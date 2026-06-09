@@ -106,8 +106,13 @@ endif
 # CIA build pipeline (for installable .cia on real 3DS hardware / FBI / Citra)
 #---------------------------------------------------------------------------------
 # Tool paths - prefer system install, fall back to project-local copies
-MAKEROM     ?= $(shell which makerom 2>/dev/null || echo /opt/devkitpro/tools/bin/makerom)
-BANNERTOOL  ?= $(shell which bannertool 2>/dev/null || echo /opt/devkitpro/tools/bin/bannertool)
+ifeq ($(OS),Windows_NT)
+MAKEROM     ?= $(TOPDIR)/cia_tools/makerom-win/makerom.exe
+BANNERTOOL  ?= $(TOPDIR)/cia_tools/bannertool-1.2.0/windows-x86_64/bannertool.exe
+else
+MAKEROM     ?= $(shell which makerom 2>/dev/null || echo $(TOPDIR)/cia_tools/makerom)
+BANNERTOOL  ?= $(shell which bannertool 2>/dev/null || echo $(TOPDIR)/cia_tools/bannertool)
+endif
 
 # CIA build inputs / outputs
 RSF_FILE        := $(TOPDIR)/app.rsf
@@ -138,9 +143,9 @@ cia: $(CIA_OUTPUT)
 
 $(CIA_OUTPUT): $(BUILD) $(RSF_FILE) $(BANNER_PNG) $(BANNER_AUDIO) $(CIA_ICON_PNG)
 	@echo "=== Building CIA for original 3DS (O3DS-safe) ==="
-	@if [ ! -x "$(MAKEROM)" ]; then \
+	@if [ ! -f "$(MAKEROM)" ]; then \
 	        echo "ERROR: makerom not found at '$(MAKEROM)'"; exit 1; fi
-	@if [ ! -x "$(BANNERTOOL)" ]; then \
+	@if [ ! -f "$(BANNERTOOL)" ]; then \
 	        echo "ERROR: bannertool not found at '$(BANNERTOOL)'"; exit 1; fi
 	@echo "[bannertool] generating banner.bnr ..."
 	@$(BANNERTOOL) makebanner \

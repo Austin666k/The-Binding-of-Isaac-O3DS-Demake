@@ -50,6 +50,7 @@ find_tool() {
         return 0
     fi
     for candidate in \
+        "$SCRIPT_DIR/cia_tools/$name" \
         "/opt/devkitpro/tools/bin/$name" \
         "/usr/local/bin/$name" \
         "$HOME/cia_tools/$name" \
