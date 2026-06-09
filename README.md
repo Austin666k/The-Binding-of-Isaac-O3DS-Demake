@@ -70,9 +70,23 @@ export PATH=$DEVKITPRO/tools/bin:$DEVKITARM/bin:$PATH
 make
 ```
 
-### Run
+### Run (.3dsx)
 - **3DS**: Copy `binding_of_isaac_3ds.3dsx` to your SD card's `/3ds/` folder
 - **Citra Emulator**: File → Load File → select `.3dsx`
+
+### Build installable CIA (Windows)
+```powershell
+cd C:\Users\Admin\The-Binding-of-Isaac-O3DS-Demake
+.\build_cia.ps1
+```
+
+Install `binding_of_isaac_3ds.cia` on CFW 3DS with FBI.
+
+### Push to GitHub
+```powershell
+& "C:\Program Files\Git\cmd\git.exe" -C C:\Users\Admin\The-Binding-of-Isaac-O3DS-Demake push -u origin main
+```
+Git Credential Manager will prompt you to sign in to GitHub the first time.
 
 ## Project Structure
 
