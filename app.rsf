@@ -1,0 +1,210 @@
+# =============================================================================
+# Binding of Isaac 3DS - Resource Spec File (RSF) for makerom
+# -----------------------------------------------------------------------------
+# Based on the sm64-port (3ds-port) RSF template — a known-good homebrew CIA
+# configuration that boots on BOTH original 3DS and New 3DS under Luma3DS CFW.
+#
+# Previous version of this RSF caused HOME Menu to crash with
+#   "Fault status: Translation - Page / Current Process: menu"
+# on launch.  The root causes were:
+#
+#   * MaxCpu = 0x0000                  -> kernel treats 0 as invalid, refused launch
+#   * Priority = 0x30                  -> outside the normal application range
+#   * CanUsePrivilegedPriority = false -> blocked libctru thread setup
+#
+# Fixed by mirroring sm64-port's permissions verbatim and overriding only
+# the title / product code / unique-id / logo for our homebrew identity.
+# SystemModeExt = Legacy + 64MB SystemMode keeps O3DS happy; the N3DS-only
+# fields below are ignored on O3DS thanks to Legacy mode.
+# =============================================================================
+
+BasicInfo:
+  Title                   : "Binding of Isaac 3DS"
+  ProductCode             : "CTR-P-BOIH"
+  Logo                    : Homebrew   # CFW (Luma3DS) accepts the Homebrew logo
+
+TitleInfo:
+  Category                : Application
+  UniqueId                : 0xFF3B0    # Safe homebrew range (0x00000-0xFFFFF)
+
+Option:
+  UseOnSD                 : true
+  FreeProductCode         : true       # Allow non-Nintendo "CTR-P-BOIH" code
+  MediaFootPadding        : false
+  EnableCrypt             : false      # Homebrew: unencrypted
+  EnableCompress          : true       # Compress ExeFS
+
+AccessControlInfo:
+  CoreVersion                   : 2
+  DescVersion                   : 2
+  ReleaseKernelMajor            : "02"
+  ReleaseKernelMinor            : "33"
+
+  UseExtSaveData                : false  # No external save data
+
+  FileSystemAccess:
+   - DirectSdmc
+   - DirectSdmcWrite
+   - Debug
+
+  # IoAccessControl omitted entirely (no ARM9 I/O privileges needed)
+
+  # === Memory / process configuration ===
+  # MUST match a known-good template; values below come directly from
+  # sm64-port's working RSF.  Do NOT change individual fields casually —
+  # they form a tested-together set that the ARM11 kernel accepts.
+  MemoryType                    : Application
+  SystemMode                    : 64MB        # O3DS-safe (64MB, not 96MB)
+  IdealProcessor                : 0
+  AffinityMask                  : 1
+  Priority                      : 16          # 0x10 — standard application priority
+  MaxCpu                        : 0xFF        # 100% CPU allowed (kernel rejects 0x00)
+  HandleTableSize               : 0x200
+  DisableDebug                  : false
+  EnableForceDebug              : false
+  CanWriteSharedPage            : true
+  CanUsePrivilegedPriority      : true        # libctru threads need this
+  CanUseNonAlphabetAndNumber    : true
+  PermitMainFunctionArgument    : true
+  CanShareDeviceMemory          : true
+
+  # === N3DS extension – set to Legacy so the title behaves identically
+  # === on both O3DS and N3DS (no extra RAM, no L2 cache, no core 2). ===
+  # On Legacy mode the kernel ignores CpuSpeed / EnableL2Cache /
+  # CanAccessCore2 entirely on O3DS, so these settings are safe.
+  SystemModeExt                 : Legacy
+  CpuSpeed                      : 268MHz      # O3DS native (ignored under Legacy on N3DS too)
+  EnableL2Cache                 : false
+  CanAccessCore2                : false
+
+  # === ARM11 syscall whitelist (libctru / devkitARM standard set) ===
+  SystemCallAccess:
+    ArbitrateAddress: 34
+    Backdoor: 123
+    Break: 60
+    CancelTimer: 28
+    ClearEvent: 25
+    ClearTimer: 29
+    CloseHandle: 35
+    ConnectToPort: 45
+    ControlMemory: 1
+    CreateAddressArbiter: 33
+    CreateEvent: 23
+    CreateMemoryBlock: 30
+    CreateMutex: 19
+    CreateSemaphore: 21
+    CreateThread: 8
+    CreateTimer: 26
+    DuplicateHandle: 39
+    ExitProcess: 3
+    ExitThread: 9
+    FlushProcessDataCache: 84
+    GetCurrentProcessorNumber: 17
+    GetHandleInfo: 41
+    GetProcessId: 53
+    GetProcessIdOfThread: 54
+    GetProcessIdealProcessor: 6
+    GetProcessInfo: 43
+    GetResourceLimit: 56
+    GetResourceLimitCurrentValues: 58
+    GetResourceLimitLimitValues: 57
+    GetSystemInfo: 42
+    GetSystemTick: 40
+    GetThreadContext: 59
+    GetThreadId: 55
+    GetThreadIdealProcessor: 15
+    GetThreadInfo: 44
+    GetThreadPriority: 11
+    MapMemoryBlock: 31
+    OutputDebugString: 61
+    QueryMemory: 2
+    ReleaseMutex: 20
+    ReleaseSemaphore: 22
+    SendSyncRequest: 50
+    SetThreadPriority: 12
+    SetTimer: 27
+    SignalEvent: 24
+    SleepThread: 10
+    UnmapMemoryBlock: 32
+    WaitSynchronization1: 36
+    WaitSynchronizationN: 37
+
+  # === Services the title is allowed to connect to ===
+  # libctru standard set: GPU (gsp), audio (dsp / csnd), input (hid / ir),
+  # filesystem (fs), apt, ndsp uses dsp::DSP, ssl, networking stubs.
+  ServiceAccessControl:
+   - APT:U
+   - ac:u
+   - am:net
+   - boss:U
+   - cam:u
+   - cecd:u
+   - cfg:nor
+   - cfg:u
+   - csnd:SND
+   - dsp::DSP
+   - frd:u
+   - fs:USER
+   - gsp::Gpu
+   - hid:USER
+   - http:C
+   - ir:rst
+   - ir:u
+   - ir:USER
+   - mic:u
+   - ndm:u
+   - news:s
+   - nwm::UDS
+   - ptm:u
+   - pxi:dev
+   - soc:U
+   - ssl:C
+   - y2r:u
+
+# =============================================================================
+# SystemControlInfo - kernel-side metadata
+# =============================================================================
+SystemControlInfo:
+  SaveDataSize: 0KB
+  RemasterVersion: 0
+  StackSize: 0x40000          # 256 KB — the devkitARM linker default; matches
+                              # what the .elf actually reserves so the kernel
+                              # can map the stack page-aligned (mismatch here
+                              # produces a "Translation - Page" fault).
+  Dependency:
+    ac: 0x0004013000002402
+    am: 0x0004013000001502
+    boss: 0x0004013000003402
+    camera: 0x0004013000001602
+    cecd: 0x0004013000002602
+    cfg: 0x0004013000001702
+    codec: 0x0004013000001802
+    csnd: 0x0004013000002702
+    dlp: 0x0004013000002802
+    dsp: 0x0004013000001a02
+    friends: 0x0004013000003202
+    gpio: 0x0004013000001b02
+    gsp: 0x0004013000001c02
+    hid: 0x0004013000001d02
+    http: 0x0004013000002902
+    i2c: 0x0004013000001e02
+    ir: 0x0004013000003302
+    mcu: 0x0004013000001f02
+    mic: 0x0004013000002002
+    ndm: 0x0004013000002b02
+    news: 0x0004013000003502
+    nim: 0x0004013000002c02
+    nwm: 0x0004013000002d02
+    pdn: 0x0004013000002102
+    ps: 0x0004013000003102
+    ptm: 0x0004013000002202
+    ro: 0x0004013000003702
+    socket: 0x0004013000002e02
+    ssl: 0x0004013000002f02
+
+# =============================================================================
+# RomFs - makerom recursively packs APP_ROMFS into the CIA at build time.
+# Path is supplied via "-DAPP_ROMFS=<path>" on the makerom command line.
+# =============================================================================
+RomFs:
+  RootPath: $(APP_ROMFS)

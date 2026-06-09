@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html lang="en">
+
+  <head>
+    <link rel="stylesheet" href="/includes/css/styles.css?v=1774934783">
+    <link rel="stylesheet" href="/includes/css/themes/light.css?v=1775573021">
+    <link rel="stylesheet" href="/includes/css/sites/light/sprites.css?v=1732123883">
+    <link rel="manifest" href="/manifest.json">
+    <link rel="icon" href="/images/icons/sprites.png">
+    <link rel="apple-touch-icon" href="/images/icons/sprites.png">
+    <link rel="preconnect" href="https://fonts.googleapis.com" crossorigin>
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <meta http-equiv="Content-Type" content="text/html;charset=utf-8">
+    <meta name="description" content="404 - Not Found - Archiving and preserving video game media since 2003!">
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+    <meta name="theme-color" content="#b4202a">
+    <meta property="og:title" content="404 - Not Found">
+    <meta property="og:url" content="https://www.spriters-resource.com/resources/sheets/21/213080.png">
+    <meta property="og:image" content="/images/icons/sprites.png">
+    <meta property="og:site_name" content="The Spriters Resource">
+    <title>404 - Not Found - The Spriters Resource</title>
+    <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.7.1/jquery.min.js"></script>
+        <script src="/includes/js/scripts.js?v=1779315681"></script>
+        <script async src="https://www.googletagmanager.com/gtag/js?id=G-QHE6R14E7M"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-QHE6R14E7M');
+    </script>
+    <script data-cfasync="false">window.nitroAds=window.nitroAds||{createAd:function(){return new Promise(e=>{window.nitroAds.queue.push(["createAd",arguments,e])})},addUserToken:function(){window.nitroAds.queue.push(["addUserToken",arguments])},queue:[]};</script>
+<script data-cfasync="false" async src="https://s.nitropay.com/ads-69.js"></script>
+  </head>
+
+  <body >
+    <script>
+window['nitroAds'].createAd('nitro-anchor', {
+  "refreshLimit": 0,
+  "refreshTime": 30,
+  "format": "anchor-v2",
+  "anchor": "bottom",
+  "anchorClose": true,
+  "anchorPersistClose": true,
+  "anchorBgColor": "rgba(255, 255, 255, 0.2)",
+  "report": {
+    "enabled": true,
+    "icon": true,
+    "wording": "Report Ad",
+    "position": "top-right"
+  }
+});
+window['nitroAds'].createAd('nitro-outstream', {
+  "refreshLimit": 0,
+  "refreshTime": 30,
+  "format": "floating",
+  "reduceMobileSize": true,
+  "report": {
+    "enabled": true,
+    "icon": true,
+    "wording": "Report Ad",
+    "position": "top-left"
+  }
+});
+</script>
+    <div id="header">
+      <div class="wrap">
+        <div id="navigation">
+          <div id="mobile-menu-container"><div id="mobile-menu-button" class="material-symbols-outlined text-shadow">menu</div></div>
+          <a href="/" class="logo"></a>
+          <div id="nav-links">
+            <div class="nav-search">
+              <form id="simple-searchform" method="get" action="/browse/">
+                <input type="text" name="name" class="header-search formElement" placeholder="Search Assets" title="Searches assets by default. Prefix with &quot;g:&quot; to search for games directly.">
+                <div class="random-asset"><a href="/random/" title="Random Asset"><span class="material-symbols-outlined">shuffle</span></a></div>
+                <button type="submit" class="search-submit"><span class="material-symbols-outlined thin-stroke">search</span></button>
+                <input type="hidden" name="sect" value="1">
+              </form>
+            </div>
+            <a href="/browse/" class="text-shadow">Browse</a>
+                        <a href="/stats/" class="text-shadow">Stats</a>
+            <a href="/page/help/" class="text-shadow">Help</a>
+            <a href="https://discord.gg/tsr" target="_blank" class="text-shadow">Discord</a>
+          </div>
+          <div id="nav-right">
+            <div id="nav-toggles">
+              <a href="/process/seticons/?return=%2Fresources%2Fsheets%2F21%2F213080.png" id="icon-toggle"><span class="material-symbols-outlined text-shadow" title="Switch to Text Mode">imagesmode</span></a>
+              <a href="/process/setnsfw/?return=%2Fresources%2Fsheets%2F21%2F213080.png" id="nsfw-toggle"><span class="material-symbols-outlined text-shadow" title="Show NSFW Assets">warning_off</span></a>
+              <a href="/process/setwidth/?return=%2Fresources%2Fsheets%2F21%2F213080.png" id="width-toggle"><span class="material-symbols-outlined text-shadow" title="Switch to Full Width">width_normal</span></a>
+                            <a href="/process/settheme/?theme=dark&amp;return=%2Fresources%2Fsheets%2F21%2F213080.png"><span class="material-symbols-outlined text-shadow" title="Switch to Dark Theme">light_mode</span></a>
+                          </div>
+                        <a href="/user_login/" class="login">Log In</a>
+                      </div>
+        </div>
+              </div>
+    </div>
+        <div id="wrapper">
+      <div id="content-container" class="wrap">
+        <div id="sidebar-left">
+          <div id="nav-mobile-links">
+            <div class="nav-search">
+              <form id="simple-searchform-mobile" method="get" action="/browse/">
+                <input type="text" name="name" class="header-search formElement" placeholder="Search Assets (Prefix g: for Games)" title="Searches assets by default. Prefix with &quot;g:&quot; to search for games directly.">
+                <div class="random-asset"><a href="/random/" title="Random Asset"><span class="material-symbols-outlined">shuffle</span></a></div>
+                <button type="submit" class="search-submit"><span class="material-symbols-outlined thin-stroke">search</span></button>
+                <input type="hidden" name="sect" value="1">
+              </form>
+            </div>
+            <a href="/browse/" class="text-shadow">Browse</a>
+            <a href="/page/help/" class="text-shadow">Help</a>
+            <a href="https://discord.gg/tsr" target="_blank" class="text-shadow">Discord</a>
+            <div id="nav-mobile-toggles">
+              <a href="/process/seticons/?return=%2Fresources%2Fsheets%2F21%2F213080.png"><span class="material-symbols-outlined text-shadow" title="Switch to Text Mode">imagesmode</span></a>
+              <a href="/process/setnsfw/?return=%2Fresources%2Fsheets%2F21%2F213080.png"><span class="material-symbols-outlined text-shadow" title="Show NSFW Assets">warning_off</span></a>
+                            <a href="/process/settheme/?theme=dark&amp;return=%2Fresources%2Fsheets%2F21%2F213080.png"><span class="material-symbols-outlined text-shadow" title="Switch to Dark Theme">light_mode</span></a>
+                          </div>
+          </div>
+          <div class="nav-header border text-shadow">Consoles</div>
+          <a href="/custom_edited/">Custom / Edited</a>
+<a href="/3ds/">3DS</a>
+<a href="/arcade/">Arcade</a>
+<a href="/browser_games/">Browser Games</a>
+<a href="/ds_dsi/">DS / DSi</a>
+<a href="/game_boy_gbc/">Game Boy / GBC</a>
+<a href="/game_boy_advance/">Game Boy Advance</a>
+<a href="/gamecube/">GameCube</a>
+<a href="/mobile/">Mobile</a>
+<a href="/ms_dos/">MS-DOS</a>
+<a href="/neo_geo_ngcd/">Neo Geo / NGCD</a>
+<a href="/nes/">NES</a>
+<a href="/nintendo_64/">Nintendo 64</a>
+<a href="/nintendo_switch/">Nintendo Switch</a>
+<a href="/pc_computer/">PC / Computer</a>
+<a href="/playstation/">PlayStation</a>
+<a href="/playstation_2/">PlayStation 2</a>
+<a href="/playstation_3/">PlayStation 3</a>
+<a href="/playstation_4/">PlayStation 4</a>
+<a href="/psp/">PlayStation Portable</a>
+<a href="/sega_genesis/">Sega Genesis</a>
+<a href="/snes/">SNES</a>
+<a href="/wii/">Wii</a>
+<a href="/wii_u/">Wii U</a>
+<a href="/xbox_360/">Xbox 360</a>
+<a href="/other_systems/">Other Systems<span class="material-symbols-outlined arrow" id="toggle-other">arrow_right</span></a>
+<div id="other-systems" style="display: none;">
+<a href="/3do/">3DO</a>
+<a href="/acorn_archimedes/">Acorn Archimedes</a>
+<a href="/acorn_electron/">Acorn Electron</a>
+<a href="/adventure_vision/">Adventure Vision</a>
+<a href="/amiga_amiga_cd32/">Amiga / Amiga CD32</a>
+<a href="/amstrad_cpc/">Amstrad CPC</a>
+<a href="/apple_ii/">Apple II</a>
+<a href="/atari_2600/">Atari 2600</a>
+<a href="/atari/">Atari 400 / 800 / 5200</a>
+<a href="/atari_7800/">Atari 7800</a>
+<a href="/atari_st/">Atari ST</a>
+<a href="/bally_astrocade/">Bally Astrocade</a>
+<a href="/bbc_micro/">BBC Micro</a>
+<a href="/cd_i/">CD-i</a>
+<a href="/colecovision/">ColecoVision</a>
+<a href="/commodore_16/">Commodore 16</a>
+<a href="/commodore_64/">Commodore 64</a>
+<a href="/comx_35/">COMX-35</a>
+<a href="/cybiko/">Cybiko</a>
+<a href="/dreamcast/">Dreamcast</a>
+<a href="/elektronika_calculators/">Elektronika Calculators</a>
+<a href="/emerson_arcadia_2001/">Emerson Arcadia 2001</a>
+<a href="/enterprise/">Enterprise</a>
+<a href="/fm_towns/">FM Towns</a>
+<a href="/fm_7/">FM-7</a>
+<a href="/fujitsu_fm77av/">Fujitsu FM77AV</a>
+<a href="/gamate/">Gamate</a>
+<a href="/game_gear/">Game Gear</a>
+<a href="/game_master/">Game Master</a>
+<a href="/game_com/">Game.com</a>
+<a href="/gizmondo/">Gizmondo</a>
+<a href="/hyperscan/">HyperScan</a>
+<a href="/innotab/">InnoTab</a>
+<a href="/intellivision/">Intellivision</a>
+<a href="/jaguar/">Jaguar</a>
+<a href="/lcd_handhelds/">LCD Handhelds</a>
+<a href="/leapfrog/">LeapFrog</a>
+<a href="/lynx/">Lynx</a>
+<a href="/master_system/">Master System</a>
+<a href="/mega_duck/">Mega Duck</a>
+<a href="/mobigo/">MobiGo</a>
+<a href="/msx/">MSX</a>
+<a href="/msx2/">MSX2</a>
+<a href="/n_gage/">N-Gage</a>
+<a href="/nec_pc_6001/">NEC PC-6001</a>
+<a href="/nec_pc_8801/">NEC PC-8801</a>
+<a href="/nec_pc_9801/">NEC PC-9801</a>
+<a href="/neo_geo_pocket/">Neo Geo Pocket / NGPC</a>
+<a href="/nokia_series_40_60/">Nokia Series 40/60</a>
+<a href="/nvidia_shield_tv/">Nvidia Shield TV</a>
+<a href="/odyssey/">Odyssey²</a>
+<a href="/palmos/">PalmOS</a>
+<a href="/pc_fx/">PC-FX</a>
+<a href="/pico/">Pico</a>
+<a href="/pinball/">Pinball</a>
+<a href="/playstation_5/">PlayStation 5</a>
+<a href="/playstation_vita/">PlayStation Vita</a>
+<a href="/plug_play/">Plug &amp; Play</a>
+<a href="/pocketstation/">PocketStation</a>
+<a href="/pokemon_mini/">Pokémon Mini</a>
+<a href="/rca_studio_ii/">RCA Studio II</a>
+<a href="/saturn/">Saturn</a>
+<a href="/sega_32x/">Sega 32X</a>
+<a href="/sega_cd/">Sega CD</a>
+<a href="/sg_1000/">SG-1000</a>
+<a href="/sharp_mz/">Sharp MZ</a>
+<a href="/sharp_x1/">Sharp X1</a>
+<a href="/sharp_x68000/">Sharp X68000</a>
+<a href="/sky_active_tv/">Sky Active TV</a>
+<a href="/sord_m5/">Sord M5</a>
+<a href="/super_a_can/">Super A&#039;Can</a>
+<a href="/super_cassette_vision/">Super Cassette Vision</a>
+<a href="/supervision/">Supervision</a>
+<a href="/tapwave_zodiac/">Tapwave Zodiac</a>
+<a href="/thumby/">Thumby</a>
+<a href="/ti_83/">TI-83</a>
+<a href="/ti_99/">TI-99</a>
+<a href="/turbografx_16/">TurboGrafx-16</a>
+<a href="/v_flash/">V.Flash</a>
+<a href="/v_reader/">V.Reader</a>
+<a href="/v_smile/">V.Smile</a>
+<a href="/vectrex/">Vectrex</a>
+<a href="/virtual_boy/">Virtual Boy</a>
+<a href="/visicom_com_100/">Visicom COM-100</a>
+<a href="/wonderswan_wsc/">WonderSwan / WSC</a>
+<a href="/xbox/">Xbox</a>
+<a href="/xbox_one/">Xbox One</a>
+<a href="/zeebo/">Zeebo</a>
+<a href="/zx_spectrum/">ZX Spectrum</a>
+</div>
+<div class="nav-header border text-shadow ad-header">Ad</div>
+<div class="ad-sidebar"><div id="nitro-sidebar-left-top"></div>
+<script>
+window['nitroAds'].createAd('nitro-sidebar-left-top', {
+  "refreshLimit": 0,
+  "refreshTime": 30,
+  "renderVisibleOnly": true,
+  "refreshVisibleOnly": true,
+  "delayLoading": true,
+  "report": {
+    "enabled": true,
+    "icon": true,
+    "wording": "Report Ad",
+    "position": "top-right"
+  }
+});
+</script>
+</div>
+          <div class="nav-header border text-shadow">Network</div>
+          <div class="navlist">
+            <a href="https://www.spriters-resource.com/" style="background-color: var(--tsr);">The Spriters Resource</a>
+            <a href="https://models.spriters-resource.com/" style="background-color: var(--tmr);">The Models Resource</a>
+            <a href="https://textures.spriters-resource.com/" style="background-color: var(--ttr);">The Textures Resource</a>
+            <a href="https://sounds.spriters-resource.com/" style="background-color: var(--tsor);">The Sounds Resource</a>
+            <a href="https://www.vg-resource.com/" target="_blank" style="background-color: var(--vgr);">The VG Resource Wiki</a>
+            <a href="https://tools.spriters-resource.com/" target="_blank" style="background-color: var(--tools);">The Spriters Toolkit</a>
+            <a href="https://www.vgfacts.com/" target="_blank" style="background-color: var(--vgfacts);">VGFacts</a>
+          </div>
+          <div class="nav-header border text-shadow">Social</div>
+          <div class="navlist">
+            <a href="https://discord.gg/tsr" target="_blank" class="discord">Discord</a>
+            <a href="https://www.twitch.tv/thespritersresource" target="_blank" class="twitch">Twitch</a>
+            <a href="https://bsky.app/profile/spriters-resource.com" target="_blank" class="bluesky">Bluesky</a>
+            <a href="https://www.youtube.com/@Spriters-Resource" target="_blank" class="youtube">YouTube</a>
+          </div>
+          <div class="sticky-sidebar"><div class="nav-header border text-shadow ad-header">Ad</div>
+<div class="ad-sidebar"><div id="nitro-sidebar-left-bottom"></div>
+<script>
+window['nitroAds'].createAd('nitro-sidebar-left-bottom', {
+  "refreshLimit": 0,
+  "refreshTime": 30,
+  "renderVisibleOnly": true,
+  "refreshVisibleOnly": true,
+  "delayLoading": true,
+  "report": {
+    "enabled": true,
+    "icon": true,
+    "wording": "Report Ad",
+    "position": "top-right"
+  }
+});
+</script>
+</div>
+</div>
+        </div>
+        <div id="sidebar-right">
+          <div class="nav-header border text-shadow">Ad</div>
+<div class="ad-sidebar"><div id="nitro-sidebar-right-top"></div>
+<script>
+window['nitroAds'].createAd('nitro-sidebar-right-top', {
+  "refreshLimit": 0,
+  "refreshTime": 30,
+  "renderVisibleOnly": true,
+  "refreshVisibleOnly": true,
+  "delayLoading": true,
+  "report": {
+    "enabled": true,
+    "icon": true,
+    "wording": "Report Ad",
+    "position": "top-right"
+  }
+});
+</script>
+</div>
+          <div class="nav-header border text-shadow">Latest Assets</div>
+                    <a href="/wii/dragonquest25thshyuunenkinen/asset/557738/">Menu Buttons - Dragon Quest 25th Shyuunen Kinen (JPN)</a>
+          <a href="/wii/dragonquest25thshyuunenkinen/asset/557739/">Game Panels - Dragon Quest 25th Shyuunen Kinen (JPN)</a>
+          <a href="/browser_games/lordofthestars/asset/557814/">Fire Flower - Lord of the Stars</a>
+          <a href="/neo_geo_ngcd/worldheroes2/asset/557878/">Neo Geegus - World Heroes 2</a>
+          <a href="/neo_geo_ngcd/worldheroes2/asset/557877/">Muscle Power - World Heroes 2</a>
+          <a href="/neo_geo_ngcd/worldheroes2/asset/557876/">Kim Dragon - World Heroes 2</a>
+          <a href="/neo_geo_ngcd/worldheroes2/asset/557875/">Jeanne - World Heroes 2</a>
+          <a href="/neo_geo_ngcd/worldheroes2/asset/557874/">J. Carn - World Heroes 2</a>
+          <a href="/neo_geo_ngcd/worldheroes2/asset/557873/">Hanzo - World Heroes 2</a>
+          <a href="/sega_genesis/vspuyopuyosun/asset/557743/">Choppun - VS Puyo Puyo Sun</a>
+          <a href="/browse/?sortby=3&dir=1" class="right-nav">View more!</a>
+          <div class="nav-header border text-shadow">Latest Comments</div>
+                    <a href="/custom_edited/topbanana/asset/556469/#comment_303500" title="May 25, 2026, 4:08 AM">PGE on KT (Rainbow Islands-Style)</a>
+          <a href="/arcade/punchout/asset/113682/#comment_303498" title="May 25, 2026, 3:28 AM">fredrickfivebears on Pizza Pasta</a>
+          <a href="/neo_geo_ngcd/worldheroes2/asset/557875/#comment_303497" title="May 25, 2026, 2:55 AM">Doc von Schmeltwick on Jeanne</a>
+          <a href="/custom_edited/sonicthehedgehogcustoms/asset/557271/#comment_303496" title="May 25, 2026, 2:51 AM">Goshadyac on Tails (Knuckles&#039; Chaotix-Style)</a>
+          <a href="/custom_edited/thesimpsonscustoms/asset/557523/#comment_303495" title="May 25, 2026, 2:37 AM">DogToon64 on Homer Simpson (Mean Bean Machine-style)</a>
+          <a href="/game_boy_gbc/sonicthehedgehogbootleg/asset/90954/#comment_303494" title="May 25, 2026, 2:26 AM">Nikeitos55 on General Sprites</a>
+          <a href="/update-1657/#comment_303493" title="May 25, 2026, 2:26 AM">bntcrls on Rest in Peace, Omega</a>
+          <a href="/update-1657/#comment_303492" title="May 25, 2026, 2:24 AM">friendlysmile on Rest in Peace, Omega</a>
+          <a href="/update-1657/#comment_303491" title="May 25, 2026, 2:20 AM">Alxala on Rest in Peace, Omega</a>
+          <a href="/sega_genesis/vspuyopuyosun/asset/557740/#comment_303489" title="May 25, 2026, 1:13 AM">Doc von Schmeltwick on Draco Centauros</a>
+          <a href="/comments/" class="right-nav">View more!</a>
+          <div class="nav-header border text-shadow">Popular Assets</div>
+                    <a href="/custom_edited/sonicthehedgehogcustoms/asset/555502/">Sonic - Sonic the Hedgehog Customs</a>
+          <a href="/game_boy_gbc/sakurawarsgb/asset/549308/">Sumire - Sakura Wars GB: Geki Hanagumi Nyuutai! (JPN)</a>
+          <a href="/ds_dsi/pokemonheartgoldsoulsilver/asset/26794/">Pokémon (1st Generation, Overworld) - Pokémon HeartGold / SoulSilver</a>
+          <a href="/sega_genesis/sonicth1/asset/8877/">Title Screen, Stage Select &amp; Company Screens - Sonic the Hedgehog</a>
+          <a href="/pc_computer/deltarune/asset/110733/">Battle Menu - Deltarune</a>
+          <a href="/mobile/fireemblemheroes/asset/221952/">Robin (Double Vision) - Fire Emblem: Heroes</a>
+          <a href="/nes/supermariobros/asset/52570/">Enemies &amp; Bosses - Super Mario Bros.</a>
+          <a href="/custom_edited/mariocustoms/asset/551106/">Mario Kart - Mario Customs</a>
+          <a href="/sega_cd/sonicthehedgehogcd/asset/10831/">Sonic the Hedgehog - Sonic the Hedgehog CD</a>
+          <a href="/pc_computer/pizzatower/asset/133492/">Peppino - Pizza Tower</a>
+          <a href="/browse/?sortby=1&dir=1" class="right-nav">View more!</a>
+          <div class="nav-header border text-shadow">Popular Games</div>
+                    <a href="/pc_computer/pizzatower/">Pizza Tower - PC / Computer</a>
+          <a href="/playstation/cvsotn/">Castlevania: Symphony of the Night - PlayStation</a>
+          <a href="/game_boy_advance/mother3/">Mother 3 - Game Boy Advance</a>
+          <a href="/wii_u/supermariomaker/">Super Mario Maker - Wii U</a>
+          <a href="/nintendo_switch/pokemonscarletviolet/">Pokémon Scarlet / Violet - Nintendo Switch</a>
+          <a href="/pc_computer/danganronpav3killingharmony/">Danganronpa V3: Killing Harmony - PC / Computer</a>
+          <a href="/custom_edited/megamancustoms/">Mega Man Customs - Custom / Edited</a>
+          <a href="/nintendo_64/ssb/">Super Smash Bros. - Nintendo 64</a>
+          <a href="/nintendo_switch/splatoon3/">Splatoon 3 - Nintendo Switch</a>
+          <a href="/pc_computer/danganronpa2goodbyedespair/">Danganronpa 2: Goodbye Despair - PC / Computer</a>
+          <a href="/browse/games/?sortby=1&dir=1" class="right-nav">View more!</a>
+          <div class="sticky-sidebar"><div class="nav-header border text-shadow">Ad</div>
+<div class="ad-sidebar"><div id="nitro-sidebar-right-bottom"></div>
+<script>
+window['nitroAds'].createAd('nitro-sidebar-right-bottom', {
+  "refreshLimit": 0,
+  "refreshTime": 30,
+  "renderVisibleOnly": true,
+  "refreshVisibleOnly": true,
+  "delayLoading": true,
+  "report": {
+    "enabled": true,
+    "icon": true,
+    "wording": "Report Ad",
+    "position": "top-right"
+  }
+});
+</script>
+</div>
+</div>
+        </div>
+        <div id="content">
+          <div class="title errorpage">Not Found (404)</div>
+        </div>
+      </div>
+      <div id="footer">
+        <div id="footer-content" class="wrap">
+          <div id="footer-copyright">&copy; <a href="https://www.spriters-resource.com/">The Spriters Resource</a> 2003-2026</div>
+          <div id="footer-theme">
+            Theme:
+            <span style="font-weight: bold;">Light</span> |
+            <a href="/process/settheme/?theme=dark&amp;return=%2Fresources%2Fsheets%2F21%2F213080.png">Dark</a> |
+            <a href="/process/settheme/?theme=classic&amp;return=%2Fresources%2Fsheets%2F21%2F213080.png">Classic</a>          </div>
+          <div id="footer-links">
+            <a href="/contact/">Contact</a> |
+            <a href="/page/about/">About</a> |
+            <a href="/stats/">Stats</a> |
+            <a href="/page/privacy/">Privacy</a> |
+            <a href="/page/tou/">Terms</a> |
+            <a href="/page/rules/">Rules</a> |
+            <a href="/user_staff/">Staff</a>
+          </div>
+        </div>
+      </div>
+    </div>
+    <script>
+window['nitroAds'].createAd('asset-display', {
+  "refreshLimit": 0,
+  "refreshTime": 30,
+  "format": "article",
+  "pageInterval": $(window).outerWidth() <= 1067 ? 2 : 1,
+  "report": {
+    "enabled": true,
+    "icon": true,
+    "wording": "Report Ad",
+    "position": "top-right"
+  }
+});
+</script>
+<span data-ccpa-link="1"></span>
+<div id="ncmp-consent-link"></div>
+  </body>
+
+</html>

@@ -1,0 +1,10 @@
+build/
+*.3dsx
+*.elf
+*.smdh
+*.map
+*.o
+*.d
+*.lst
+*.cia
+.abacus.donotdelete
