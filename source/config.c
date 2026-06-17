@@ -30,6 +30,7 @@ static float clampf(float v, float lo, float hi) {
 /* Trim leading whitespace in place (returns pointer into same buffer) */
 static char *trim(char *s) {
     while (*s == ' ' || *s == '\t') s++;
+    if (*s == '\0') return s;
     /* Trim trailing whitespace/newline */
     char *end = s + strlen(s) - 1;
     while (end > s && (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r'))
@@ -48,6 +49,7 @@ void config_init(GameConfig *cfg) {
     cfg->total_wins           = 0;
     cfg->bosses_defeated      = 0;
     cfg->characters_completed = 0;
+    cfg->challenges_completed = 0;
     cfg->floors_reached       = 0;
     cfg->total_runs_started   = 0;
 }
@@ -86,6 +88,8 @@ int config_load(GameConfig *cfg) {
             cfg->bosses_defeated = atoi(val);
         } else if (strcmp(key, "characters_completed") == 0) {
             cfg->characters_completed = atoi(val);
+        } else if (strcmp(key, "challenges_completed") == 0) {
+            cfg->challenges_completed = atoi(val);
         } else if (strcmp(key, "floors_reached") == 0) {
             cfg->floors_reached = atoi(val);
         } else if (strcmp(key, "total_runs_started") == 0) {
@@ -120,6 +124,7 @@ int config_save(const GameConfig *cfg) {
     fprintf(f, "# Bitmasks: 0x01=Isaac, 0x02=Magdalene, 0x04=Cain, 0x08=Judas\n");
     fprintf(f, "unlocked_chars=%d\n", cfg->unlocked_chars);
     fprintf(f, "characters_completed=%d\n", cfg->characters_completed);
+    fprintf(f, "challenges_completed=%d\n", cfg->challenges_completed);
     fprintf(f, "bosses_defeated=%d\n", cfg->bosses_defeated);
     fprintf(f, "total_wins=%d\n", cfg->total_wins);
     fprintf(f, "total_runs_started=%d\n", cfg->total_runs_started);

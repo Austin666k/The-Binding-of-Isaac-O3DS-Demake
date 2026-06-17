@@ -18,6 +18,7 @@ typedef struct {
     int total_wins;              /* total runs completed successfully */
     int bosses_defeated;         /* bitmask of bosses defeated (by enum index) */
     int characters_completed;    /* bitmask of characters who beat a run */
+    int challenges_completed;    /* bitmask of completed ChallengeType values */
     int floors_reached;          /* deepest floor index ever reached (0-6) */
     int total_runs_started;      /* total number of runs ever started */
 } GameConfig;

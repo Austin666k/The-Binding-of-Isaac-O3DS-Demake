@@ -53,6 +53,8 @@ typedef enum {
 
 /* ---------- Player ---------- */
 #define PLAYER_SIZE        12.0f
+#define PLAYER_COLLISION_RADIUS 7.5f
+#define PLAYER_HURT_RADIUS  6.5f
 #define PLAYER_BASE_SPEED  2.2f     /* slightly higher base; Isaac feels quick */
 #define PLAYER_BASE_HP     6        /* 3 full hearts (each heart = 2 hp) */
 #define PLAYER_IFRAMES     60
@@ -60,8 +62,9 @@ typedef enum {
 #define PLAYER_MAX_HP_CAP  16       /* max 8 hearts */
 
 /* Isaac-style momentum physics tuning */
-#define PLAYER_ACCEL       0.38f    /* how fast velocity approaches target (lower = more slide) */
-#define PLAYER_FRICTION    0.82f    /* velocity decay when no input (higher = more slide) */
+#define PLAYER_ACCEL       0.34f    /* acceleration toward the requested velocity */
+#define PLAYER_TURN_ACCEL  0.52f    /* stronger braking when reversing direction */
+#define PLAYER_FRICTION    0.78f    /* short, readable slide-to-stop */
 #define PLAYER_STOP_THRESH 0.08f   /* below this speed, snap to zero */
 #define PLAYER_KB_FORCE    4.5f    /* knockback impulse magnitude when hit */
 #define PLAYER_KB_FRAMES   12      /* frames of lost control during knockback */
@@ -71,11 +74,13 @@ typedef enum {
 /* ---------- Tears ---------- */
 #define MAX_TEARS          30
 #define TEAR_RADIUS        4.0f
-#define TEAR_BASE_SPEED    4.0f
-#define TEAR_BASE_RANGE    120.0f
+#define TEAR_BASE_SPEED    4.25f
+#define TEAR_BASE_RANGE    132.0f
 #define TEAR_GRAVITY       0.15f    /* gravity applied to tear vz per frame */
 #define TEAR_ARC_VEL      -2.0f     /* initial upward velocity (negative = up) */
-#define TEAR_SPREAD        0.12f    /* random spread angle in radians */
+#define TEAR_ARC_HEIGHT    14.0f    /* visual peak height at mid-flight */
+#define TEAR_SPREAD        0.035f   /* subtle natural inaccuracy */
+#define TEAR_MOVE_INHERIT  0.35f    /* inherit part of Isaac's movement velocity */
 #define TEAR_KNOCKBACK     1.4f     /* knockback impulse magnitude */
 
 /* ---------- Enemies ---------- */
@@ -113,8 +118,9 @@ typedef enum {
 
 /* ---------- Shop ---------- */
 #define MAX_SHOP_ITEMS     3
-#define SHOP_ITEM_COST_MIN 3
-#define SHOP_ITEM_COST_MAX 7
+#define SETTINGS_COUNT     4   /* audio toggle, sfx vol, music vol, erase data */
+#define SHOP_ITEM_COST_MIN 5
+#define SHOP_ITEM_COST_MAX 10
 
 /* ---------- Items ---------- */
 #define MAX_ITEMS_HELD     32       /* max items player can collect */
@@ -129,6 +135,26 @@ typedef enum {
     CHAR_COUNT
 } CharacterType;
 
+/* ---------- Challenges ---------- */
+typedef enum {
+    CHALLENGE_DARKNESS_FALLS = 0,
+    CHALLENGE_GLASS_CANNON,
+    CHALLENGE_SPRAY_AND_PRAY,
+    CHALLENGE_THE_TANK,
+    CHALLENGE_THE_GAUNTLET,
+    CHALLENGE_COUNT,
+    CHALLENGE_NONE = -1
+} ChallengeType;
+
+#define CHALLENGE_FLAG_PERMA_DARKNESS  (1 << 0)
+#define CHALLENGE_FLAG_HIDE_MAP        (1 << 1)
+#define CHALLENGE_FLAG_ONE_HEART       (1 << 2)
+#define CHALLENGE_FLAG_NO_HEART_DROPS  (1 << 3)
+#define CHALLENGE_FLAG_NO_TREASURE     (1 << 4)
+#define CHALLENGE_FLAG_NO_SHOPS        (1 << 5)
+#define CHALLENGE_FLAG_EXTRA_ENEMIES   (1 << 6)
+#define CHALLENGE_FLAG_MORE_CHAMPIONS  (1 << 7)
+
 /* ---------- Pills ---------- */
 typedef enum {
     PILL_HEALTH_UP = 0,
@@ -141,6 +167,11 @@ typedef enum {
     PILL_LUCK_UP,
     PILL_FULL_HEALTH,
     PILL_TELEPILLS,
+    PILL_BOMBS,        /* +2 bombs */
+    PILL_COINS,        /* +5 coins */
+    PILL_KEYS,         /* +2 keys */
+    PILL_AMNESIA,      /* forget the map (un-visit explored rooms) */
+    PILL_HEMATEMESIS,  /* drop to 1 heart, vomit up 2 full hearts */
     PILL_EFFECT_COUNT
 } PillEffect;
 
@@ -154,6 +185,10 @@ typedef enum {
     TAROT_LOVERS,           /* spawn two full hearts */
     TAROT_TOWER,            /* spawn 6 troll bombs (damages player too) */
     TAROT_WORLD,            /* full map reveal */
+    TAROT_STRENGTH,         /* +1 damage until you leave the room */
+    TAROT_DEATH,            /* deal 40 damage to every enemy in the room */
+    TAROT_STARS,            /* teleport to the treasure room */
+    TAROT_SUN,              /* full heal + map reveal + damage all enemies */
     TAROT_COUNT
 } TarotCard;
 
@@ -183,6 +218,7 @@ typedef struct {
 typedef enum {
     STATE_MENU,
     STATE_MODE_SELECT,         /* choose Story vs Infinite */
+    STATE_CHALLENGE_SELECT,    /* choose a fixed challenge run */
     STATE_CHARACTER_SELECT,    /* choose playable character */
     STATE_DIFFICULTY_SELECT,   /* choose Easy / Normal / Hard */
     STATE_CONTROLS,
@@ -292,6 +328,7 @@ typedef enum {
     PICKUP_BOMB2,     /* double bomb pickup */
     PICKUP_PILL,      /* pill (single-use, scrambled color) */
     PICKUP_CARD,      /* tarot card (single-use) */
+    PICKUP_TRINKET,   /* trinket (held passive; sub_type = TrinketType) */
     PICKUP_TYPE_COUNT
 } PickupType;
 
@@ -343,8 +380,34 @@ typedef enum {
     ITEM_YUM_HEART,       /* Magdalene starter: spawn heart on use */
     ITEM_LUCKY_FOOT,      /* Cain starter: +1 luck */
     ITEM_BOOK_OF_BELIAL,  /* Judas starter: +1.5 dmg this room on use */
+    /* --- Active items (occupy the active slot, triggered with L) --- */
+    ITEM_NECRONOMICON,    /* active: damage every enemy in the room */
+    ITEM_BIBLE,           /* active: full red-heart heal */
+    ITEM_MOMS_BRA,        /* active: clear all enemy shots + brief grace */
+    ITEM_FORGET_ME_NOW,   /* active: re-roll the current floor */
+    ITEM_D6,              /* active: re-roll the items in this room */
+    /* --- Passive: active-item charge economy --- */
+    ITEM_BATTERY,         /* passive: doubles active-item charge capacity */
+    /* --- Familiars (passive: grant an orbiting helper that fires) --- */
+    ITEM_BROTHER_BOBBY,   /* familiar: fires tears at nearest enemy */
+    ITEM_SISTER_MAGGY,    /* familiar: heavier tears, slower */
+    ITEM_LITTLE_STEVEN,   /* familiar: homing tears */
+    ITEM_DEMON_BABY,      /* familiar: rapid short-range tears */
     ITEM_COUNT
 } ItemType;
+
+/* ---------- Trinkets (single held passive pickup with a global effect) ---------- */
+typedef enum {
+    TRINKET_NONE = 0,
+    TRINKET_CANCER,         /* + fire rate */
+    TRINKET_CURVED_HORN,    /* + damage */
+    TRINKET_RABBIT_FOOT,    /* + luck */
+    TRINKET_SWALLOWED_PENNY,/* a coin each time a room is cleared */
+    TRINKET_MATCH_STICK,    /* chance for a bomb on room clear */
+    TRINKET_PETRIFIED_POOP, /* better consumable drop chances */
+    TRINKET_AAA_BATTERY,    /* active item gains extra charge on room clear */
+    TRINKET_COUNT
+} TrinketType;
 
 /* ---------- Shop Item ---------- */
 typedef struct {
@@ -366,6 +429,9 @@ typedef struct {
 #define ITEM_FLAG_EXPLOSIVE    (1 << 8)   /* Ipecac: explosive tears */
 #define ITEM_FLAG_MANTLE       (1 << 9)   /* Holy Mantle: absorb one hit */
 #define ITEM_FLAG_FIRE_IMMUNE  (1 << 10)  /* Pyromaniac: immune+heal from blasts */
+#define ITEM_FLAG_ACTIVE       (1 << 11)  /* on-use active item (occupies the active slot) */
+#define ITEM_FLAG_BATTERY      (1 << 12)  /* doubles active-item charge capacity */
+#define ITEM_FLAG_FAMILIAR     (1 << 13)  /* grants an orbiting familiar */
 
 /* ---------- Item Definition ---------- */
 typedef struct {
@@ -378,6 +444,7 @@ typedef struct {
     int   hp_bonus;
     int   flags;             /* ITEM_FLAG_* */
     const char *description; /* short description shown on pickup */
+    int   charge;            /* active items: room-clears needed to use (0 = passive) */
 } ItemDef;
 
 /* ---------- Pedestal (item on ground) ---------- */
@@ -392,6 +459,7 @@ typedef struct {
     float x, y;
     float dx, dy;
     float dist;
+    float max_dist;
     int   active;
     int   piercing;
     int   spectral;
@@ -404,6 +472,11 @@ typedef struct {
     float rotation;      /* current rotation angle in radians */
     int   anim_frame;    /* animation counter for wobble/spin */
     int   is_enemy;      /* 1 = red/enemy tear, 0 = player blue tear */
+    unsigned int hit_mask; /* prevents piercing tears hitting one enemy every frame */
+    int   explosive;
+    int   bomb_tear;
+    int   knife;
+    int   laser;
 } Tear;
 
 /* ---------- Blood Splatter Particle ---------- */
@@ -433,6 +506,7 @@ typedef struct {
     float     dx, dy;
     int       hp;
     int       max_hp;    /* for boss HP bar */
+    float     damage_carry; /* preserves fractional tear damage between hits */
     int       active;
     int       timer;
     int       flash;
@@ -462,6 +536,7 @@ typedef struct {
     float     gemini_cdx, gemini_cdy; /* Gemini: companion velocity */
     int       gemini_split;     /* Gemini: 1 if tether broken */
     int       gemini_chp;       /* Gemini: companion HP */
+    int       gemini_cflash;    /* Gemini: companion hit-flash timer */
     int       famine_shoot_cd;  /* Famine: shoot cooldown */
     /* Champion / elite enemy state */
     ChampionType champion;      /* CHAMP_NONE if not a champion */
@@ -469,11 +544,30 @@ typedef struct {
     int       split_pending;    /* black champion: deferred split on death */
 } Enemy;
 
-/* ---------- Obstacle (rocks/pots) ---------- */
+/* ---------- Obstacle (rocks / poop / spikes) ---------- */
+typedef enum {
+    OBST_ROCK = 0,    /* indestructible by tears, blocks everything */
+    OBST_POOP,        /* destructible: 3 tear hits or a bomb, may drop pickup */
+    OBST_SPIKES       /* doesn't block anything, hurts the player on contact */
+} ObstacleType;
+
+#define POOP_HP 3
+
 typedef struct {
     float x, y;
     int   active;
+    int   type;       /* ObstacleType */
+    int   hp;         /* remaining hits (poop only) */
 } Obstacle;
+
+/* ---------- Familiar (orbiting helper granted by a passive item) ---------- */
+#define MAX_FAMILIARS 6
+typedef struct {
+    ItemType type;       /* ITEM_NONE = empty slot */
+    float    x, y;       /* world position (lerps toward orbit point) */
+    float    orbit_phase;/* angle around the player */
+    int      fire_cd;    /* frames until this familiar may fire again */
+} Familiar;
 
 /* ---------- Player Stats ---------- */
 typedef struct {
@@ -518,6 +612,17 @@ typedef struct {
     int   lives;            /* extra lives from Dead Cat etc. */
     int   holy_mantle_active; /* 1 if can absorb next hit */
     int   book_belial_dmg_timer; /* frames remaining of Book of Belial damage boost */
+    int   brimstone_charge;
+    Direction brimstone_dir;
+    /* Active item now lives in a dedicated slot (not the passive items[] list) */
+    ItemType active_item;   /* ITEM_NONE = no active held */
+    int   active_charge;    /* current room-charge for active item */
+    int   active_max_charge;/* max room-charge for current active item */
+    /* Held trinket (single passive pickup) */
+    TrinketType trinket;
+    /* Orbiting familiars granted by passive items */
+    Familiar familiars[MAX_FAMILIARS];
+    int   familiar_count;
     /* Magdalene Yum Heart cooldown (frames) */
     int   yum_heart_cd;
     /* Soul hearts */
@@ -528,6 +633,11 @@ typedef struct {
     float pill_range_bonus;
     float pill_luck_bonus;
     int   pill_max_hp_bonus;
+    /* Max HP permanently paid to devil deals (applied in recalc) */
+    int   devil_hp_paid;
+    /* Reserved headroom so future fields can be appended WITHOUT changing
+     * sizeof(Player) or breaking saved runs (see save.c versioned read). */
+    unsigned int reserved[24];
 } Player;
 
 /* ---------- Heart Pickup ---------- */
@@ -536,7 +646,7 @@ typedef struct {
 typedef enum {
     HEART_RED_FULL = 0,   /* heals 2 HP */
     HEART_RED_HALF,       /* heals 1 HP */
-    HEART_SOUL            /* adds 2 soul hearts (TODO: implement soul hearts) */
+    HEART_SOUL            /* adds one soul heart */
 } HeartType;
 
 typedef struct {
@@ -561,6 +671,7 @@ typedef struct {
     Obstacle obstacles[MAX_OBSTACLES];
     int      enemies_spawned;
     Pedestal pedestal;       /* item pedestal (for treasure rooms) */
+    Pedestal devil_pedestal; /* devil deal: item paid for with heart containers */
     int      has_trapdoor;   /* trapdoor to next floor */
     int      heart_count;
     HeartPickup hearts[MAX_HEART_PICKUPS];
@@ -626,6 +737,8 @@ typedef struct {
     int        best_floor;      /* high score: deepest floor reached (infinite mode) */
     int        mode_sel;        /* selection index for mode select screen (0-1) */
     int        diff_sel;        /* selection index for difficulty select screen (0-2) */
+    int        challenge_sel;   /* selection index for challenge screen */
+    int        active_challenge;/* ChallengeType, or CHALLENGE_NONE */
     Player     player;
     Tear       tears[MAX_TEARS];
     EnemyShot  enemy_shots[MAX_ENEMY_SHOTS];
@@ -666,17 +779,21 @@ typedef struct {
     int   bomb_flash;        /* visual flash counter */
     /* Shop feedback */
     int   shop_deny_timer;   /* cooldown timer for "can't afford" feedback */
+    int   trinket_swap_lock; /* frames before another trinket swap is allowed */
     /* Settings menu state */
     int   settings_sel;      /* selected item in settings screen (0-based) */
     int   settings_changed;  /* 1 if settings were modified (need save+restart) */
+    int   settings_erase_armed; /* erase-data row: 0=idle, 1=confirm, 2=done */
     /* Character select state */
     int   char_sel;          /* selection on character select screen (0-3) */
     CharacterType selected_character;
     /* Item description on pickup */
     int   pickup_msg_timer;  /* frames remaining to show pickup description */
+    int   pickup_msg_total;  /* original duration (for fade-in math) */
     char  pickup_msg_text[96];
     /* Stats screen */
     int   prev_state;        /* state to return to when un-pausing */
+    int   pause_sel;         /* selected option on pause menu (0-2) */
     /* Gameplay stat tracking */
     int   kills;             /* total enemy kills */
     int   play_time_frames;  /* total elapsed game frames (playing) */
@@ -732,9 +849,10 @@ void trigger_shake(Game *g, float intensity, int frames);
 void game_render_top(Game *g, C2D_TextBuf textBuf);
 void render_menu(Game *g, C2D_TextBuf textBuf);
 void render_mode_select(Game *g, C2D_TextBuf textBuf);
+void render_challenge_select(Game *g, C2D_TextBuf textBuf);
 void render_character_select(Game *g, C2D_TextBuf textBuf);
 void render_difficulty_select(Game *g, C2D_TextBuf textBuf);
-void render_controls(C2D_TextBuf textBuf);
+void render_controls(Game *g, C2D_TextBuf textBuf);
 void render_gameover(Game *g, C2D_TextBuf textBuf);
 void render_win(Game *g, C2D_TextBuf textBuf);
 void render_hud(Game *g, C2D_TextBuf textBuf);
@@ -749,12 +867,14 @@ void apply_pill_effect(Game *g, PillEffect e);
 void apply_tarot_card(Game *g, TarotCard c);
 void spawn_pill_pickup(Room *r, float x, float y, int effect);
 void spawn_card_pickup(Room *r, float x, float y, int card);
+void spawn_trinket_pickup(Room *r, float x, float y, int trinket);
 void start_new_game(Game *g);
 void apply_character_start(Game *g);
 const char *character_name(CharacterType c);
 const char *pill_name(PillEffect e, int known);
 const char *pill_color_name(int color_idx);
 const char *tarot_name(TarotCard c);
+const char *trinket_name(TrinketType t);
 const char *champion_name(ChampionType c);
 void enemy_make_champion(Enemy *e, ChampionType c);
 void enemy_drop_champion_reward(Game *g, Enemy *e);

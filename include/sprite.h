@@ -43,6 +43,10 @@ void spr_draw_at(C2D_SpriteSheet sheet, int idx, float x, float y, float scaleX,
 /* Draw sprite flipped horizontally */
 void spr_draw_fliph(C2D_SpriteSheet sheet, int idx, float cx, float cy, float scaleX, float scaleY);
 
+/* Draw flipped horizontally + tinted (e.g. hit-flash on a left-facing sprite) */
+void spr_draw_fliph_tinted(C2D_SpriteSheet sheet, int idx, float cx, float cy,
+                           float scaleX, float scaleY, u32 tintColor, float tintBlend);
+
 /* Draw with rotation (angle in radians) centered at (cx,cy) */
 void spr_draw_rotated(C2D_SpriteSheet sheet, int idx, float cx, float cy,
                       float scaleX, float scaleY, float angle);
