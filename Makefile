@@ -26,7 +26,7 @@ LIBDIRS     := $(CTRULIB)
 #---------------------------------------------------------------------------------
 ARCH     := -march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft
 
-CFLAGS   := -g -Wall -O2 -mword-relocations \
+CFLAGS   := -g -Wall -O2 -ffast-math -fomit-frame-pointer -mword-relocations \
 	    -ffunction-sections \
 	$(ARCH)
 

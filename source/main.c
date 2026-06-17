@@ -22,6 +22,7 @@
 #include "sprite.h"
 #include "audio.h"
 #include "config.h"
+#include "save.h"
 #include "menu_logo_atlas.h"
 #include "bulletatlas.h"
 #include "enemies_atlas.h"
@@ -32,9 +33,101 @@ static int g_sprites_loaded = 0;
 /* Early forward declarations needed before definitions appear later */
 static int is_boss_type(EnemyType t);
 static void spawn_heart(Room *r, float x, float y, HeartType type);
+static ItemType player_active_item(const Player *p);
+static void handle_touch_action_panel(Game *g);
+static void render_touch_action_panel(Game *g, C2D_TextBuf textBuf);
+static void apply_challenge_floor_rules(Game *g);
+static void apply_challenge_player_limits(Game *g);
+static void start_challenge(Game *g, ChallengeType challenge);
+static void explode_at(Game *g, float bx, float by, int damage_player);
+static void player_clamp_health(Player *p);
+static void spawn_blood_splatter(Game *g, float x, float y, float dx, float dy, int is_big);
+static void write_run_save(Game *g);
+static int  continue_saved_run(Game *g);
+static void delete_run_save(void);
+static const RunSaveData *get_continue_info(void);
 
 /* Global config (loaded from SD card on startup) */
 static GameConfig g_config;
+
+typedef struct {
+    const char *name;
+    const char *subtitle;
+    const char *rule_text;
+    CharacterType character;
+    Difficulty difficulty;
+    ItemType starting_items[3];
+    int starting_item_count;
+    int bombs;
+    int keys;
+    int coins;
+    int soul_hp;
+    int flags;
+} ChallengeDef;
+
+static const ChallengeDef challenge_defs[CHALLENGE_COUNT] = {
+    {
+        "DARKNESS FALLS",
+        "Homing spectral tears in permanent darkness.",
+        "No item rooms. The map is hidden.",
+        CHAR_ISAAC, DIFF_NORMAL,
+        { ITEM_SPOON_BENDER, ITEM_SPIRIT_SWORD, ITEM_NONE }, 2,
+        2, 1, 0, 0,
+        CHALLENGE_FLAG_PERMA_DARKNESS | CHALLENGE_FLAG_HIDE_MAP |
+        CHALLENGE_FLAG_NO_TREASURE
+    },
+    {
+        "GLASS CANNON",
+        "Massive damage. One heart. No healing drops.",
+        "Hard mode with no item rooms.",
+        CHAR_JUDAS, DIFF_HARD,
+        { ITEM_PENTAGRAM, ITEM_POLYPHEMUS, ITEM_NONE }, 2,
+        1, 1, 0, 0,
+        CHALLENGE_FLAG_ONE_HEART | CHALLENGE_FLAG_NO_HEART_DROPS |
+        CHALLENGE_FLAG_NO_TREASURE
+    },
+    {
+        "SPRAY AND PRAY",
+        "A storm of weak, triple, homing tears.",
+        "Crowded rooms and many champions.",
+        CHAR_CAIN, DIFF_HARD,
+        { ITEM_SOY_MILK, ITEM_INNER_EYE, ITEM_SPOON_BENDER }, 3,
+        2, 1, 3, 0,
+        CHALLENGE_FLAG_NO_TREASURE | CHALLENGE_FLAG_EXTRA_ENEMIES |
+        CHALLENGE_FLAG_MORE_CHAMPIONS
+    },
+    {
+        "THE TANK",
+        "Heavy health and a shield against brutal rooms.",
+        "No shops. Crowded champion-heavy floors.",
+        CHAR_MAGDALENE, DIFF_HARD,
+        { ITEM_HOLY_MANTLE, ITEM_LUNCH, ITEM_STIGMATA }, 3,
+        1, 1, 0, 0,
+        CHALLENGE_FLAG_NO_SHOPS | CHALLENGE_FLAG_EXTRA_ENEMIES |
+        CHALLENGE_FLAG_MORE_CHAMPIONS
+    },
+    {
+        "THE GAUNTLET",
+        "A pure combat run with almost no recovery.",
+        "No item rooms, shops, or heart drops.",
+        CHAR_ISAAC, DIFF_HARD,
+        { ITEM_HALO, ITEM_SAD_ONION, ITEM_HOLY_MANTLE }, 3,
+        2, 1, 0, 2,
+        CHALLENGE_FLAG_NO_TREASURE | CHALLENGE_FLAG_NO_SHOPS |
+        CHALLENGE_FLAG_NO_HEART_DROPS | CHALLENGE_FLAG_EXTRA_ENEMIES |
+        CHALLENGE_FLAG_MORE_CHAMPIONS
+    }
+};
+
+static const ChallengeDef *get_challenge_def(int challenge) {
+    if (challenge < 0 || challenge >= CHALLENGE_COUNT) return NULL;
+    return &challenge_defs[challenge];
+}
+
+static int challenge_has_flag(const Game *g, int flag) {
+    const ChallengeDef *def = get_challenge_def(g->active_challenge);
+    return def && (def->flags & flag);
+}
 
 /* ================================================================
  * Utility helpers
@@ -85,20 +178,20 @@ void init_item_pool(void) {
         "Piercing tears");
     DEF(ITEM_SPOON_BENDER,    "Spoon Bender",    0.0f,  0.0f,  0.0f,  0.0f,  0, ITEM_FLAG_HOMING,
         "Homing tears");
-    DEF(ITEM_POLYPHEMUS,      "Polyphemus",      1.5f,  0.0f, -1.0f,  0.0f,  0, 0,
+    DEF(ITEM_POLYPHEMUS,      "Polyphemus",      1.2f,  0.0f, -1.2f,  0.0f,  0, 0,
         "Bigger tears, slower fire");
     DEF(ITEM_INNER_EYE,       "Inner Eye",       0.0f,  0.0f, -1.5f,  0.0f,  0, ITEM_FLAG_TRIPLE,
         "Triple shot");
-    DEF(ITEM_SPELUNKER_HAT,   "Spelunker Hat",   0.0f,  0.0f,  0.0f,  1.5f,  0, 0,
-        "Range Up");
+    DEF(ITEM_SPELUNKER_HAT,   "Spelunker Hat",   0.0f,  0.0f,  0.0f,  0.0f,  0, 0,
+        "Reveals the floor map");
     DEF(ITEM_SPEED_BALL,      "Speed Ball",      0.0f,  0.3f,  0.5f,  0.0f,  0, 0,
         "Speed + Tears");
-    DEF(ITEM_MAGIC_MUSH,      "Magic Mushroom",  0.5f,  0.0f,  0.0f,  1.0f,  2, 0,
+    DEF(ITEM_MAGIC_MUSH,      "Magic Mushroom",  0.4f,  0.2f,  0.3f,  0.8f,  2, 0,
         "All stats up");
-    DEF(ITEM_SACRED_HEART,    "Sacred Heart",    1.0f, -0.3f,  0.0f,  0.0f,  0, ITEM_FLAG_HOMING,
-        "Big damage, homing");
-    DEF(ITEM_SPIRIT_SWORD,    "Spirit Sword",    0.0f,  0.0f,  0.0f,  0.0f,  0, ITEM_FLAG_SPECTRAL,
-        "Spectral tears");
+    DEF(ITEM_SACRED_HEART,    "Sacred Heart",    1.2f,  0.0f, -0.7f,  0.4f,  0, ITEM_FLAG_HOMING,
+        "Huge damage and homing");
+    DEF(ITEM_SPIRIT_SWORD,    "Spirit Sword",    0.6f,  0.0f, -0.8f, -0.6f,  0, ITEM_FLAG_KNIFE | ITEM_FLAG_PIERCING,
+        "Short-range piercing sword");
     DEF(ITEM_BLOOD_OF_MARTYR, "Blood Martyr",    0.5f,  0.0f,  0.0f,  0.0f,  0, 0,
         "Damage Up");
     DEF(ITEM_STIGMATA,        "Stigmata",        0.3f,  0.0f,  0.0f,  0.0f,  2, 0,
@@ -111,20 +204,20 @@ void init_item_pool(void) {
         "Damage + Speed");
     DEF(ITEM_JESUS_JUICE,     "Jesus Juice",     0.5f,  0.0f,  0.0f,  0.5f,  0, 0,
         "Damage + Range");
-    DEF(ITEM_HALO,            "The Halo",        0.3f,  0.2f,  0.2f,  0.5f,  2, 0,
+    DEF(ITEM_HALO,            "The Halo",        0.25f,  0.15f,  0.15f,  0.4f,  2, 0,
         "All stats up");
     /* --- New expansion items --- */
-    DEF(ITEM_MOMS_KNIFE,      "Mom's Knife",     1.0f,  0.0f, -1.5f,  0.5f,  0, ITEM_FLAG_KNIFE | ITEM_FLAG_PIERCING,
+    DEF(ITEM_MOMS_KNIFE,      "Mom's Knife",     0.7f,  0.0f, -2.0f,  0.4f,  0, ITEM_FLAG_KNIFE | ITEM_FLAG_PIERCING,
         "Throws a piercing knife");
-    DEF(ITEM_BRIMSTONE,       "Brimstone",       1.5f,  0.0f, -2.0f,  0.0f,  0, ITEM_FLAG_BRIMSTONE,
+    DEF(ITEM_BRIMSTONE,       "Brimstone",       1.0f,  0.0f, -2.5f,  0.0f,  0, ITEM_FLAG_BRIMSTONE,
         "Charged blood laser");
-    DEF(ITEM_TECHNOLOGY,      "Technology",      0.4f,  0.0f,  0.0f,  0.5f,  0, ITEM_FLAG_LASER,
+    DEF(ITEM_TECHNOLOGY,      "Technology",      0.25f, 0.0f,  0.0f,  0.4f,  0, ITEM_FLAG_LASER,
         "Continuous laser eye");
-    DEF(ITEM_NUMBER_ONE,      "Number One",      0.0f,  0.0f,  2.0f, -0.5f,  0, 0,
+    DEF(ITEM_NUMBER_ONE,      "Number One",      0.0f,  0.0f,  1.5f, -0.5f,  0, 0,
         "Huge fire rate, short range");
-    DEF(ITEM_DR_FETUS,        "Dr. Fetus",       1.2f,  0.0f, -1.5f,  0.0f,  0, ITEM_FLAG_BOMB_TEAR,
+    DEF(ITEM_DR_FETUS,        "Dr. Fetus",       0.8f,  0.0f, -2.0f,  0.0f,  0, ITEM_FLAG_BOMB_TEAR,
         "Shoots bombs");
-    DEF(ITEM_EPIC_FETUS,      "Epic Fetus",      1.8f,  0.0f, -2.0f,  0.5f,  0, ITEM_FLAG_BOMB_TEAR | ITEM_FLAG_EXPLOSIVE,
+    DEF(ITEM_EPIC_FETUS,      "Epic Fetus",      1.2f,  0.0f, -2.8f,  0.4f,  0, ITEM_FLAG_BOMB_TEAR | ITEM_FLAG_EXPLOSIVE,
         "Targeted bomb strikes");
     DEF(ITEM_DEAD_CAT,        "Dead Cat",        0.0f,  0.0f,  0.0f,  0.0f,  0, 0,
         "9 lives. Max HP set to 1");
@@ -132,17 +225,49 @@ void init_item_pool(void) {
         "Absorb one hit per room");
     DEF(ITEM_PYROMANIAC,      "Pyromaniac",      0.0f,  0.0f,  0.0f,  0.0f,  0, ITEM_FLAG_FIRE_IMMUNE,
         "Explosions heal you");
-    DEF(ITEM_IPECAC,          "Ipecac",          1.0f,  0.0f, -1.0f,  0.0f,  0, ITEM_FLAG_EXPLOSIVE,
+    DEF(ITEM_IPECAC,          "Ipecac",          0.7f,  0.0f, -1.5f,  0.0f,  0, ITEM_FLAG_EXPLOSIVE,
         "Explosive tears");
-    DEF(ITEM_SOY_MILK,        "Soy Milk",       -0.5f,  0.0f,  3.0f,  0.0f,  0, 0,
+    DEF(ITEM_SOY_MILK,        "Soy Milk",       -0.7f,  0.0f,  2.4f,  0.0f,  0, 0,
         "Tiny tears, huge fire rate");
-    DEF(ITEM_YUM_HEART,       "Yum Heart",       0.0f,  0.0f,  0.0f,  0.0f,  0, 0,
-        "Active: heal half a heart");
-    DEF(ITEM_LUCKY_FOOT,      "Lucky Foot",      0.0f,  0.1f,  0.0f,  0.0f,  0, 0,
+    DEF(ITEM_YUM_HEART,       "Yum Heart",       0.0f,  0.0f,  0.0f,  0.0f,  0, ITEM_FLAG_ACTIVE,
+        "Active: heal one heart");
+    DEF(ITEM_LUCKY_FOOT,      "Lucky Foot",      0.0f,  0.0f,  0.0f,  0.0f,  0, 0,
         "Luck up, better drops");
-    DEF(ITEM_BOOK_OF_BELIAL,  "Book of Belial",  0.0f,  0.0f,  0.0f,  0.0f,  0, 0,
+    DEF(ITEM_BOOK_OF_BELIAL,  "Book of Belial",  0.0f,  0.0f,  0.0f,  0.0f,  0, ITEM_FLAG_ACTIVE,
         "Active: +damage this room");
+    /* --- New active items (occupy the active slot) --- */
+    DEF(ITEM_NECRONOMICON,    "Necronomicon",    0.0f,  0.0f,  0.0f,  0.0f,  0, ITEM_FLAG_ACTIVE,
+        "Active: hurt all enemies");
+    DEF(ITEM_BIBLE,           "The Bible",       0.0f,  0.0f,  0.0f,  0.0f,  0, ITEM_FLAG_ACTIVE,
+        "Active: full heal");
+    DEF(ITEM_MOMS_BRA,        "Mom's Bra",       0.0f,  0.0f,  0.0f,  0.0f,  0, ITEM_FLAG_ACTIVE,
+        "Active: clear enemy shots");
+    DEF(ITEM_FORGET_ME_NOW,   "Forget Me Now",   0.0f,  0.0f,  0.0f,  0.0f,  0, ITEM_FLAG_ACTIVE,
+        "Active: re-roll the floor");
+    DEF(ITEM_D6,              "The D6",          0.0f,  0.0f,  0.0f,  0.0f,  0, ITEM_FLAG_ACTIVE,
+        "Active: re-roll room items");
+    /* --- Active-charge economy --- */
+    DEF(ITEM_BATTERY,         "The Battery",     0.0f,  0.0f,  0.0f,  0.0f,  0, ITEM_FLAG_BATTERY,
+        "Hold a double active charge");
+    /* --- Familiars (orbiting helpers) --- */
+    DEF(ITEM_BROTHER_BOBBY,   "Brother Bobby",   0.0f,  0.0f,  0.0f,  0.0f,  0, ITEM_FLAG_FAMILIAR,
+        "Familiar fires tears");
+    DEF(ITEM_SISTER_MAGGY,    "Sister Maggy",    0.0f,  0.0f,  0.0f,  0.0f,  0, ITEM_FLAG_FAMILIAR,
+        "Familiar fires heavy tears");
+    DEF(ITEM_LITTLE_STEVEN,   "Little Steven",   0.0f,  0.0f,  0.0f,  0.0f,  0, ITEM_FLAG_FAMILIAR,
+        "Familiar fires homing tears");
+    DEF(ITEM_DEMON_BABY,      "Demon Baby",      0.0f,  0.0f,  0.0f,  0.0f,  0, ITEM_FLAG_FAMILIAR,
+        "Familiar fires rapidly");
     #undef DEF
+
+    /* Active-item charge requirements (room-clears needed to fire). */
+    item_pool[ITEM_YUM_HEART].charge      = 4;
+    item_pool[ITEM_BOOK_OF_BELIAL].charge = 6;
+    item_pool[ITEM_NECRONOMICON].charge   = 6;
+    item_pool[ITEM_BIBLE].charge          = 4;
+    item_pool[ITEM_MOMS_BRA].charge       = 4;
+    item_pool[ITEM_FORGET_ME_NOW].charge  = 6;
+    item_pool[ITEM_D6].charge             = 6;
 }
 
 const ItemDef *get_item_def(ItemType type) {
@@ -157,12 +282,12 @@ const ItemDef *get_item_def(ItemType type) {
 /*                name        hp_bonus  base_boss_hp  spd_mult  boss_hp_sc  boss_spd_sc  tier */
 static const FloorInfo floors[MAX_FLOORS] = {
     { "Basement I",    0,       20,       1.0f,      1.0f,       1.0f,    BOSS_TIER_BASEMENT },
-    { "Basement II",   1,       25,       1.1f,      1.2f,       1.05f,   BOSS_TIER_BASEMENT },
-    { "Caves I",       2,       32,       1.2f,      1.35f,      1.1f,    BOSS_TIER_CAVES    },
-    { "Caves II",      3,       40,       1.3f,      1.5f,       1.15f,   BOSS_TIER_CAVES    },
-    { "Depths",        4,       50,       1.4f,      1.7f,       1.25f,   BOSS_TIER_DEPTHS   },
-    { "The Womb",      6,       65,       1.5f,      1.9f,       1.35f,   BOSS_TIER_WOMB     },
-    { "Sheol",         9,       85,       1.6f,      2.2f,       1.5f,    BOSS_TIER_SHEOL    },
+    { "Basement II",   1,       24,       1.05f,     1.15f,      1.03f,   BOSS_TIER_BASEMENT },
+    { "Caves I",       2,       30,       1.15f,     1.3f,       1.08f,   BOSS_TIER_CAVES    },
+    { "Caves II",      3,       38,       1.22f,     1.42f,      1.12f,   BOSS_TIER_CAVES    },
+    { "Depths",        4,       48,       1.3f,      1.6f,       1.18f,   BOSS_TIER_DEPTHS   },
+    { "The Womb",      5,       60,       1.4f,      1.8f,       1.28f,   BOSS_TIER_WOMB     },
+    { "Sheol",         7,       78,       1.5f,      2.0f,       1.38f,   BOSS_TIER_SHEOL    },
 };
 
 const FloorInfo *get_floor_info(int floor_num) {
@@ -186,16 +311,16 @@ float diff_enemy_hp_mult(Difficulty d) {
 /* Heart drop chance threshold out of 100 (higher = more hearts) */
 float diff_heart_drop_rate(Difficulty d) {
     switch (d) {
-        case DIFF_EASY:   return 40.0f;
-        case DIFF_HARD:   return 20.0f;
-        default:          return 30.0f;  /* Normal: full=10, half=30 */
+        case DIFF_EASY:   return 32.0f;
+        case DIFF_HARD:   return 16.0f;
+        default:          return 24.0f;  /* Normal: full~8, half~24 */
     }
 }
 
 float diff_shop_price_mult(Difficulty d) {
     switch (d) {
-        case DIFF_EASY:   return 0.85f;
-        case DIFF_HARD:   return 1.4f;
+        case DIFF_EASY:   return 0.95f;
+        case DIFF_HARD:   return 1.5f;
         default:          return 1.0f;
     }
 }
@@ -216,13 +341,13 @@ typedef struct {
 static const BossPool boss_pools[BOSS_POOL_TIERS] = {
     /* BOSS_TIER_BASEMENT (Floors 0-1): Classic Basement bosses + Haunt/Widow/Pin.
      * Haunt and Widow added here for variety on early floors. */
-    { { ENEMY_BOSS_DUKE, ENEMY_BOSS_MONSTRO, ENEMY_BOSS_LARRY, ENEMY_BOSS_GEMINI, ENEMY_BOSS_HAUNT, ENEMY_BOSS_PIN }, 6 },
+    { { ENEMY_BOSS_DUKE, ENEMY_BOSS_MONSTRO, ENEMY_BOSS_LARRY, ENEMY_BOSS_GEMINI, ENEMY_BOSS_PIN }, 5 },
 
     /* BOSS_TIER_CAVES (Floors 2-3): Mid-tier bosses. Add Peep, Gurdy. */
-    { { ENEMY_BOSS_PEEP, ENEMY_BOSS_GURDY, ENEMY_BOSS_GEMINI, ENEMY_BOSS_LARRY, ENEMY_BOSS_FAMINE, ENEMY_BOSS_WIDOW }, 6 },
+    { { ENEMY_BOSS_PEEP, ENEMY_BOSS_GURDY, ENEMY_BOSS_GEMINI, ENEMY_BOSS_LARRY, ENEMY_BOSS_FAMINE, ENEMY_BOSS_PIN }, 6 },
 
     /* BOSS_TIER_DEPTHS (Floor 4): Hardest standard bosses. */
-    { { ENEMY_BOSS_FAMINE, ENEMY_BOSS_GURDY, ENEMY_BOSS_PEEP, ENEMY_BOSS_GEMINI, ENEMY_BOSS_MONSTRO, ENEMY_BOSS_PIN }, 6 },
+    { { ENEMY_BOSS_FAMINE, ENEMY_BOSS_GURDY, ENEMY_BOSS_PEEP, ENEMY_BOSS_HAUNT, ENEMY_BOSS_WIDOW, ENEMY_BOSS_MONSTRO }, 6 },
 
     /* BOSS_TIER_WOMB (Floor 5): Late-game bosses with high HP. */
     { { ENEMY_BOSS_GURDY, ENEMY_BOSS_PEEP, ENEMY_BOSS_FAMINE, ENEMY_BOSS_HAUNT, ENEMY_BOSS_WIDOW, ENEMY_BOSS_PIN }, 6 },
@@ -265,7 +390,7 @@ int get_boss_base_hp(EnemyType boss, int floor_num) {
     int scaled = (int)(base * fi->boss_hp_scale) + fi->enemy_hp_bonus * 2;
     /* Clamp to reasonable range */
     if (scaled < 15) scaled = 15;
-    if (scaled > 80) scaled = 80;
+    if (scaled > 120) scaled = 120;
     return scaled;
 }
 
@@ -417,17 +542,17 @@ void recalc_player_stats(Player *p) {
     switch (p->character) {
         case CHAR_MAGDALENE:
             p->stats.max_hp = 8;          /* 4 hearts */
-            p->stats.speed *= 0.85f;
+            p->stats.speed *= 0.9f;
             break;
         case CHAR_CAIN:
             p->stats.max_hp = 4;          /* 2 hearts */
-            p->stats.damage *= 1.2f;
-            p->stats.speed  *= 1.1f;
+            p->stats.damage *= 1.15f;
+            p->stats.speed  *= 1.05f;
             p->stats.luck   += 1.0f;
             break;
         case CHAR_JUDAS:
             p->stats.max_hp = 2;          /* 1 heart - glass cannon */
-            p->stats.damage *= 1.35f;
+            p->stats.damage *= 1.25f;
             break;
         case CHAR_ISAAC:
         default:
@@ -449,7 +574,7 @@ void recalc_player_stats(Player *p) {
     }
 
     /* Book of Belial active damage buff */
-    if (p->book_belial_dmg_timer > 0) p->stats.damage += 1.5f;
+    if (p->book_belial_dmg_timer > 0) p->stats.damage += 1.0f;
 
     /* Persistent pill stat bonuses (preserved across item pickups) */
     p->stats.speed     += p->pill_speed_bonus;
@@ -457,6 +582,43 @@ void recalc_player_stats(Player *p) {
     p->stats.range     += p->pill_range_bonus;
     p->stats.luck      += p->pill_luck_bonus;
     p->stats.max_hp    += p->pill_max_hp_bonus;
+
+    /* Heart containers permanently sold to devil deals */
+    p->stats.max_hp    -= p->devil_hp_paid;
+
+    /* Trinket passive stat effects (held single trinket) */
+    switch (p->trinket) {
+        case TRINKET_CANCER:      p->stats.fire_rate += 0.5f; break;
+        case TRINKET_CURVED_HORN: p->stats.damage    += 1.0f; break;
+        case TRINKET_RABBIT_FOOT: p->stats.luck      += 1.0f; break;
+        default: break;
+    }
+
+    /* Rebuild the familiar roster from held familiar-granting items. Slots
+     * keep their runtime state (orbit/cooldown) when membership is unchanged
+     * so frequent recalcs (pills, room buffs) don't reset the orbit. */
+    {
+        ItemType desired[MAX_FAMILIARS];
+        int dn = 0;
+        for (int i = 0; i < p->item_count && dn < MAX_FAMILIARS; i++) {
+            const ItemDef *fd = get_item_def(p->items[i]);
+            if (fd && (fd->flags & ITEM_FLAG_FAMILIAR)) desired[dn++] = p->items[i];
+        }
+        for (int i = 0; i < MAX_FAMILIARS; i++) {
+            if (i < dn) {
+                if (p->familiars[i].type != desired[i]) {
+                    p->familiars[i].type = desired[i];
+                    p->familiars[i].orbit_phase = (float)i * 1.4f;
+                    p->familiars[i].x = p->x;
+                    p->familiars[i].y = p->y;
+                    p->familiars[i].fire_cd = 0;
+                }
+            } else {
+                p->familiars[i].type = ITEM_NONE;
+            }
+        }
+        p->familiar_count = dn;
+    }
 
     /* Clamp stats */
     if (p->stats.damage < 0.3f) p->stats.damage = 0.3f;
@@ -467,6 +629,7 @@ void recalc_player_stats(Player *p) {
     if (p->stats.fire_rate < -3.0f) p->stats.fire_rate = -3.0f;
     if (p->stats.max_hp > PLAYER_MAX_HP_CAP) p->stats.max_hp = PLAYER_MAX_HP_CAP;
     if (p->stats.max_hp < 2) p->stats.max_hp = 2;
+    player_clamp_health(p);
 }
 
 /* Damage absorption: holy_mantle blocks all, soul hearts absorb first.
@@ -483,6 +646,17 @@ static int player_absorb_dmg(Player *p, int dmg) {
     return dmg;
 }
 
+static void player_clamp_health(Player *p) {
+    if (p->stats.max_hp < 2) p->stats.max_hp = 2;
+    if (p->stats.max_hp > PLAYER_MAX_HP_CAP) p->stats.max_hp = PLAYER_MAX_HP_CAP;
+    if (p->hp < 0) p->hp = 0;
+    if (p->hp > p->stats.max_hp) p->hp = p->stats.max_hp;
+    if (p->soul_hp < 0) p->soul_hp = 0;
+    int soul_cap = PLAYER_MAX_HP_CAP - p->stats.max_hp;
+    if (soul_cap < 0) soul_cap = 0;
+    if (p->soul_hp > soul_cap) p->soul_hp = soul_cap;
+}
+
 /* Check if player owns a particular item */
 static int player_has_item(const Player *p, ItemType type) {
     for (int i = 0; i < p->item_count; i++) {
@@ -491,12 +665,80 @@ static int player_has_item(const Player *p, ItemType type) {
     return 0;
 }
 
+/* Does the player hold any passive item carrying the given flag? */
+static int player_has_item_flag(const Player *p, int flag) {
+    for (int i = 0; i < p->item_count; i++) {
+        const ItemDef *def = get_item_def(p->items[i]);
+        if (def && (def->flags & flag)) return 1;
+    }
+    return 0;
+}
+
+static ItemType player_active_item(const Player *p) {
+    return p->active_item;
+}
+
+/* Charge a single use of the active item costs / needs to be "ready". */
+static int active_use_cost(const Player *p) {
+    const ItemDef *def = get_item_def(p->active_item);
+    return def ? def->charge : 0;
+}
+
+/* Recompute max charge for the held active, accounting for The Battery
+ * (doubles capacity so a full bar banks two uses). */
+static void refresh_active_charge(Player *p) {
+    int cost = active_use_cost(p);
+    if (cost <= 0) {
+        p->active_max_charge = 0;
+        p->active_charge = 0;
+        return;
+    }
+    int mult = player_has_item_flag(p, ITEM_FLAG_BATTERY) ? 2 : 1;
+    p->active_max_charge = cost * mult;
+    if (p->active_charge > p->active_max_charge) p->active_charge = p->active_max_charge;
+}
+
+static int active_item_is_ready(const Player *p) {
+    int cost = active_use_cost(p);
+    return cost > 0 && p->active_charge >= cost;
+}
+
+/* Apply the on-use effect; returns 1 if the charge should actually be spent
+ * (0 = no-op, e.g. Yum Heart used at full health). Defined later, where its
+ * dependencies (handle_enemy_death, pick_random_item, floor reroll) live. */
+static int do_active_item_effect(Game *g, ItemType item);
+
+static void try_use_active_item(Game *g) {
+    Player *p = &g->player;
+    if (p->active_item == ITEM_NONE) return;
+    if (!active_item_is_ready(p)) return;
+
+    /* Spend the charge BEFORE running the effect: some effects (Forget Me Now)
+     * checkpoint the run mid-effect via write_run_save, which would otherwise
+     * snapshot the un-spent charge and let a Continue refund the use. Refund
+     * here only if the effect turned out to be a no-op. */
+    int cost = active_use_cost(p);
+    p->active_charge -= cost;
+    if (p->active_charge < 0) p->active_charge = 0;
+
+    if (do_active_item_effect(g, p->active_item)) {
+        audio_play(SFX_PICKUP);
+    } else {
+        p->active_charge += cost;  /* no-op (e.g. heal at full HP): refund */
+    }
+}
+
 /* Check if player is dead. If lives > 0, respawn at full HP. Returns 1 if truly dead. */
 static int player_check_death(Player *p) {
     if (p->hp > 0) return 0;
     if (p->lives > 0) {
         p->lives--;
         p->hp = p->stats.max_hp;
+        p->iframes = PLAYER_IFRAMES;
+        p->kb_timer = 0;
+        p->vx = 0.0f;
+        p->vy = 0.0f;
+        if (p->stats.flags & ITEM_FLAG_MANTLE) p->holy_mantle_active = 1;
         return 0;
     }
     return 1;
@@ -504,16 +746,33 @@ static int player_check_death(Player *p) {
 
 void collect_item(Game *g, ItemType item) {
     Player *p = &g->player;
-    if (p->item_count >= MAX_ITEMS_HELD) return;
+    const ItemDef *def = get_item_def(item);
 
+    /* Active items occupy a dedicated slot, not the passive list. Picking up
+     * a new active replaces the one held and arrives fully charged. */
+    if (def && (def->flags & ITEM_FLAG_ACTIVE)) {
+        p->active_item = item;
+        refresh_active_charge(p);
+        p->active_charge = p->active_max_charge;
+        if (def->name) {
+            snprintf(g->pickup_msg_text, sizeof(g->pickup_msg_text),
+                     "%s - %s", def->name,
+                     def->description ? def->description : "");
+            g->pickup_msg_timer = 180;
+            g->pickup_msg_total = 180;
+        }
+        return;
+    }
+
+    /* Passive item: add to the held list (capped). */
+    if (p->item_count >= MAX_ITEMS_HELD) return;
     p->items[p->item_count++] = item;
-    recalc_player_stats(p);
+    recalc_player_stats(p);   /* also rebuilds the familiar roster */
 
     /* Heal for HP bonus items */
-    const ItemDef *def = get_item_def(item);
     if (def && def->hp_bonus > 0) {
         p->hp += def->hp_bonus;
-        if (p->hp > p->stats.max_hp) p->hp = p->stats.max_hp;
+        player_clamp_health(p);
     }
 
     /* Show pickup name + description on top screen */
@@ -522,6 +781,7 @@ void collect_item(Game *g, ItemType item) {
                  "%s - %s", def->name,
                  def->description ? def->description : "");
         g->pickup_msg_timer = 180;  /* 3 seconds at 60fps */
+        g->pickup_msg_total = 180;
     }
 
     /* Dead Cat: grant 9 lives, max HP set to 1 (handled in recalc) */
@@ -533,13 +793,37 @@ void collect_item(Game *g, ItemType item) {
     if (item == ITEM_HOLY_MANTLE) {
         p->holy_mantle_active = 1;
     }
+    if (item == ITEM_SPELUNKER_HAT) {
+        g->map_revealed = 1;
+    }
+    /* The Battery just changed active-charge capacity */
+    if (item == ITEM_BATTERY) {
+        refresh_active_charge(p);
+    }
+    apply_challenge_player_limits(g);
 }
 
 static int get_tear_cooldown(Player *p) {
+    if (p->stats.flags & ITEM_FLAG_LASER) return 2;
     float cd = (float)BASE_TEAR_COOLDOWN - p->stats.fire_rate * 2.0f;
     if (cd < 3.0f) cd = 3.0f;
     if (cd > 30.0f) cd = 30.0f;
     return (int)cd;
+}
+
+static float display_tears_stat(const Player *p) {
+    float cd = (float)BASE_TEAR_COOLDOWN - p->stats.fire_rate * 2.0f;
+    if (cd < 3.0f) cd = 3.0f;
+    if (cd > 30.0f) cd = 30.0f;
+    return 60.0f / cd;
+}
+
+static float display_speed_stat(const Player *p) {
+    return p->stats.speed / PLAYER_BASE_SPEED;
+}
+
+static float display_range_stat(const Player *p) {
+    return p->stats.range / 20.0f;
 }
 
 /* ================================================================
@@ -657,20 +941,81 @@ static int is_on_critical_path(Dungeon *d, int rx, int ry) {
     return !connected; /* if removing it breaks connectivity, it's critical */
 }
 
+static int item_rarity_weight(ItemType item) {
+    switch (item) {
+        case ITEM_SACRED_HEART:
+        case ITEM_POLYPHEMUS:
+        case ITEM_BRIMSTONE:
+        case ITEM_MOMS_KNIFE:
+        case ITEM_EPIC_FETUS:
+        case ITEM_HOLY_MANTLE:
+        case ITEM_PYROMANIAC:
+        case ITEM_IPECAC:
+            return 1;
+
+        case ITEM_TECHNOLOGY:
+        case ITEM_INNER_EYE:
+        case ITEM_MAGIC_MUSH:
+        case ITEM_SOY_MILK:
+        case ITEM_DR_FETUS:
+        case ITEM_DEAD_CAT:
+        case ITEM_SPOON_BENDER:
+        case ITEM_SPIRIT_SWORD:
+            return 2;
+
+        case ITEM_HALO:
+        case ITEM_GROWTH_HORMONES:
+        case ITEM_JESUS_JUICE:
+        case ITEM_PENTAGRAM:
+        case ITEM_BLOOD_OF_MARTYR:
+        case ITEM_SAD_ONION:
+        case ITEM_WIRE_COAT:
+        case ITEM_SPEED_BALL:
+        case ITEM_SPELUNKER_HAT:
+        case ITEM_LUNCH:
+        case ITEM_STIGMATA:
+            return 4;
+
+        default:
+            return 3;
+    }
+}
+
+static int item_is_active(ItemType item) {
+    const ItemDef *def = get_item_def(item);
+    return def && (def->flags & ITEM_FLAG_ACTIVE);
+}
+
 /* Pick a random item that the player doesn't already have */
 static ItemType pick_random_item(Game *g) {
     /* Build pool of items not yet collected */
     ItemType available[ITEM_COUNT];
     int avail_count = 0;
+    int has_active = player_active_item(&g->player) != ITEM_NONE;
     for (int t = 1; t < ITEM_COUNT; t++) {
         int has = 0;
         for (int j = 0; j < g->player.item_count; j++) {
             if (g->player.items[j] == (ItemType)t) { has = 1; break; }
         }
-        if (!has) available[avail_count++] = (ItemType)t;
+        if (!has && !(has_active && item_is_active((ItemType)t))) {
+            available[avail_count++] = (ItemType)t;
+        }
     }
     if (avail_count == 0) return ITEM_PENTAGRAM; /* fallback */
-    return available[randi(0, avail_count - 1)];
+
+    int total_weight = 0;
+    for (int i = 0; i < avail_count; i++) {
+        total_weight += item_rarity_weight(available[i]);
+    }
+
+    int roll = randi(1, total_weight);
+    int accum = 0;
+    for (int i = 0; i < avail_count; i++) {
+        accum += item_rarity_weight(available[i]);
+        if (roll <= accum) return available[i];
+    }
+
+    return available[avail_count - 1];
 }
 
 void dungeon_generate(Dungeon *d, int floor_num) {
@@ -860,18 +1205,6 @@ void dungeon_generate(Dungeon *d, int floor_num) {
                     }
                 }
             }
-            /* Fallback: allow curse on critical path if no other option */
-            for (int ry = 0; ry < DUNGEON_H; ry++) {
-                for (int rx = 0; rx < DUNGEON_W; rx++) {
-                    if (d->rooms[ry][rx].type == ROOM_NORMAL) {
-                        int dist_start = abs(rx - sx) + abs(ry - sy);
-                        if (dist_start >= 2) {
-                            d->rooms[ry][rx].type = ROOM_CURSE;
-                            goto done_curse;
-                        }
-                    }
-                }
-            }
             done_curse:;
         }
 
@@ -937,6 +1270,19 @@ static void place_obstacles(Room *r) {
         o->x = randf(ROOM_LEFT + 50, ROOM_RIGHT - 50);
         o->y = randf(ROOM_TOP + 50, ROOM_BOTTOM - 50);
         o->active = 1;
+        /* Mix of obstacle types: rocks block, poop breaks, spikes hurt.
+         * No spikes in boss rooms - charging bosses make them unfair. */
+        int roll = randi(0, 99);
+        if (roll < 50) {
+            o->type = OBST_ROCK;
+            o->hp = 0;
+        } else if (roll < 85 || r->type == ROOM_BOSS) {
+            o->type = OBST_POOP;
+            o->hp = POOP_HP;
+        } else {
+            o->type = OBST_SPIKES;
+            o->hp = 0;
+        }
         r->obstacle_count++;
     }
 }
@@ -960,16 +1306,33 @@ void spawn_consumable(Room *r, float x, float y, PickupType type) {
 /* Spawn random consumable drop (weighted) */
 static void spawn_random_consumable(Room *r, float x, float y) {
     int roll = randi(0, 100);
-    if (roll < 40) {
+    if (roll < 45) {
         spawn_consumable(r, x, y, PICKUP_COIN);
-    } else if (roll < 65) {
+    } else if (roll < 68) {
         spawn_consumable(r, x, y, PICKUP_BOMB);
-    } else if (roll < 85) {
+    } else if (roll < 86) {
         spawn_consumable(r, x, y, PICKUP_KEY);
     } else if (roll < 95) {
         spawn_consumable(r, x, y, PICKUP_COIN5);
     } else {
         spawn_consumable(r, x, y, PICKUP_BOMB2);
+    }
+}
+
+static void spawn_room_clear_reward(Game *g, Room *r) {
+    float rx = (ROOM_LEFT + ROOM_RIGHT) / 2.0f;
+    float ry = (ROOM_TOP + ROOM_BOTTOM) / 2.0f;
+
+    if (g->player.keys <= 0) {
+        spawn_consumable(r, rx, ry, PICKUP_KEY);
+    } else if (g->player.bombs <= 0) {
+        spawn_consumable(r, rx, ry, PICKUP_BOMB);
+    } else if (g->player.coins < 5) {
+        spawn_consumable(r, rx, ry, PICKUP_COIN);
+    } else if (randi(0, 99) < 50) {
+        spawn_consumable(r, rx, ry, PICKUP_COIN);
+    } else {
+        spawn_consumable(r, rx, ry, PICKUP_BOMB);
     }
 }
 
@@ -1013,7 +1376,7 @@ void room_spawn_enemies(Game *g, Room *r) {
         r->enemy_count = 0;
         r->cleared = 1;
         /* Populate shop items (no duplicates within same shop) */
-        r->shop_count = randi(2, MAX_SHOP_ITEMS);
+        r->shop_count = (g->current_floor < 2) ? 2 : randi(2, MAX_SHOP_ITEMS);
         float shopX_start = ROOM_LEFT + 60;
         float shopSpacing = (ROOM_RIGHT - ROOM_LEFT - 120) / (float)(r->shop_count > 1 ? r->shop_count - 1 : 1);
         ItemType shop_used[MAX_SHOP_ITEMS];
@@ -1038,11 +1401,11 @@ void room_spawn_enemies(Game *g, Room *r) {
             if (si->cost < 1) si->cost = 1;
             si->active = 1;
         }
-        /* Sprinkle a free pill/card in the shop as additional loot */
-        if (randi(0, 100) < 60) {
+        /* Occasionally add one small free extra so shops still feel rewarding */
+        if (randi(0, 100) < 20) {
             spawn_pill_pickup(r, ROOM_LEFT + 40, ROOM_BOTTOM - 40, randi(0, PILL_EFFECT_COUNT - 1));
         }
-        if (randi(0, 100) < 60) {
+        if (randi(0, 100) < 20) {
             spawn_card_pickup(r, ROOM_RIGHT - 40, ROOM_BOTTOM - 40, randi(0, TAROT_COUNT - 1));
         }
         return;
@@ -1053,11 +1416,19 @@ void room_spawn_enemies(Game *g, Room *r) {
         r->cleared = 1;
         /* Secret rooms always have good loot */
         spawn_consumable(r, (ROOM_LEFT + ROOM_RIGHT) / 2.0f - 15,
-                         (ROOM_TOP + ROOM_BOTTOM) / 2.0f, PICKUP_BOMB2);
+                         (ROOM_TOP + ROOM_BOTTOM) / 2.0f, PICKUP_BOMB);
         spawn_consumable(r, (ROOM_LEFT + ROOM_RIGHT) / 2.0f + 15,
                          (ROOM_TOP + ROOM_BOTTOM) / 2.0f, PICKUP_COIN5);
-        spawn_consumable(r, (ROOM_LEFT + ROOM_RIGHT) / 2.0f,
-                         (ROOM_TOP + ROOM_BOTTOM) / 2.0f - 15, PICKUP_KEY);
+        if (g->current_floor >= 2) {
+            spawn_consumable(r, (ROOM_LEFT + ROOM_RIGHT) / 2.0f,
+                             (ROOM_TOP + ROOM_BOTTOM) / 2.0f - 15, PICKUP_KEY);
+        }
+        /* Secret rooms often stash a trinket */
+        if (randi(0, 99) < 50) {
+            spawn_trinket_pickup(r, (ROOM_LEFT + ROOM_RIGHT) / 2.0f,
+                                 (ROOM_TOP + ROOM_BOTTOM) / 2.0f + 20,
+                                 randi(1, TRINKET_COUNT - 1));
+        }
         return;
     }
 
@@ -1069,9 +1440,9 @@ void room_spawn_enemies(Game *g, Room *r) {
         r->pedestal.y = (ROOM_TOP + ROOM_BOTTOM) / 2.0f;
         r->pedestal.item = pick_random_item(g);
         r->pedestal.active = 1;
-        /* Also spawn some pickups */
-        spawn_consumable(r, ROOM_LEFT + 60, ROOM_TOP + 60, PICKUP_COIN5);
-        spawn_consumable(r, ROOM_RIGHT - 60, ROOM_TOP + 60, PICKUP_KEY);
+        /* Also spawn one support pickup */
+        spawn_consumable(r, ROOM_LEFT + 60, ROOM_TOP + 60,
+                         (g->current_floor >= 3) ? PICKUP_COIN5 : PICKUP_KEY);
         return;
     }
 
@@ -1079,7 +1450,12 @@ void room_spawn_enemies(Game *g, Room *r) {
     if (r->type == ROOM_BOSS) {
         count = 1;
     } else {
-        count = randi(2, 4 + g->current_floor);
+        int max_count = 3 + g->current_floor / 2;
+        if (g->current_floor >= 4) max_count += 1;
+        count = randi(2, max_count);
+        if (challenge_has_flag(g, CHALLENGE_FLAG_EXTRA_ENEMIES)) {
+            count += 2;
+        }
         if (count > MAX_ENEMIES) count = MAX_ENEMIES;
     }
 
@@ -1094,11 +1470,26 @@ void room_spawn_enemies(Game *g, Room *r) {
 
         float px, py;
         int safety = 0;
+        int position_blocked;
         do {
             px = randf(ROOM_LEFT + 30, ROOM_RIGHT - 30);
             py = randf(ROOM_TOP + 30, ROOM_BOTTOM - 30);
+            position_blocked = 0;
+            for (int obstacle_idx = 0; obstacle_idx < r->obstacle_count; obstacle_idx++) {
+                Obstacle *obstacle = &r->obstacles[obstacle_idx];
+                if (!obstacle->active) continue;
+                float obstacle_dx = px - obstacle->x;
+                float obstacle_dy = py - obstacle->y;
+                float clearance = ENEMY_SIZE + OBSTACLE_SIZE * 0.5f + 4.0f;
+                if (obstacle_dx * obstacle_dx + obstacle_dy * obstacle_dy <
+                    clearance * clearance) {
+                    position_blocked = 1;
+                    break;
+                }
+            }
             safety++;
-        } while (fabsf(px - cx) < 50 && fabsf(py - cy) < 50 && safety < 20);
+        } while (((fabsf(px - cx) < 50 && fabsf(py - cy) < 50) ||
+                  position_blocked) && safety < 40);
 
         e->x = px;
         e->y = py;
@@ -1209,12 +1600,14 @@ void room_spawn_enemies(Game *g, Room *r) {
         } else {
             /* Floor-tiered enemy pool selection */
             int t;
-            if (g->current_floor >= 3) {
+            if (g->current_floor >= 4) {
                 t = randi(0, 16);  /* all enemy types available */
+            } else if (g->current_floor >= 3) {
+                t = randi(0, 14);  /* Caves II: no Leaper / Vis yet */
             } else if (g->current_floor >= 2) {
-                t = randi(0, 10);  /* + tier 2 (Globin, Boom Fly, Maw, Mulligan) */
+                t = randi(0, 12);  /* + tier 2 (Globin, Boom Fly, Maw, Mulligan) */
             } else if (g->current_floor >= 1) {
-                t = randi(0, 6);   /* + tier 1 (Attack Fly, Pooter, Hopper, Baby) */
+                t = randi(0, 8);   /* + tier 1 (Attack Fly, Pooter, Hopper, Baby) */
             } else {
                 t = randi(0, 4);   /* base: Fly, Gaper, Pacer, Spider, Clotty */
             }
@@ -1357,8 +1750,13 @@ void room_spawn_enemies(Game *g, Room *r) {
 
         /* Champion / Elite roll: 15% chance, non-bosses only */
         if (!is_boss_type(e->type)) {
+            int champ_chance = 6 + g->current_floor * 2;
+            if (champ_chance > 15) champ_chance = 15;
+            if (challenge_has_flag(g, CHALLENGE_FLAG_MORE_CHAMPIONS)) {
+                champ_chance += 25;
+            }
             int roll = randi(0, 99);
-            if (roll < 15) {
+            if (roll < champ_chance) {
                 /* Pick one of 4 champion types */
                 ChampionType ct = (ChampionType)(CHAMP_RED + randi(0, 3));
                 enemy_make_champion(e, ct);
@@ -1403,6 +1801,7 @@ void game_init(Game *g) {
     memset(g, 0, sizeof(Game));
     g->state = STATE_MENU;
     g->menu_sel = 0;
+    g->active_challenge = CHALLENGE_NONE;
     g->player.hp = PLAYER_BASE_HP;
     g->player.item_count = 0;
     recalc_player_stats(&g->player);
@@ -1422,17 +1821,73 @@ static MusicId music_for_floor(int floor_num) {
     return MUS_DEPTHS;
 }
 
+static void add_challenge_starting_item(Player *p, ItemType item) {
+    if (item <= ITEM_NONE || item >= ITEM_COUNT) return;
+    /* Active items go to the dedicated slot, not the passive list. */
+    if (item_is_active(item)) {
+        p->active_item = item;
+        return;
+    }
+    if (p->item_count >= MAX_ITEMS_HELD) return;
+    for (int i = 0; i < p->item_count; i++) {
+        if (p->items[i] == item) return;
+    }
+    p->items[p->item_count++] = item;
+}
+
+static void apply_challenge_player_limits(Game *g) {
+    if (!challenge_has_flag(g, CHALLENGE_FLAG_ONE_HEART)) return;
+    g->player.stats.max_hp = 2;
+    if (g->player.hp > 2) g->player.hp = 2;
+}
+
+static void apply_challenge_floor_rules(Game *g) {
+    int remove_treasure = challenge_has_flag(g, CHALLENGE_FLAG_NO_TREASURE);
+    int remove_shops = challenge_has_flag(g, CHALLENGE_FLAG_NO_SHOPS);
+    if (!remove_treasure && !remove_shops) return;
+
+    for (int y = 0; y < DUNGEON_H; y++) {
+        for (int x = 0; x < DUNGEON_W; x++) {
+            Room *room = &g->dungeon.rooms[y][x];
+            if ((remove_treasure && room->type == ROOM_TREASURE) ||
+                (remove_shops && room->type == ROOM_SHOP)) {
+                room->type = ROOM_NORMAL;
+                room->cleared = 0;
+                room->enemies_spawned = 0;
+            }
+            if (remove_treasure) {
+                for (int dir = 0; dir < 4; dir++) {
+                    room->door_locked[dir] = 0;
+                    if (room->door_type[dir] == 1) room->door_type[dir] = 0;
+                }
+            }
+        }
+    }
+}
+
+static void start_challenge(Game *g, ChallengeType challenge) {
+    const ChallengeDef *def = get_challenge_def(challenge);
+    if (!def) return;
+    g->active_challenge = challenge;
+    g->game_mode = MODE_STORY;
+    g->difficulty = def->difficulty;
+    g->selected_character = def->character;
+    start_new_game(g);
+}
+
 void start_new_game(Game *g) {
     /* Preserve settings selected in menus */
     GameMode  saved_mode = g->game_mode;
     Difficulty saved_diff = g->difficulty;
     CharacterType saved_char = g->selected_character;
+    int saved_challenge = g->active_challenge;
 
     memset(g, 0, sizeof(Game));
 
     g->game_mode = saved_mode;
     g->difficulty = saved_diff;
     g->selected_character = saved_char;
+    g->active_challenge = saved_challenge;
     g->state = STATE_PLAYING;
     g->score = 0;
     g->current_floor = 0;
@@ -1452,21 +1907,40 @@ void start_new_game(Game *g) {
     }
     g->player.item_count = 0;
     /* Starting consumables */
-    g->player.bombs = 1;
-    g->player.keys = 1;
-    g->player.coins = 0;
+    const ChallengeDef *challenge = get_challenge_def(g->active_challenge);
+    g->player.bombs = challenge ? challenge->bombs : 1;
+    g->player.keys = challenge ? challenge->keys : 1;
+    g->player.coins = challenge ? challenge->coins : 0;
     g->player.lives = 0;
     g->player.holy_mantle_active = 0;
     g->player.book_belial_dmg_timer = 0;
+    g->player.active_charge = 0;
+    g->player.active_max_charge = 0;
     g->player.yum_heart_cd = 0;
-    g->player.soul_hp = 0;
+    g->player.soul_hp = challenge ? challenge->soul_hp : 0;
     g->player.has_pill = 0;
     g->player.has_card = 0;
 
+    if (!challenge) {
+        if (g->selected_character == CHAR_CAIN) {
+            g->player.coins = 3;
+        } else if (g->selected_character == CHAR_JUDAS) {
+            g->player.soul_hp = 2;
+        }
+    }
+
     /* Apply character starting bonuses (items + adjust HP to max) */
     apply_character_start(g);
+    if (challenge) {
+        for (int i = 0; i < challenge->starting_item_count; i++) {
+            add_challenge_starting_item(&g->player, challenge->starting_items[i]);
+        }
+    }
 
     recalc_player_stats(&g->player);
+    apply_challenge_player_limits(g);
+    refresh_active_charge(&g->player);
+    g->player.active_charge = g->player.active_max_charge;
 
     /* Set HP to max for character */
     g->player.hp = g->player.stats.max_hp;
@@ -1487,6 +1961,7 @@ void start_new_game(Game *g) {
     for (int i = 0; i < PILL_EFFECT_COUNT; i++) g->pill_known[i] = 0;
 
     dungeon_generate(&g->dungeon, g->current_floor);
+    apply_challenge_floor_rules(g);
 
     g->player.x = (ROOM_LEFT + ROOM_RIGHT) / 2.0f;
     g->player.y = (ROOM_TOP + ROOM_BOTTOM) / 2.0f;
@@ -1503,6 +1978,9 @@ void start_new_game(Game *g) {
 
     /* Switch to floor-appropriate music */
     music_play(music_for_floor(g->current_floor));
+
+    /* Snapshot the fresh run so Continue works even after a power-off */
+    write_run_save(g);
 }
 
 /* Apply per-character starting items */
@@ -1510,16 +1988,16 @@ void apply_character_start(Game *g) {
     Player *p = &g->player;
     switch (p->character) {
         case CHAR_MAGDALENE:
-            /* +1 heart container, Yum Heart starter */
-            p->items[p->item_count++] = ITEM_YUM_HEART;
+            /* Yum Heart starter (active slot) */
+            p->active_item = ITEM_YUM_HEART;
             break;
         case CHAR_CAIN:
-            /* Lucky Foot starter, missing eye visual */
+            /* Lucky Foot starter (passive) */
             p->items[p->item_count++] = ITEM_LUCKY_FOOT;
             break;
         case CHAR_JUDAS:
-            /* Book of Belial starter */
-            p->items[p->item_count++] = ITEM_BOOK_OF_BELIAL;
+            /* Book of Belial starter (active slot) */
+            p->active_item = ITEM_BOOK_OF_BELIAL;
             break;
         case CHAR_ISAAC:
         default:
@@ -1564,6 +2042,7 @@ static void finish_floor_transition(Game *g) {
 
     /* Generate new dungeon for new floor */
     dungeon_generate(&g->dungeon, g->current_floor);
+    apply_challenge_floor_rules(g);
 
     /* Reset tears and enemy shots */
     for (int i = 0; i < MAX_TEARS; i++)
@@ -1582,15 +2061,22 @@ static void finish_floor_transition(Game *g) {
     g->boss_active = 0;
     g->boss_death_anim = 0;
     g->boss_intro_timer = 0;
+    g->map_revealed = player_has_item(&g->player, ITEM_SPELUNKER_HAT);
+    g->player.brimstone_charge = 0;
+    g->player.brimstone_dir = DIR_NONE;
+    if (g->player.book_belial_dmg_timer > 0) {
+        g->player.book_belial_dmg_timer = 0;
+        recalc_player_stats(&g->player);
+    }
 
     /* Place player in center */
     g->player.x = (ROOM_LEFT + ROOM_RIGHT) / 2.0f;
     g->player.y = (ROOM_TOP + ROOM_BOTTOM) / 2.0f;
     g->player.iframes = 30;
 
-    /* Safety: guarantee at least 1 key per floor so locked doors
-     * are never a permanent softlock even in edge cases */
-    if (g->player.keys < 1) g->player.keys = 1;
+    /* Small safety net on Easy only; keys remain a real routing resource
+     * on Normal and Hard. */
+    if (g->difficulty == DIFF_EASY && g->player.keys < 1) g->player.keys = 1;
 
     Room *r = current_room(g);
     room_spawn_enemies(g, r);
@@ -1600,30 +2086,151 @@ static void finish_floor_transition(Game *g) {
 
     /* Play floor-appropriate music (crossfades if track changes) */
     music_play(music_for_floor(g->current_floor));
+
+    /* Checkpoint the run at the start of each floor */
+    write_run_save(g);
+}
+
+/* ================================================================
+ * Run save / continue
+ * ================================================================ */
+
+/* Cached copy of the save header so the main menu can show run details
+ * (character / floor) without re-reading the SD card every frame.
+ * 0 = needs (re)load, 1 = valid, -1 = no save. */
+static RunSaveData s_continue_info;
+static int s_continue_info_state = 0;
+
+static const RunSaveData *get_continue_info(void) {
+    if (!run_save_exists()) {
+        s_continue_info_state = -1;
+        return NULL;
+    }
+    if (s_continue_info_state != 1) {
+        s_continue_info_state =
+            (run_save_read(&s_continue_info) == 0) ? 1 : -1;
+    }
+    return (s_continue_info_state == 1) ? &s_continue_info : NULL;
+}
+
+static void delete_run_save(void) {
+    run_save_delete();
+    s_continue_info_state = -1;
+}
+
+/* Snapshot the current run to SD. Called at every floor start and on
+ * Save & Quit, so a crash/power-off never costs more than one floor. */
+static void write_run_save(Game *g) {
+    RunSaveData sv;
+    memset(&sv, 0, sizeof(sv));
+    sv.magic              = RUN_SAVE_MAGIC;
+    sv.version            = RUN_SAVE_VERSION;
+    sv.player_struct_size = (unsigned int)sizeof(Player);
+    sv.game_mode          = (int)g->game_mode;
+    sv.difficulty         = (int)g->difficulty;
+    sv.active_challenge   = g->active_challenge;
+    sv.current_floor      = g->current_floor;
+    sv.infinite_loop      = g->infinite_loop;
+    sv.best_floor         = g->best_floor;
+    sv.score              = g->score;
+    sv.kills              = g->kills;
+    sv.play_time_frames   = g->play_time_frames;
+    sv.rooms_cleared      = g->rooms_cleared;
+    sv.characters_completed_run = g->characters_completed_run;
+    memcpy(sv.pill_color_map, g->pill_color_map, sizeof(sv.pill_color_map));
+    memcpy(sv.pill_known,     g->pill_known,     sizeof(sv.pill_known));
+    sv.player = g->player;
+    if (run_save_write(&sv) == 0) {
+        s_continue_info = sv;
+        s_continue_info_state = 1;
+    } else {
+        s_continue_info_state = 0;
+    }
+}
+
+/* Resume a saved run at the start of its floor (fresh layout, same build).
+ * Returns 1 on success, 0 if there was no usable save. */
+static int continue_saved_run(Game *g) {
+    RunSaveData sv;
+    if (run_save_read(&sv) != 0) return 0;
+
+    memset(g, 0, sizeof(Game));
+    g->game_mode        = (GameMode)sv.game_mode;
+    g->difficulty       = (Difficulty)sv.difficulty;
+    g->active_challenge = sv.active_challenge;
+    g->current_floor    = sv.current_floor;
+    g->infinite_loop    = sv.infinite_loop;
+    g->best_floor       = sv.best_floor;
+    g->score            = sv.score;
+    g->kills            = sv.kills;
+    g->play_time_frames = sv.play_time_frames;
+    g->rooms_cleared    = sv.rooms_cleared;
+    g->characters_completed_run = sv.characters_completed_run;
+    memcpy(g->pill_color_map, sv.pill_color_map, sizeof(g->pill_color_map));
+    memcpy(g->pill_known,     sv.pill_known,     sizeof(g->pill_known));
+    g->player = sv.player;
+    g->selected_character = g->player.character;
+
+    /* Rebuild derived state from the restored item list */
+    recalc_player_stats(&g->player);
+    apply_challenge_player_limits(g);
+    refresh_active_charge(&g->player);
+
+    dungeon_generate(&g->dungeon, g->current_floor);
+    apply_challenge_floor_rules(g);
+
+    g->player.x = (ROOM_LEFT + ROOM_RIGHT) / 2.0f;
+    g->player.y = (ROOM_TOP + ROOM_BOTTOM) / 2.0f;
+    g->player.iframes = 30;
+    g->player.kb_timer = 0;
+    g->player.vx = g->player.vy = 0.0f;
+    g->player.brimstone_charge = 0;
+    g->player.brimstone_dir = DIR_NONE;
+    if (g->player.book_belial_dmg_timer > 0) {
+        g->player.book_belial_dmg_timer = 0;
+        recalc_player_stats(&g->player);
+    }
+    g->map_revealed = player_has_item(&g->player, ITEM_SPELUNKER_HAT);
+
+    Room *r = current_room(g);
+    room_spawn_enemies(g, r);
+    roll_curse(g);
+
+    g->state = STATE_PLAYING;
+    music_play(music_for_floor(g->current_floor));
+    return 1;
 }
 
 /* ================================================================
  * Player update
  * ================================================================ */
 
-/* Check if a circle at (x,y) with given radius overlaps any obstacle in the room */
-static int player_blocked_at(Room *r, float x, float y) {
-    if (x < ROOM_LEFT + PLAYER_SIZE) return 1;
-    if (x > ROOM_RIGHT - PLAYER_SIZE) return 1;
-    if (y < ROOM_TOP + PLAYER_SIZE) return 1;
-    if (y > ROOM_BOTTOM - PLAYER_SIZE) return 1;
+/* Check if a circle at (x,y) overlaps any solid obstacle in the room.
+ * Spikes are not solid - they hurt instead of block. */
+static int room_obstacle_blocked_at(Room *r, float x, float y, float radius) {
     for (int i = 0; i < r->obstacle_count; i++) {
         Obstacle *o = &r->obstacles[i];
+        if (o->type == OBST_SPIKES) continue;
         if (!o->active) continue;
-        float ox = x - o->x, oy = y - o->y;
-        float md = PLAYER_SIZE + OBSTACLE_SIZE * 0.5f;
-        if (ox * ox + oy * oy < md * md) return 1;
+        float ox = x - o->x;
+        float oy = y - o->y;
+        float min_dist = radius + OBSTACLE_SIZE * 0.5f;
+        if (ox * ox + oy * oy < min_dist * min_dist) return 1;
     }
     return 0;
 }
 
+static int player_blocked_at(Room *r, float x, float y) {
+    if (x < ROOM_LEFT + PLAYER_COLLISION_RADIUS) return 1;
+    if (x > ROOM_RIGHT - PLAYER_COLLISION_RADIUS) return 1;
+    if (y < ROOM_TOP + PLAYER_COLLISION_RADIUS) return 1;
+    if (y > ROOM_BOTTOM - PLAYER_COLLISION_RADIUS) return 1;
+    return room_obstacle_blocked_at(r, x, y, PLAYER_COLLISION_RADIUS);
+}
+
 void player_update(Game *g, u32 kHeld, circlePosition circlePos) {
     Player *p = &g->player;
+    player_clamp_health(p);
     float spd = p->stats.speed;  /* max speed from stats (item-modified) */
 
     /* ── Timers ── */
@@ -1646,22 +2253,19 @@ void player_update(Game *g, u32 kHeld, circlePosition circlePos) {
     if (kHeld & KEY_DLEFT)  { ix -= 1.0f; has_dpad = 1; }
     if (kHeld & KEY_DRIGHT) { ix += 1.0f; has_dpad = 1; }
 
-    /* Circle Pad: analog — overrides D-pad when outside deadzone */
-    int cpActive = (abs(circlePos.dx) > CIRCLE_PAD_DEADZONE ||
-                    abs(circlePos.dy) > CIRCLE_PAD_DEADZONE);
+    /* Circle Pad: radial deadzone with the remaining travel remapped to 0..1. */
+    float raw_cpx = (float)circlePos.dx;
+    float raw_cpy = -(float)circlePos.dy;
+    float raw_mag = sqrtf(raw_cpx * raw_cpx + raw_cpy * raw_cpy);
+    int cpActive = raw_mag > CIRCLE_PAD_DEADZONE;
+    float analog_strength = 0.0f;
     if (cpActive) {
-        /* Convert raw analog to -1..1 range */
-        float cpx = (float)circlePos.dx / CIRCLE_PAD_MAX;
-        float cpy = -(float)circlePos.dy / CIRCLE_PAD_MAX; /* Y inverted on 3DS */
-
-        if (has_dpad) {
-            /* Blend: circle pad takes priority when active */
-            ix = cpx;
-            iy = cpy;
-        } else {
-            ix = cpx;
-            iy = cpy;
-        }
+        float capped_mag = raw_mag;
+        if (capped_mag > CIRCLE_PAD_MAX) capped_mag = CIRCLE_PAD_MAX;
+        analog_strength = (capped_mag - CIRCLE_PAD_DEADZONE) /
+                          (CIRCLE_PAD_MAX - CIRCLE_PAD_DEADZONE);
+        ix = raw_cpx / raw_mag;
+        iy = raw_cpy / raw_mag;
     }
 
     /* Compute input magnitude (how far the stick is tilted / digital input) */
@@ -1678,11 +2282,7 @@ void player_update(Game *g, u32 kHeld, circlePosition circlePos) {
             inputStrength = 1.0f;
         } else {
             /* Analog: allow variable speed based on tilt magnitude */
-            inputStrength = imag;
-            if (inputStrength > 1.0f) inputStrength = 1.0f;
-            /* Normalize direction only */
-            ix /= imag;
-            iy /= imag;
+            inputStrength = analog_strength;
         }
     } else {
         ix = 0.0f;
@@ -1706,9 +2306,12 @@ void player_update(Game *g, u32 kHeld, circlePosition circlePos) {
         float tvx = ix * inputStrength * spd;
         float tvy = iy * inputStrength * spd;
 
-        /* Lerp current velocity toward target (smooth acceleration) */
-        p->vx += (tvx - p->vx) * PLAYER_ACCEL;
-        p->vy += (tvy - p->vy) * PLAYER_ACCEL;
+        /* Reversals brake harder than normal acceleration, avoiding ice-like
+         * direction changes while preserving Isaac's short movement glide. */
+        float response = PLAYER_ACCEL;
+        if (p->vx * tvx + p->vy * tvy < 0.0f) response = PLAYER_TURN_ACCEL;
+        p->vx += (tvx - p->vx) * response;
+        p->vy += (tvy - p->vy) * response;
     } else {
         /* No input: apply friction (the Isaac slide-to-stop feel) */
         p->vx *= PLAYER_FRICTION;
@@ -1721,7 +2324,7 @@ void player_update(Game *g, u32 kHeld, circlePosition circlePos) {
 
     /* Clamp velocity magnitude (allow brief overshoot from knockback) */
     float vmag = sqrtf(p->vx * p->vx + p->vy * p->vy);
-    float maxV = spd * 1.6f;   /* knockback can briefly exceed normal speed */
+    float maxV = (p->kb_timer > 0) ? spd * 1.6f : spd;
     if (vmag > maxV) {
         float scale = maxV / vmag;
         p->vx *= scale;
@@ -1751,8 +2354,33 @@ void player_update(Game *g, u32 kHeld, circlePosition circlePos) {
     }
 
     /* Final boundary clamp (safety net) */
-    p->x = clampf(p->x, ROOM_LEFT + PLAYER_SIZE, ROOM_RIGHT - PLAYER_SIZE);
-    p->y = clampf(p->y, ROOM_TOP + PLAYER_SIZE, ROOM_BOTTOM - PLAYER_SIZE);
+    p->x = clampf(p->x, ROOM_LEFT + PLAYER_COLLISION_RADIUS,
+                  ROOM_RIGHT - PLAYER_COLLISION_RADIUS);
+    p->y = clampf(p->y, ROOM_TOP + PLAYER_COLLISION_RADIUS,
+                  ROOM_BOTTOM - PLAYER_COLLISION_RADIUS);
+
+    /* Spike obstacles: half a heart on contact */
+    if (p->iframes == 0) {
+        for (int i = 0; i < r->obstacle_count; i++) {
+            Obstacle *o = &r->obstacles[i];
+            if (!o->active || o->type != OBST_SPIKES) continue;
+            float sdx = p->x - o->x;
+            float sdy = p->y - o->y;
+            float reach = PLAYER_HURT_RADIUS + OBSTACLE_SIZE * 0.35f;
+            if (sdx * sdx + sdy * sdy < reach * reach) {
+                p->hp -= player_absorb_dmg(p, 1);
+                p->iframes = PLAYER_IFRAMES;
+                audio_play(SFX_HURT_GRUNT);
+                trigger_shake(g, 3.0f, 12);
+                spawn_blood_splatter(g, p->x, p->y, 0.0f, -1.0f, 0);
+                if (player_check_death(p)) {
+                    audio_play(SFX_PLAYER_DEATH);
+                    g->state = STATE_GAMEOVER;
+                }
+                break;
+            }
+        }
+    }
 
     /* ══════════════════════════════════════════════════════════
      * 4. FACING DIRECTION + ANIMATION
@@ -1793,6 +2421,30 @@ void player_update(Game *g, u32 kHeld, circlePosition circlePos) {
         }
     }
 
+    /* Devil deal pickup: costs one heart container (2 max HP), paid in
+     * blood. Refused if it would leave the player without a full heart. */
+    if (r->devil_pedestal.active) {
+        float pdx = p->x - r->devil_pedestal.x;
+        float pdy = p->y - r->devil_pedestal.y;
+        if (pdx * pdx + pdy * pdy < (PLAYER_SIZE + 10) * (PLAYER_SIZE + 10)) {
+            if (p->stats.max_hp > 2) {
+                p->devil_hp_paid += 2;
+                g->last_pickup = r->devil_pedestal.item;
+                g->pickup_flash = PICKUP_FLASH_FRAMES;
+                p->pickup_anim = 40;
+                collect_item(g, r->devil_pedestal.item);  /* recalcs stats */
+                r->devil_pedestal.active = 0;
+                g->score += 50;
+                audio_play(SFX_HURT_GRUNT);  /* the price is blood */
+                trigger_shake(g, 4.0f, 16);
+                spawn_blood_splatter(g, p->x, p->y, 0.0f, 1.0f, 1);
+            } else if (g->shop_deny_timer <= 0) {
+                g->shop_deny_timer = 60;
+                audio_play(SFX_TEAR_BLOCK);
+            }
+        }
+    }
+
     /* Heart pickup */
     for (int i = 0; i < MAX_HEART_PICKUPS; i++) {
         HeartPickup *h = &r->hearts[i];
@@ -1801,18 +2453,24 @@ void player_update(Game *g, u32 kHeld, circlePosition circlePos) {
         float hdx = p->x - h->x;
         float hdy = p->y - h->y;
         if (hdx * hdx + hdy * hdy < (PLAYER_SIZE + 8) * (PLAYER_SIZE + 8)) {
-            /* Heal player based on heart type */
-            int heal_amount = 0;
-            if (h->type == HEART_RED_FULL) {
-                heal_amount = 2;
-            } else if (h->type == HEART_RED_HALF) {
-                heal_amount = 1;
+            int can_pickup = 0;
+            if (h->type == HEART_SOUL) {
+                int soul_cap = PLAYER_MAX_HP_CAP - p->stats.max_hp;
+                if (p->soul_hp < soul_cap) {
+                    p->soul_hp += 2;
+                    player_clamp_health(p);
+                    can_pickup = 1;
+                }
+            } else {
+                int heal_amount = (h->type == HEART_RED_FULL) ? 2 : 1;
+                if (p->hp < p->stats.max_hp) {
+                    p->hp += heal_amount;
+                    player_clamp_health(p);
+                    can_pickup = 1;
+                }
             }
-            
-            /* Only pick up if player can be healed */
-            if (p->hp < p->stats.max_hp) {
-                p->hp += heal_amount;
-                if (p->hp > p->stats.max_hp) p->hp = p->stats.max_hp;
+
+            if (can_pickup) {
                 h->active = 0;
                 r->heart_count--;
                 audio_play(SFX_PICKUP);
@@ -1830,19 +2488,20 @@ void player_update(Game *g, u32 kHeld, circlePosition circlePos) {
         if (cdx * cdx + cdy * cdy < CONSUMABLE_PICKUP_DIST * CONSUMABLE_PICKUP_DIST) {
             int picked_up = 1;
             switch (c->type) {
-            case PICKUP_BOMB:   p->bombs += 1; break;
-            case PICKUP_BOMB2:  p->bombs += 2; break;
-            case PICKUP_KEY:    p->keys  += 1; break;
-            case PICKUP_COIN:   p->coins += 1; break;
-            case PICKUP_COIN5:  p->coins += 5; break;
+            case PICKUP_BOMB:   p->bombs += 1; if (p->bombs > 99) p->bombs = 99; break;
+            case PICKUP_BOMB2:  p->bombs += 2; if (p->bombs > 99) p->bombs = 99; break;
+            case PICKUP_KEY:    p->keys  += 1; if (p->keys  > 99) p->keys  = 99; break;
+            case PICKUP_COIN:   p->coins += 1; if (p->coins > 99) p->coins = 99; break;
+            case PICKUP_COIN5:  p->coins += 5; if (p->coins > 99) p->coins = 99; break;
             case PICKUP_PILL:
                 if (!p->has_pill) {
                     p->has_pill = 1;
                     p->held_pill = (PillEffect)c->sub_type;
                     /* Show pill color name as pickup message */
                     snprintf(g->pickup_msg_text, sizeof(g->pickup_msg_text),
-                             "Pill: %s", pill_color_name(c->sub_type));
+                             "Pill: %s", pill_color_name(g->pill_color_map[c->sub_type]));
                     g->pickup_msg_timer = 180;
+                    g->pickup_msg_total = 180;
                 } else picked_up = 0;
                 break;
             case PICKUP_CARD:
@@ -1852,8 +2511,45 @@ void player_update(Game *g, u32 kHeld, circlePosition circlePos) {
                     snprintf(g->pickup_msg_text, sizeof(g->pickup_msg_text),
                              "Card: %s", tarot_name(c->sub_type));
                     g->pickup_msg_timer = 180;
+                    g->pickup_msg_total = 180;
                 } else picked_up = 0;
                 break;
+            case PICKUP_TRINKET: {
+                if (g->trinket_swap_lock > 0) { picked_up = 0; break; }
+                /* Hold one trinket; picking up a new one swaps the old back
+                 * onto the floor (it stays grabbable). */
+                TrinketType incoming = (TrinketType)c->sub_type;
+                TrinketType previous = p->trinket;
+                p->trinket = incoming;
+                recalc_player_stats(p);   /* trinket stat effects apply now */
+                snprintf(g->pickup_msg_text, sizeof(g->pickup_msg_text),
+                         "Trinket: %s", trinket_name(incoming));
+                g->pickup_msg_timer = 180;
+                g->pickup_msg_total = 180;
+                g->trinket_swap_lock = 45;  /* avoid frame-by-frame re-swap */
+                if (previous != TRINKET_NONE) {
+                    /* Drop the swapped-out trinket behind the player so the
+                     * player isn't standing on it (it stays grabbable). */
+                    float ox = -p->vx, oy = -p->vy;
+                    float om = sqrtf(ox * ox + oy * oy);
+                    if (om < 0.5f) { ox = 0.0f; oy = 1.0f; }
+                    else { ox /= om; oy /= om; }
+                    float dist = CONSUMABLE_PICKUP_DIST + 16.0f;
+                    c->sub_type = previous;
+                    c->x = clampf(p->x + ox * dist, ROOM_LEFT + 12, ROOM_RIGHT - 12);
+                    c->y = clampf(p->y + oy * dist, ROOM_TOP + 12, ROOM_BOTTOM - 12);
+                    /* If clamping (e.g. in a corner) pulled the drop back within
+                     * pickup range, park it at room center so it can't thrash. */
+                    float ddx = c->x - p->x, ddy = c->y - p->y;
+                    float safe = CONSUMABLE_PICKUP_DIST + 6.0f;
+                    if (ddx * ddx + ddy * ddy < safe * safe) {
+                        c->x = (ROOM_LEFT + ROOM_RIGHT) * 0.5f;
+                        c->y = (ROOM_TOP + ROOM_BOTTOM) * 0.5f;
+                    }
+                    picked_up = 0;  /* don't deactivate; it's the old trinket now */
+                }
+                break;
+            }
             default: break;
             }
             if (p->coins > 99) p->coins = 99;
@@ -1865,9 +2561,12 @@ void player_update(Game *g, u32 kHeld, circlePosition circlePos) {
         }
     }
 
+    /* "Can't afford" feedback cooldown (shop purchases and devil deals) */
+    if (g->shop_deny_timer > 0) g->shop_deny_timer--;
+    if (g->trinket_swap_lock > 0) g->trinket_swap_lock--;
+
     /* Shop item purchase (walk into shop item to buy) */
     if (r->type == ROOM_SHOP) {
-        if (g->shop_deny_timer > 0) g->shop_deny_timer--;
         for (int i = 0; i < r->shop_count; i++) {
             ShopItem *si = &r->shop_items[i];
             if (!si->active) continue;
@@ -2033,12 +2732,27 @@ static void render_blood_particles(Game *g) {
     }
 }
 
+static float tear_hit_radius(const Tear *t) {
+    return TEAR_RADIUS * clampf(t->size, 0.75f, 1.6f);
+}
+
+static void detonate_player_tear(Game *g, Tear *t) {
+    if (!t->active) return;
+    float x = clampf(t->x, ROOM_LEFT + 2.0f, ROOM_RIGHT - 2.0f);
+    float y = clampf(t->y, ROOM_TOP + 2.0f, ROOM_BOTTOM - 2.0f);
+    t->active = 0;
+    explode_at(g, x, y, 1);
+}
+
 static void spawn_tear(Game *g, float dx, float dy) {
     Tear *t = NULL;
     for (int i = 0; i < MAX_TEARS; i++) {
         if (!g->tears[i].active) { t = &g->tears[i]; break; }
     }
     if (!t) return;
+
+    float dir_len = sqrtf(dx * dx + dy * dy);
+    if (dir_len < 0.01f) return;
 
     memset(t, 0, sizeof(Tear));
     t->active = 1;
@@ -2048,10 +2762,9 @@ static void spawn_tear(Game *g, float dx, float dy) {
        Also nudges it forward enough that the tear is clearly separate
        from the player sprite on its very first frame. */
     {
-        float tlen = sqrtf(dx * dx + dy * dy);
         float fwd = PLAYER_SIZE * 0.55f;  /* forward push (in pixels) */
-        float fx = (tlen > 0.1f) ? (dx / tlen) * fwd : 0.0f;
-        float fy = (tlen > 0.1f) ? (dy / tlen) * fwd : 0.0f;
+        float fx = (dx / dir_len) * fwd;
+        float fy = (dy / dir_len) * fwd;
         t->x = g->player.x + fx;
         /* Raise spawn so tears look like they come from the head, not
            the body. PLAYER_SIZE/3 ≈ Isaac's eye height. */
@@ -2059,26 +2772,66 @@ static void spawn_tear(Game *g, float dx, float dy) {
     }
 
     /* Apply slight random spread by rotating the direction vector */
-    float ang = randf(-TEAR_SPREAD, TEAR_SPREAD);
+    float unit_x = dx / dir_len;
+    float unit_y = dy / dir_len;
+    int flags = g->player.stats.flags;
+    int special_straight_shot = flags & (ITEM_FLAG_KNIFE | ITEM_FLAG_BRIMSTONE |
+                                         ITEM_FLAG_LASER | ITEM_FLAG_BOMB_TEAR);
+    float ang = special_straight_shot ? 0.0f : randf(-TEAR_SPREAD, TEAR_SPREAD);
     float ca = cosf(ang), sa = sinf(ang);
-    float ndx = dx * ca - dy * sa;
-    float ndy = dx * sa + dy * ca;
-    t->dx = ndx;
-    t->dy = ndy;
+    float ndx = unit_x * ca - unit_y * sa;
+    float ndy = unit_x * sa + unit_y * ca;
+    float shot_speed = TEAR_BASE_SPEED + g->player.stats.shot_speed * 0.25f;
+    if (flags & ITEM_FLAG_KNIFE) shot_speed = 7.5f;
+    if (flags & ITEM_FLAG_BRIMSTONE) shot_speed = 12.0f;
+    if (flags & ITEM_FLAG_LASER) shot_speed = 14.0f;
+    if (flags & ITEM_FLAG_BOMB_TEAR) shot_speed = 3.0f;
+    else if (flags & ITEM_FLAG_EXPLOSIVE) shot_speed = 3.4f;
+    if (shot_speed < 2.5f) shot_speed = 2.5f;
+    if (shot_speed > 14.0f) shot_speed = 14.0f;
+    float inherit = special_straight_shot ? 0.0f : TEAR_MOVE_INHERIT;
+    t->dx = ndx * shot_speed + g->player.vx * inherit;
+    t->dy = ndy * shot_speed + g->player.vy * inherit;
 
     t->dist = 0;
-    t->speed = sqrtf(ndx * ndx + ndy * ndy);
+    t->max_dist = g->player.stats.range;
+    t->speed = shot_speed;
     t->dmg = g->player.stats.damage;
     t->piercing = (g->player.stats.flags & ITEM_FLAG_PIERCING) ? 1 : 0;
     t->spectral = (g->player.stats.flags & ITEM_FLAG_SPECTRAL) ? 1 : 0;
-    t->homing   = (g->player.stats.flags & ITEM_FLAG_HOMING) ? 1 : 0;
+    t->homing   = ((g->player.stats.flags & ITEM_FLAG_HOMING) ||
+                   g->homing_timer > 0) ? 1 : 0;
+    t->explosive = (flags & ITEM_FLAG_EXPLOSIVE) ? 1 : 0;
+    t->bomb_tear = (flags & ITEM_FLAG_BOMB_TEAR) ? 1 : 0;
+    t->knife = (flags & ITEM_FLAG_KNIFE) ? 1 : 0;
+    t->laser = (flags & (ITEM_FLAG_BRIMSTONE | ITEM_FLAG_LASER)) ? 1 : 0;
+
+    if (t->knife) {
+        t->piercing = 1;
+        t->dmg *= 2.0f;
+        t->max_dist = fminf(t->max_dist * 0.65f, 105.0f);
+    }
+    if (flags & ITEM_FLAG_BRIMSTONE) {
+        t->piercing = 1;
+        t->spectral = 1;
+        t->dmg *= 3.0f;
+        t->max_dist = 380.0f;
+    } else if (flags & ITEM_FLAG_LASER) {
+        t->piercing = 1;
+        t->spectral = 1;
+        t->max_dist = fmaxf(t->max_dist, 300.0f);
+    }
+    if (t->bomb_tear) {
+        t->explosive = 1;
+        t->max_dist *= 0.75f;
+    }
 
     /* Tear arc: launch slightly upward, gravity will bring it down */
     t->z = 0;
     t->vz = TEAR_ARC_VEL;
 
     /* Sprite animation fields */
-    t->rotation = atan2f(ndy, ndx);  /* rotation based on travel direction */
+    t->rotation = atan2f(t->dy, t->dx);  /* rotation based on travel direction */
     t->anim_frame = 0;
     t->is_enemy = 0;  /* player tear */
 
@@ -2086,6 +2839,9 @@ static void spawn_tear(Game *g, float dx, float dy) {
     float dscale = t->dmg / 2.0f;
     if (dscale < 0.7f) dscale = 0.7f;
     if (dscale > 2.0f) dscale = 2.0f;
+    if (t->knife) dscale = 2.0f;
+    if (t->laser) dscale = (flags & ITEM_FLAG_BRIMSTONE) ? 1.7f : 0.75f;
+    if (t->bomb_tear) dscale = 1.65f;
     t->size = dscale;
 }
 
@@ -2131,21 +2887,61 @@ void shoot_tear(Game *g, Direction dir) {
     tear_sound_toggle = !tear_sound_toggle;
 }
 
+static Direction held_shoot_direction(u32 kHeld) {
+    if (kHeld & KEY_X) return DIR_UP;
+    if (kHeld & KEY_B) return DIR_DOWN;
+    if (kHeld & KEY_Y) return DIR_LEFT;
+    if (kHeld & KEY_A) return DIR_RIGHT;
+    return DIR_NONE;
+}
+
+static void update_player_shooting(Game *g, u32 kHeld) {
+    Player *p = &g->player;
+    Direction dir = held_shoot_direction(kHeld);
+
+    if (!(p->stats.flags & ITEM_FLAG_BRIMSTONE)) {
+        p->brimstone_charge = 0;
+        p->brimstone_dir = DIR_NONE;
+        if (dir != DIR_NONE) shoot_tear(g, dir);
+        return;
+    }
+
+    if (dir != DIR_NONE) {
+        if (p->brimstone_dir != dir) {
+            p->brimstone_dir = dir;
+            p->brimstone_charge = 0;
+        }
+        if (p->brimstone_charge < 90) p->brimstone_charge++;
+        p->face_dir = dir;
+        p->shoot_dir = dir;
+        p->shoot_anim = 4;
+        return;
+    }
+
+    if (p->brimstone_dir != DIR_NONE) {
+        if (p->brimstone_charge >= 30) shoot_tear(g, p->brimstone_dir);
+        p->brimstone_charge = 0;
+        p->brimstone_dir = DIR_NONE;
+    }
+}
+
 void tears_update(Game *g) {
     Room *r = current_room(g);
-    float range = g->player.stats.range;
 
     for (int i = 0; i < MAX_TEARS; i++) {
         Tear *t = &g->tears[i];
         if (!t->active) continue;
 
-        /* Homing: steer toward nearest enemy */
+        /* Homing: steer toward nearest *vulnerable* enemy */
         if (t->homing) {
             float best_dist = 99999.0f;
             Enemy *best = NULL;
             for (int j = 0; j < r->enemy_count; j++) {
                 Enemy *e = &r->enemies[j];
                 if (!e->active) continue;
+                /* Don't chase targets that can't currently be hit */
+                if (e->type == ENEMY_HOST && e->hidden) continue;
+                if (e->type == ENEMY_BOSS_PIN && e->phase == 1) continue;
                 float edx = e->x - t->x;
                 float edy = e->y - t->y;
                 float d = edx * edx + edy * edy;
@@ -2162,8 +2958,8 @@ void tears_update(Game *g) {
                     /* Re-normalize speed back to original */
                     float sm = sqrtf(t->dx * t->dx + t->dy * t->dy);
                     if (sm > 0.1f) {
-                        t->dx = (t->dx / sm) * TEAR_BASE_SPEED;
-                        t->dy = (t->dy / sm) * TEAR_BASE_SPEED;
+                        t->dx = (t->dx / sm) * t->speed;
+                        t->dy = (t->dy / sm) * t->speed;
                     }
                 }
             }
@@ -2172,13 +2968,16 @@ void tears_update(Game *g) {
         /* Move */
         t->x += t->dx;
         t->y += t->dy;
-        /* Track distance using actual velocity */
-        t->dist += sqrtf(t->dx * t->dx + t->dy * t->dy);
+        /* Range is a lifetime property of the tear. Isaac's movement can
+         * change world-space travel without shortening that lifetime. */
+        t->dist += t->speed;
 
-        /* Arc: gravity pulls vz back down to ground */
-        t->z += t->vz;
-        t->vz += TEAR_GRAVITY;
-        if (t->z > 0) t->z = 0; /* hit ground (z = 0 ground plane) */
+        /* Tie the visual arc to this tear's retained lifetime. This keeps
+         * range upgrades airborne instead of sliding along the floor. */
+        float flight_progress = t->dist / t->max_dist;
+        if (flight_progress > 1.0f) flight_progress = 1.0f;
+        t->z = -4.0f * TEAR_ARC_HEIGHT * flight_progress *
+               (1.0f - flight_progress);
 
         /* Animate tear: spin slowly and increment frame counter */
         t->anim_frame++;
@@ -2189,9 +2988,12 @@ void tears_update(Game *g) {
         }
 
         /* Out of range -> splash + blood particles */
-        if (t->dist >= range) {
-            spawn_tear_pop(g, t->x, t->y, 0);  /* wall splash */
-            t->active = 0;
+        if (t->dist >= t->max_dist) {
+            if (t->explosive) detonate_player_tear(g, t);
+            else {
+                spawn_tear_pop(g, t->x, t->y, 0);
+                t->active = 0;
+            }
             continue;
         }
 
@@ -2200,8 +3002,11 @@ void tears_update(Game *g) {
             if (t->x < ROOM_LEFT || t->x > ROOM_RIGHT ||
                 t->y < ROOM_TOP  || t->y > ROOM_BOTTOM) {
                 audio_play(SFX_TEAR_BLOCK);  /* Play wall hit sound */
-                spawn_tear_pop(g, t->x, t->y, 0);  /* wall splash */
-                t->active = 0;
+                if (t->explosive) detonate_player_tear(g, t);
+                else {
+                    spawn_tear_pop(g, t->x, t->y, 0);
+                    t->active = 0;
+                }
                 continue;
             }
         } else {
@@ -2213,19 +3018,33 @@ void tears_update(Game *g) {
             }
         }
 
-        /* Hit obstacle (spectral tears pass through) */
+        /* Hit obstacle (spectral tears pass through, spikes never block) */
         if (!t->spectral) {
             for (int j = 0; j < r->obstacle_count; j++) {
                 Obstacle *o = &r->obstacles[j];
                 if (!o->active) continue;
+                if (o->type == OBST_SPIKES) continue;
                 float odx = t->x - o->x;
                 float ody = t->y - o->y;
                 float dist = odx * odx + ody * ody;
-                float minDist = TEAR_RADIUS + OBSTACLE_SIZE * 0.5f;
+                float minDist = tear_hit_radius(t) + OBSTACLE_SIZE * 0.5f;
                 if (dist < minDist * minDist) {
                     audio_play(SFX_TEAR_BLOCK);  /* Play obstacle hit sound */
-                    spawn_tear_pop(g, t->x, t->y, 0);  /* obstacle splash */
-                    t->active = 0;
+                    /* Poop is destructible: 3 tear hits break it */
+                    if (o->type == OBST_POOP && !t->is_enemy) {
+                        o->hp--;
+                        if (o->hp <= 0) {
+                            o->active = 0;
+                            if (randi(0, 99) < 30) {
+                                spawn_random_consumable(r, o->x, o->y);
+                            }
+                        }
+                    }
+                    if (t->explosive) detonate_player_tear(g, t);
+                    else {
+                        spawn_tear_pop(g, t->x, t->y, 0);
+                        t->active = 0;
+                    }
                     break;
                 }
             }
@@ -2266,12 +3085,22 @@ static int count_alive_flies(Room *r) {
     return c;
 }
 
+static Enemy *room_alloc_enemy(Room *r) {
+    for (int i = 0; i < MAX_ENEMIES; i++) {
+        if (r->enemies[i].active) continue;
+        Enemy *e = &r->enemies[i];
+        memset(e, 0, sizeof(Enemy));
+        e->active = 1;
+        if (i >= r->enemy_count) r->enemy_count = i + 1;
+        return e;
+    }
+    return NULL;
+}
+
 static void boss_spawn_fly(Game *g, Room *r, float bx, float by) {
     (void)g;
-    if (r->enemy_count >= MAX_ENEMIES) return;
-    Enemy *e = &r->enemies[r->enemy_count];
-    memset(e, 0, sizeof(Enemy));
-    e->active = 1;
+    Enemy *e = room_alloc_enemy(r);
+    if (!e) return;
     e->type = ENEMY_FLY;
     e->hp = 2;
     e->max_hp = 2;
@@ -2280,7 +3109,6 @@ static void boss_spawn_fly(Game *g, Room *r, float bx, float by) {
     e->dx = randf(-1.5f, 1.5f);
     e->dy = randf(-1.5f, 1.5f);
     e->timer = randi(30, 60);
-    r->enemy_count++;
 }
 
 /* Spawn boss tear in a specific direction */
@@ -2315,10 +3143,8 @@ static void monstro_shotgun(Game *g, float bx, float by) {
 
 /* Peep: spawn a small eye that pursues player */
 static void boss_spawn_eye(Room *r, float bx, float by) {
-    if (r->enemy_count >= MAX_ENEMIES) return;
-    Enemy *e = &r->enemies[r->enemy_count];
-    memset(e, 0, sizeof(Enemy));
-    e->active = 1;
+    Enemy *e = room_alloc_enemy(r);
+    if (!e) return;
     e->type = ENEMY_EYE;
     e->hp = 3;
     e->max_hp = 3;
@@ -2328,15 +3154,12 @@ static void boss_spawn_eye(Room *r, float bx, float by) {
     e->dy = randf(-1.0f, 1.0f);
     e->timer = randi(30, 60);
     e->shoot_timer = randi(60, 100);
-    r->enemy_count++;
 }
 
 /* Haunt: spawn a Lil Haunt minion */
 static void boss_spawn_lil_haunt(Room *r, float bx, float by) {
-    if (r->enemy_count >= MAX_ENEMIES) return;
-    Enemy *e = &r->enemies[r->enemy_count];
-    memset(e, 0, sizeof(Enemy));
-    e->active = 1;
+    Enemy *e = room_alloc_enemy(r);
+    if (!e) return;
     e->type = ENEMY_LIL_HAUNT;
     e->hp = 4;
     e->max_hp = 4;
@@ -2345,15 +3168,12 @@ static void boss_spawn_lil_haunt(Room *r, float bx, float by) {
     e->dx = randf(-0.8f, 0.8f);
     e->dy = randf(-0.8f, 0.8f);
     e->timer = randi(60, 90);
-    r->enemy_count++;
 }
 
 /* Widow / Gurdy: spawn a small spider */
 static void boss_spawn_spider(Room *r, float bx, float by) {
-    if (r->enemy_count >= MAX_ENEMIES) return;
-    Enemy *e = &r->enemies[r->enemy_count];
-    memset(e, 0, sizeof(Enemy));
-    e->active = 1;
+    Enemy *e = room_alloc_enemy(r);
+    if (!e) return;
     e->type = ENEMY_SPIDER;
     e->hp = 2;
     e->max_hp = 2;
@@ -2362,15 +3182,12 @@ static void boss_spawn_spider(Room *r, float bx, float by) {
     e->dx = randf(-2.0f, 2.0f);
     e->dy = randf(-2.0f, 2.0f);
     e->timer = randi(30, 60);
-    r->enemy_count++;
 }
 
 /* Gurdy: spawn pooter minion */
 static void boss_spawn_pooter(Room *r, float bx, float by) {
-    if (r->enemy_count >= MAX_ENEMIES) return;
-    Enemy *e = &r->enemies[r->enemy_count];
-    memset(e, 0, sizeof(Enemy));
-    e->active = 1;
+    Enemy *e = room_alloc_enemy(r);
+    if (!e) return;
     e->type = ENEMY_POOTER;
     e->hp = 3;
     e->max_hp = 3;
@@ -2380,7 +3197,6 @@ static void boss_spawn_pooter(Room *r, float bx, float by) {
     e->dy = randf(-1.0f, 1.0f);
     e->timer = randi(40, 80);
     e->shoot_timer = randi(60, 100);
-    r->enemy_count++;
 }
 
 /* Phase 2 boss: shoot a 4-way spread of tears */
@@ -2410,10 +3226,8 @@ static int count_enemies_of_type(Room *r, EnemyType t) {
 
 /* Spawn a small gaper as part of split-on-death */
 static void spawn_gaper_split(Room *r, float px, float py) {
-    if (r->enemy_count >= MAX_ENEMIES) return;
-    Enemy *e = &r->enemies[r->enemy_count];
-    memset(e, 0, sizeof(Enemy));
-    e->active = 1;
+    Enemy *e = room_alloc_enemy(r);
+    if (!e) return;
     e->type = ENEMY_GAPER_SMALL;
     e->hp = 1;
     e->max_hp = 1;
@@ -2423,15 +3237,12 @@ static void spawn_gaper_split(Room *r, float px, float py) {
     e->dy = randf(-1.5f, 1.5f);
     e->timer = randi(20, 60);
     e->split_done = 1; /* don't split again */
-    r->enemy_count++;
 }
 
 /* Spawn a fly from a dying Mulligan */
 static void spawn_fly_from_death(Room *r, float px, float py, const FloorInfo *fi) {
-    if (r->enemy_count >= MAX_ENEMIES) return;
-    Enemy *e = &r->enemies[r->enemy_count];
-    memset(e, 0, sizeof(Enemy));
-    e->active = 1;
+    Enemy *e = room_alloc_enemy(r);
+    if (!e) return;
     e->type = ENEMY_FLY;
     e->hp = 2;
     e->max_hp = 2;
@@ -2440,7 +3251,6 @@ static void spawn_fly_from_death(Room *r, float px, float py, const FloorInfo *f
     e->dx = randf(-1.0f, 1.0f) * fi->enemy_speed_mult;
     e->dy = randf(-1.0f, 1.0f) * fi->enemy_speed_mult;
     e->timer = randi(30, 90);
-    r->enemy_count++;
 }
 
 /* Boom fly explosion: damage player if close, spawn blood particles */
@@ -2451,14 +3261,24 @@ static void boom_fly_explode(Game *g, float x, float y) {
     float dist = sqrtf(dx * dx + dy * dy);
     float blast_radius = 40.0f;
     if (dist < blast_radius && p->iframes == 0) {
-        p->hp -= player_absorb_dmg(p, 1);
-        p->iframes = PLAYER_IFRAMES;
-        if (dist > 0.1f) {
-            p->vx = (dx / dist) * PLAYER_KB_FORCE * 1.5f;
-            p->vy = (dy / dist) * PLAYER_KB_FORCE * 1.5f;
+        if (p->stats.flags & ITEM_FLAG_FIRE_IMMUNE) {
+            p->hp += 2;
+            player_clamp_health(p);
+            audio_play(SFX_PICKUP);
+        } else {
+            p->hp -= player_absorb_dmg(p, 1);
+            p->iframes = PLAYER_IFRAMES;
+            if (dist > 0.1f) {
+                p->vx = (dx / dist) * PLAYER_KB_FORCE * 1.5f;
+                p->vy = (dy / dist) * PLAYER_KB_FORCE * 1.5f;
+            }
+            p->kb_timer = PLAYER_KB_FRAMES;
+            audio_play(SFX_HURT);
+            if (player_check_death(p)) {
+                g->state = STATE_GAMEOVER;
+                audio_play(SFX_PLAYER_DEATH);
+            }
         }
-        p->kb_timer = PLAYER_KB_FRAMES;
-        audio_play(SFX_HURT);
     }
     /* Screen shake */
     trigger_shake(g, 5.0f, 20);
@@ -2472,32 +3292,48 @@ static void boom_fly_explode(Game *g, float x, float y) {
 /* Forward declarations for drop system */
 static void spawn_heart(Room *r, float x, float y, HeartType type);
 static void spawn_random_consumable(Room *r, float x, float y);
+static void spawn_room_clear_reward(Game *g, Room *r);
 static int is_boss_type(EnemyType t);
+static void explode_at(Game *g, float bx, float by, int damage_player);
+static int handle_enemy_death(Game *g, Room *r, Enemy *e);
 
 /* Roll heart/consumable drops from killed enemy, respecting difficulty */
 static void enemy_death_drops(Game *g, Room *r, Enemy *e) {
     if (is_boss_type(e->type)) {
-        /* Boss always drops 2 full hearts */
-        spawn_heart(r, e->x - 12, e->y, HEART_RED_FULL);
-        spawn_heart(r, e->x + 12, e->y, HEART_RED_FULL);
+        if (challenge_has_flag(g, CHALLENGE_FLAG_NO_HEART_DROPS)) {
+            spawn_random_consumable(r, e->x, e->y);
+        } else {
+            /* Boss drops one heal plus one resource so rewards stay useful */
+            spawn_heart(r, e->x - 12, e->y, HEART_RED_FULL);
+            spawn_random_consumable(r, e->x + 12, e->y);
+        }
     } else {
-        /* 5% chance for pill or card on every regular kill */
+        /* 4% chance for pill or card on every regular kill */
+        int luck_bonus = (int)floorf(g->player.stats.luck);
+        if (luck_bonus < 0) luck_bonus = 0;
+        if (luck_bonus > 8) luck_bonus = 8;
+        /* Petrified Poop trinket: noticeably better drop odds */
+        if (g->player.trinket == TRINKET_PETRIFIED_POOP) luck_bonus += 4;
         int special = randi(0, 100);
-        if (special < 3) {
+        if (special < 2 + luck_bonus / 2) {
             spawn_pill_pickup(r, e->x, e->y, randi(0, PILL_EFFECT_COUNT - 1));
             return;
-        } else if (special < 5) {
+        } else if (special < 4 + luck_bonus) {
             spawn_card_pickup(r, e->x, e->y, randi(0, TAROT_COUNT - 1));
+            return;
+        } else if (special < 5 + luck_bonus) {
+            spawn_trinket_pickup(r, e->x, e->y, randi(1, TRINKET_COUNT - 1));
             return;
         }
         /* Difficulty-scaled heart drop rates:
          * Easy: full<13, half<40, consumable<60
          * Normal: full<10, half<30, consumable<50
          * Hard: full<7, half<20, consumable<40 */
-        float rate = diff_heart_drop_rate(g->difficulty);
-        int full_thresh  = (int)(rate * 0.33f);       /* ~10 normal */
-        int half_thresh  = (int)(rate);                /* ~30 normal */
-        int consum_thresh = half_thresh + 20;          /* ~50 normal */
+        float rate = challenge_has_flag(g, CHALLENGE_FLAG_NO_HEART_DROPS)
+            ? 0.0f : diff_heart_drop_rate(g->difficulty);
+        int full_thresh  = (int)(rate * 0.33f) + luck_bonus;
+        int half_thresh  = (int)(rate) + luck_bonus * 2;
+        int consum_thresh = half_thresh + 16 + luck_bonus;
         int roll = randi(0, 100);
         if (roll < full_thresh) {
             spawn_heart(r, e->x, e->y, HEART_RED_FULL);
@@ -2567,6 +3403,12 @@ void roll_curse(Game *g) {
     g->active_curse = CURSE_NONE;
     g->curse_display_timer = 0;
 
+    if (challenge_has_flag(g, CHALLENGE_FLAG_PERMA_DARKNESS)) {
+        g->active_curse = CURSE_DARKNESS;
+        g->curse_display_timer = 180;
+        return;
+    }
+
     /* No curse on starting floor (floor 0) to give players a fair start */
     if (g->current_floor == 0) return;
 
@@ -2594,6 +3436,13 @@ const char *character_unlock_name(int char_idx) {
 
 /* Called on game win to update unlocks/achievements. */
 void unlock_check_after_win(Game *g) {
+    if (g->active_challenge >= 0 && g->active_challenge < CHALLENGE_COUNT) {
+        g_config.challenges_completed |= 1 << g->active_challenge;
+        g_config.total_wins++;
+        config_save(&g_config);
+        return;
+    }
+
     int char_bit = 1 << g->player.character;
     g_config.characters_completed |= char_bit;
     g_config.total_wins++;
@@ -2636,25 +3485,44 @@ void place_bomb(Game *g) {
     audio_play(SFX_SHOOT);  /* reuse shoot sound for placement */
 }
 
-void bomb_update(Game *g) {
-    if (g->bomb_timer <= 0) return;
-    g->bomb_timer--;
-    g->bomb_flash++;
-
-    if (g->bomb_timer > 0) return;
-
-    /* === EXPLOSION === */
+static void explode_at(Game *g, float bx, float by, int damage_player) {
     Room *r = current_room(g);
-    float bx = g->bomb_x, by = g->bomb_y;
+    Player *p = &g->player;
     float blast = 48.0f;
 
     trigger_shake(g, 6.0f, 20);
     audio_play(SFX_ENEMY_DEATH);  /* reuse for explosion sound */
 
-    /* Destroy obstacles (rocks) in blast radius */
+    if (damage_player) {
+        float pdx = p->x - bx, pdy = p->y - by;
+        float pdist = sqrtf(pdx * pdx + pdy * pdy);
+        if (pdist < blast && p->iframes == 0) {
+            if (p->stats.flags & ITEM_FLAG_FIRE_IMMUNE) {
+                p->hp += 2;
+                player_clamp_health(p);
+                audio_play(SFX_PICKUP);
+            } else {
+                p->hp -= player_absorb_dmg(p, 1);
+                p->iframes = PLAYER_IFRAMES;
+                if (pdist > 0.1f) {
+                    p->vx = (pdx / pdist) * PLAYER_KB_FORCE * 1.5f;
+                    p->vy = (pdy / pdist) * PLAYER_KB_FORCE * 1.5f;
+                }
+                p->kb_timer = PLAYER_KB_FRAMES;
+                audio_play(SFX_HURT);
+                if (player_check_death(p)) {
+                    g->state = STATE_GAMEOVER;
+                    audio_play(SFX_PLAYER_DEATH);
+                }
+            }
+        }
+    }
+
+    /* Destroy obstacles (rocks/poop) in blast radius; spikes survive bombs */
     for (int i = 0; i < r->obstacle_count; i++) {
         Obstacle *o = &r->obstacles[i];
         if (!o->active) continue;
+        if (o->type == OBST_SPIKES) continue;
         float dx = o->x - bx, dy = o->y - by;
         if (dx * dx + dy * dy < blast * blast) {
             o->active = 0;
@@ -2673,97 +3541,22 @@ void bomb_update(Game *g) {
     for (int i = 0; i < initial_enemy_count; i++) {
         Enemy *e = &r->enemies[i];
         if (!e->active) continue;
+        /* Respect the same invulnerability windows as tears */
+        if (e->type == ENEMY_HOST && e->hidden) continue;
+        if (e->type == ENEMY_BOSS_PIN && e->phase == 1) continue;
         float dx = e->x - bx, dy = e->y - by;
         if (dx * dx + dy * dy < blast * blast) {
             e->hp -= 3;  /* bombs do heavy damage */
             e->flash = 14;  /* punchier white-hit flash on bomb damage */
-            /* Knockback away from bomb */
+            /* Knockback away from bomb (bosses barely budge) */
             float dist = sqrtf(dx * dx + dy * dy);
             if (dist > 0.1f) {
-                e->x += (dx / dist) * 20.0f;
-                e->y += (dy / dist) * 20.0f;
+                float push = is_boss_type(e->type) ? 6.0f : 20.0f;
+                e->x += (dx / dist) * push;
+                e->y += (dy / dist) * push;
             }
 
-            /* Handle enemy death from bomb */
-            if (e->hp <= 0) {
-                /* Globin: collapse instead of dying (first time) */
-                if (e->type == ENEMY_GLOBIN && e->state == 0 && !e->split_done) {
-                    e->state = 1;
-                    e->hp = 1;
-                    e->regen_timer = 120;
-                    e->split_done = 1;
-                    continue;
-                }
-
-                /* Gaper split on death */
-                if (e->type == ENEMY_GAPER && !e->split_done) {
-                    spawn_gaper_split(r, e->x, e->y);
-                    spawn_gaper_split(r, e->x, e->y);
-                }
-
-                /* Boom Fly: explode on death */
-                if (e->type == ENEMY_BOOM_FLY) {
-                    boom_fly_explode(g, e->x, e->y);
-                }
-
-                /* Mulligan: spawn 2-3 flies on death */
-                if (e->type == ENEMY_MULLIGAN) {
-                    const FloorInfo *mfi = get_floor_info(g->current_floor);
-                    int nflies = randi(2, 3);
-                    for (int f = 0; f < nflies; f++) {
-                        spawn_fly_from_death(r, e->x, e->y, mfi);
-                    }
-                }
-
-                /* Drops (difficulty-scaled) */
-                enemy_death_drops(g, r, e);
-
-                /* Champion bonus reward + black champion split */
-                if (e->champion != CHAMP_NONE) {
-                    enemy_drop_champion_reward(g, e);
-                    if (e->champion == CHAMP_BLACK && e->split_pending) {
-                        int split_hp = (e->max_hp > 1) ? (e->max_hp / 2) : 1;
-                        for (int ci = 0; ci < 2; ci++) {
-                            for (int ei = 0; ei < MAX_ENEMIES; ei++) {
-                                if (!r->enemies[ei].active) {
-                                    Enemy *ne = &r->enemies[ei];
-                                    memset(ne, 0, sizeof(Enemy));
-                                    ne->type = e->type;
-                                    ne->x = e->x + randf(-12.0f, 12.0f);
-                                    ne->y = e->y + randf(-12.0f, 12.0f);
-                                    ne->hp = ne->max_hp = split_hp;
-                                    ne->active = 1;
-                                    ne->champion = CHAMP_NONE;
-                                    ne->dx = randf(-1.0f, 1.0f);
-                                    ne->dy = randf(-1.0f, 1.0f);
-                                    if (ei >= r->enemy_count) r->enemy_count = ei + 1;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                e->active = 0;
-                g->score += is_boss_type(e->type) ? 100 : 10;
-                g->kills++;
-                audio_play(SFX_ENEMY_DEATH);
-                if (is_boss_type(e->type)) {
-                    trigger_shake(g, 7.0f, 40);
-                    g->boss_active = 0;
-                    g->boss_death_anim = 60;
-                    /* Track in persistent unlocks (bosses_defeated bitmask) */
-                    {
-                        int boss_idx = (int)e->type - (int)ENEMY_BOSS_DUKE;
-                        if (boss_idx >= 0 && boss_idx < 16) {
-                            g_config.bosses_defeated |= (1 << boss_idx);
-                            config_save(&g_config);
-                        }
-                    }
-                    /* Return to floor music after boss defeat */
-                    music_play(music_for_floor(g->current_floor));
-                }
-            }
+            if (e->hp <= 0) handle_enemy_death(g, r, e);
         }
     }
 
@@ -2806,6 +3599,16 @@ void bomb_update(Game *g) {
     }
 }
 
+void bomb_update(Game *g) {
+    if (g->bomb_timer <= 0) return;
+    g->bomb_timer--;
+    g->bomb_flash++;
+
+    if (g->bomb_timer > 0) return;
+
+    explode_at(g, g->bomb_x, g->bomb_y, 1);
+}
+
 void enemy_shots_update(Game *g) {
     Room *r = current_room(g);
     Player *p = &g->player;
@@ -2827,10 +3630,11 @@ void enemy_shots_update(Game *g) {
             s->active = 0; continue;
         }
 
-        /* Obstacle collide */
+        /* Obstacle collide (spikes don't block shots) */
         for (int j = 0; j < r->obstacle_count; j++) {
             Obstacle *o = &r->obstacles[j];
             if (!o->active) continue;
+            if (o->type == OBST_SPIKES) continue;
             float dx = s->x - o->x, dy = s->y - o->y;
             float md = 3.0f + OBSTACLE_SIZE * 0.5f;
             if (dx * dx + dy * dy < md * md) { s->active = 0; break; }
@@ -2840,7 +3644,7 @@ void enemy_shots_update(Game *g) {
         /* Player collide */
         if (p->iframes == 0) {
             float pdx = s->x - p->x, pdy = s->y - p->y;
-            float md = 3.0f + PLAYER_SIZE * 0.7f;
+            float md = 3.0f + PLAYER_HURT_RADIUS;
             if (pdx * pdx + pdy * pdy < md * md) {
                 p->hp -= player_absorb_dmg(p, s->dmg);
                 p->iframes = PLAYER_IFRAMES;
@@ -2863,6 +3667,151 @@ void enemy_shots_update(Game *g) {
     }
 }
 
+static float enemy_body_radius(const Enemy *e) {
+    if (e->type >= ENEMY_BOSS_DUKE && e->type <= ENEMY_BOSS_MEGA_SATAN) {
+        return ENEMY_SIZE * 2.0f;
+    }
+    return ENEMY_SIZE * 0.85f;
+}
+
+static int enemy_ignores_obstacles(const Enemy *e) {
+    if (e->type >= ENEMY_BOSS_DUKE && e->type <= ENEMY_BOSS_MEGA_SATAN) return 1;
+    switch (e->type) {
+        case ENEMY_FLY:
+        case ENEMY_ATTACK_FLY:
+        case ENEMY_POOTER:
+        case ENEMY_BOOM_FLY:
+        case ENEMY_VIS:
+        case ENEMY_EYE:
+        case ENEMY_LIL_HAUNT:
+            return 1;
+        case ENEMY_SPIDER:
+        case ENEMY_HOPPER:
+        case ENEMY_LEAPER:
+            return e->state == 1;
+        default:
+            return 0;
+    }
+}
+
+static void enemy_steer_toward(Room *r, Enemy *e,
+                               float target_x, float target_y, float speed) {
+    float dir_x = target_x - e->x;
+    float dir_y = target_y - e->y;
+    float dir_mag = sqrtf(dir_x * dir_x + dir_y * dir_y);
+    if (dir_mag < 0.1f) {
+        e->dx = 0.0f;
+        e->dy = 0.0f;
+        return;
+    }
+    dir_x /= dir_mag;
+    dir_y /= dir_mag;
+
+    if (!enemy_ignores_obstacles(e)) {
+        float body_radius = enemy_body_radius(e);
+        for (int i = 0; i < r->obstacle_count; i++) {
+            Obstacle *o = &r->obstacles[i];
+            if (!o->active) continue;
+            if (o->type == OBST_SPIKES) continue;  /* enemies walk over spikes */
+            float rel_x = o->x - e->x;
+            float rel_y = o->y - e->y;
+            float ahead = rel_x * dir_x + rel_y * dir_y;
+            if (ahead <= 0.0f || ahead > 52.0f) continue;
+
+            float side = rel_x * dir_y - rel_y * dir_x;
+            float clearance = body_radius + OBSTACLE_SIZE * 0.5f + 6.0f;
+            if (fabsf(side) >= clearance) continue;
+
+            float turn_sign;
+            if (fabsf(side) < 0.5f) {
+                turn_sign = (((int)(e->x + e->y) + (int)e->type) & 1) ? 1.0f : -1.0f;
+            } else {
+                turn_sign = (side > 0.0f) ? 1.0f : -1.0f;
+            }
+            float strength = (1.0f - ahead / 52.0f) *
+                             (1.0f - fabsf(side) / clearance);
+            float old_dir_x = dir_x;
+            float old_dir_y = dir_y;
+            dir_x += old_dir_y * turn_sign * strength * 2.2f;
+            dir_y -= old_dir_x * turn_sign * strength * 2.2f;
+        }
+    }
+
+    dir_mag = sqrtf(dir_x * dir_x + dir_y * dir_y);
+    if (dir_mag > 0.1f) {
+        e->dx = dir_x / dir_mag * speed;
+        e->dy = dir_y / dir_mag * speed;
+    }
+}
+
+static int enemy_predictive_aim(const Player *p, float from_x, float from_y,
+                                float shot_speed, float *out_dx, float *out_dy) {
+    float to_x = p->x - from_x;
+    float to_y = p->y - from_y;
+    float distance = sqrtf(to_x * to_x + to_y * to_y);
+    if (distance < 0.1f || shot_speed <= 0.0f) return 0;
+
+    float lead_frames = distance / shot_speed * 0.35f;
+    if (lead_frames > 18.0f) lead_frames = 18.0f;
+    float aim_x = p->x + p->vx * lead_frames - from_x;
+    float aim_y = p->y + p->vy * lead_frames - from_y;
+    float aim_mag = sqrtf(aim_x * aim_x + aim_y * aim_y);
+    if (aim_mag < 0.1f) return 0;
+    *out_dx = aim_x / aim_mag * shot_speed;
+    *out_dy = aim_y / aim_mag * shot_speed;
+    return 1;
+}
+
+static void resolve_enemy_motion(Room *r, Enemy *e, float old_x, float old_y) {
+    float radius = enemy_body_radius(e);
+    float target_x = clampf(e->x, ROOM_LEFT + radius, ROOM_RIGHT - radius);
+    float target_y = clampf(e->y, ROOM_TOP + radius, ROOM_BOTTOM - radius);
+
+    if (enemy_ignores_obstacles(e)) {
+        e->x = target_x;
+        e->y = target_y;
+        return;
+    }
+
+    old_x = clampf(old_x, ROOM_LEFT + radius, ROOM_RIGHT - radius);
+    old_y = clampf(old_y, ROOM_TOP + radius, ROOM_BOTTOM - radius);
+    if (room_obstacle_blocked_at(r, old_x, old_y, radius)) {
+        int found_open_position = 0;
+        for (int ring = 1; ring <= 5 && !found_open_position; ring++) {
+            float search_radius = ring * 8.0f;
+            for (int step = 0; step < 12; step++) {
+                float angle = step * (2.0f * M_PI / 12.0f);
+                float candidate_x = clampf(old_x + cosf(angle) * search_radius,
+                                           ROOM_LEFT + radius, ROOM_RIGHT - radius);
+                float candidate_y = clampf(old_y + sinf(angle) * search_radius,
+                                           ROOM_TOP + radius, ROOM_BOTTOM - radius);
+                if (!room_obstacle_blocked_at(r, candidate_x, candidate_y, radius)) {
+                    old_x = candidate_x;
+                    old_y = candidate_y;
+                    found_open_position = 1;
+                    break;
+                }
+            }
+        }
+    }
+    e->x = old_x;
+    e->y = old_y;
+
+    if (!room_obstacle_blocked_at(r, target_x, old_y, radius)) {
+        e->x = target_x;
+    } else {
+        e->dx = -e->dx * 0.6f;
+        e->kb_dx = 0.0f;
+    }
+
+    if (!room_obstacle_blocked_at(r, e->x, target_y, radius)) {
+        e->y = target_y;
+    } else {
+        e->dy = -e->dy * 0.6f;
+        e->kb_dy = 0.0f;
+    }
+}
+
 void enemies_update(Game *g) {
     Player *p = &g->player;
     Room *r = current_room(g);
@@ -2879,8 +3828,11 @@ void enemies_update(Game *g) {
     for (int i = 0; i < r->enemy_count; i++) {
         Enemy *e = &r->enemies[i];
         if (!e->active) continue;
+        float old_x = e->x;
+        float old_y = e->y;
 
         if (e->flash > 0) e->flash--;
+        if (e->gemini_cflash > 0) e->gemini_cflash--;
         e->anim_timer++;  /* increment sprite animation counter */
 
         /* Yellow champion: drop creep trail periodically */
@@ -2952,49 +3904,15 @@ void enemies_update(Game *g) {
 
         case ENEMY_GAPER:
         case ENEMY_GAPER_SMALL: {
-            /* Pathfind around obstacles with simple steering + wobble */
-            float gdx = p->x - e->x;
-            float gdy = p->y - e->y;
-            float gm = sqrtf(gdx * gdx + gdy * gdy);
             float speed = (e->type == ENEMY_GAPER_SMALL ? 1.0f : 0.8f) *
                           fi->enemy_speed_mult;
             e->wobble += 0.16f;
 
-            if (gm > 1.0f && !suppressAI) {
-                float dirx = gdx / gm;
-                float diry = gdy / gm;
-
-                /* Avoid obstacles: push perpendicular if obstacle in front */
-                for (int j = 0; j < r->obstacle_count; j++) {
-                    Obstacle *o = &r->obstacles[j];
-                    if (!o->active) continue;
-                    float odx = o->x - e->x;
-                    float ody = o->y - e->y;
-                    float od2 = odx * odx + ody * ody;
-                    if (od2 > 60.0f * 60.0f) continue;
-                    /* perpendicular avoidance */
-                    float ond = sqrtf(od2);
-                    if (ond < 0.1f) continue;
-                    float push = (60.0f - ond) / 60.0f;
-                    /* perpendicular dir to obstacle direction */
-                    dirx += (-ody / ond) * push * 0.5f;
-                    diry += ( odx / ond) * push * 0.5f;
-                }
-
-                /* Renormalize */
-                float dl = sqrtf(dirx * dirx + diry * diry);
-                if (dl > 0.1f) {
-                    dirx /= dl;
-                    diry /= dl;
-                }
-
-                /* Wobble for organic motion */
-                float w = sinf(e->wobble) * 0.4f;
-                float wx = -diry * w;
-                float wy =  dirx * w;
-
-                e->dx = (dirx + wx) * speed;
-                e->dy = (diry + wy) * speed;
+            if (!suppressAI) {
+                enemy_steer_toward(r, e,
+                                   p->x + p->vx * 3.0f,
+                                   p->y + p->vy * 3.0f,
+                                   speed);
                 e->x += e->dx;
                 e->y += e->dy;
             }
@@ -3166,12 +4084,10 @@ void enemies_update(Game *g) {
                 /* Stopped, aiming, then shoot */
                 e->dx *= 0.9f; e->dy *= 0.9f;
                 if (e->timer <= 0) {
-                    float pdx = p->x - e->x;
-                    float pdy = p->y - e->y;
-                    float pm  = sqrtf(pdx * pdx + pdy * pdy);
-                    if (pm > 0.5f) {
-                        spawn_enemy_shot(g, e->x, e->y,
-                            (pdx / pm) * 2.5f, (pdy / pm) * 2.5f, 1);
+                    float shot_dx, shot_dy;
+                    if (enemy_predictive_aim(p, e->x, e->y, 2.5f,
+                                             &shot_dx, &shot_dy)) {
+                        spawn_enemy_shot(g, e->x, e->y, shot_dx, shot_dy, 1);
                     }
                     e->shoot_timer = randi(70, 120);
                     e->state = 0;
@@ -3218,13 +4134,9 @@ void enemies_update(Game *g) {
 
         case ENEMY_BABY: {
             /* Slow crawl toward player */
-            float pdx = p->x - e->x;
-            float pdy = p->y - e->y;
-            float pm  = sqrtf(pdx * pdx + pdy * pdy);
             float spd = 0.4f * fi->enemy_speed_mult;
-            if (pm > 1.0f && !suppressAI) {
-                e->dx = (pdx / pm) * spd;
-                e->dy = (pdy / pm) * spd;
+            if (!suppressAI) {
+                enemy_steer_toward(r, e, p->x, p->y, spd);
                 e->x += e->dx;
                 e->y += e->dy;
             }
@@ -3240,8 +4152,10 @@ void enemies_update(Game *g) {
                 float pm  = sqrtf(pdx * pdx + pdy * pdy);
                 float spd = 1.8f * fi->enemy_speed_mult;
                 if (pm > 1.0f && !suppressAI) {
-                    e->dx = (pdx / pm) * spd;
-                    e->dy = (pdy / pm) * spd;
+                    enemy_steer_toward(r, e,
+                                       p->x + p->vx * 2.0f,
+                                       p->y + p->vy * 2.0f,
+                                       spd);
                     e->x += e->dx;
                     e->y += e->dy;
                 }
@@ -3275,21 +4189,19 @@ void enemies_update(Game *g) {
 
         case ENEMY_MAW: {
             /* Walks slowly, periodically shoots aimed projectiles */
-            float pdx = p->x - e->x;
-            float pdy = p->y - e->y;
-            float pm  = sqrtf(pdx * pdx + pdy * pdy);
             float spd = 0.6f * fi->enemy_speed_mult;
-            if (pm > 1.0f && !suppressAI) {
-                e->x += (pdx / pm) * spd;
-                e->y += (pdy / pm) * spd;
+            if (!suppressAI) {
+                enemy_steer_toward(r, e, p->x, p->y, spd);
+                e->x += e->dx;
+                e->y += e->dy;
             }
             e->shoot_timer--;
             if (e->shoot_timer <= 0) {
                 e->shoot_timer = randi(60, 100);
-                if (pm > 0.5f) {
-                    float shotSpd = 2.0f;
-                    spawn_enemy_shot(g, e->x, e->y,
-                        (pdx / pm) * shotSpd, (pdy / pm) * shotSpd, 1);
+                float shot_dx, shot_dy;
+                if (enemy_predictive_aim(p, e->x, e->y, 2.0f,
+                                         &shot_dx, &shot_dy)) {
+                    spawn_enemy_shot(g, e->x, e->y, shot_dx, shot_dy, 1);
                 }
             }
             break;
@@ -3297,22 +4209,23 @@ void enemies_update(Game *g) {
 
         case ENEMY_MULLIGAN: {
             /* Walks toward player, shoots occasionally; spawns flies on death */
-            float pdx = p->x - e->x;
-            float pdy = p->y - e->y;
-            float pm  = sqrtf(pdx * pdx + pdy * pdy);
             float spd = 0.7f * fi->enemy_speed_mult;
             e->wobble += 0.12f;
-            if (pm > 1.0f && !suppressAI) {
-                float w = sinf(e->wobble) * 0.3f;
-                e->x += (pdx / pm + w) * spd;
-                e->y += (pdy / pm) * spd;
+            if (!suppressAI) {
+                enemy_steer_toward(r, e,
+                                   p->x + sinf(e->wobble) * 12.0f,
+                                   p->y,
+                                   spd);
+                e->x += e->dx;
+                e->y += e->dy;
             }
             e->shoot_timer--;
             if (e->shoot_timer <= 0) {
                 e->shoot_timer = randi(80, 140);
-                if (pm > 0.5f) {
-                    spawn_enemy_shot(g, e->x, e->y,
-                        (pdx / pm) * 1.8f, (pdy / pm) * 1.8f, 1);
+                float shot_dx, shot_dy;
+                if (enemy_predictive_aim(p, e->x, e->y, 1.8f,
+                                         &shot_dx, &shot_dy)) {
+                    spawn_enemy_shot(g, e->x, e->y, shot_dx, shot_dy, 1);
                 }
             }
             break;
@@ -3333,18 +4246,16 @@ void enemies_update(Game *g) {
                 /* Exposed - vulnerable, shoot at player */
                 e->hidden = 0;
                 if (e->timer == 20) { /* shoot midway through exposure */
-                    float pdx = p->x - e->x;
-                    float pdy = p->y - e->y;
-                    float pm  = sqrtf(pdx * pdx + pdy * pdy);
-                    if (pm > 0.5f) {
-                        float shotSpd = 2.5f;
+                    float shot_dx, shot_dy;
+                    if (enemy_predictive_aim(p, e->x, e->y, 2.5f,
+                                             &shot_dx, &shot_dy)) {
+                        float angle = atan2f(shot_dy, shot_dx);
                         spawn_enemy_shot(g, e->x, e->y,
-                            (pdx / pm) * shotSpd, (pdy / pm) * shotSpd, 1);
-                        /* Second shot slightly spread */
-                        float spread = 0.3f;
+                                         cosf(angle - 0.14f) * 2.5f,
+                                         sinf(angle - 0.14f) * 2.5f, 1);
                         spawn_enemy_shot(g, e->x, e->y,
-                            (pdx / pm + spread) * shotSpd,
-                            (pdy / pm - spread) * shotSpd, 1);
+                                         cosf(angle + 0.14f) * 2.5f,
+                                         sinf(angle + 0.14f) * 2.5f, 1);
                     }
                 }
                 if (e->timer <= 0) {
@@ -3362,13 +4273,10 @@ void enemies_update(Game *g) {
             e->shoot_timer--;
             if (e->shoot_timer <= 0) {
                 e->shoot_timer = randi(25, 45); /* fast shooting */
-                float pdx = p->x - e->x;
-                float pdy = p->y - e->y;
-                float pm  = sqrtf(pdx * pdx + pdy * pdy);
-                if (pm > 0.5f) {
-                    float shotSpd = 3.0f;
-                    spawn_enemy_shot(g, e->x, e->y,
-                        (pdx / pm) * shotSpd, (pdy / pm) * shotSpd, 1);
+                float shot_dx, shot_dy;
+                if (enemy_predictive_aim(p, e->x, e->y, 3.0f,
+                                         &shot_dx, &shot_dy)) {
+                    spawn_enemy_shot(g, e->x, e->y, shot_dx, shot_dy, 1);
                 }
             }
             /* Red Maw doesn't move */
@@ -3419,20 +4327,19 @@ void enemies_update(Game *g) {
             e->shoot_timer--;
             if (e->shoot_timer <= 0) {
                 e->shoot_timer = randi(50, 80);
-                float pdx = p->x - e->x;
-                float pdy = p->y - e->y;
-                float pm  = sqrtf(pdx * pdx + pdy * pdy);
-                if (pm > 0.5f) {
-                    float shotSpd = 2.5f;
-                    float nx = pdx / pm, ny = pdy / pm;
+                float aim_dx, aim_dy;
+                if (enemy_predictive_aim(p, e->x, e->y, 2.5f,
+                                         &aim_dx, &aim_dy)) {
+                    float nx = aim_dx / 2.5f;
+                    float ny = aim_dy / 2.5f;
                     /* Double shot - slightly spread */
                     float spread = 0.15f;
                     spawn_enemy_shot(g, e->x, e->y,
-                        (nx - ny * spread) * shotSpd,
-                        (ny + nx * spread) * shotSpd, 1);
+                        (nx - ny * spread) * 2.5f,
+                        (ny + nx * spread) * 2.5f, 1);
                     spawn_enemy_shot(g, e->x, e->y,
-                        (nx + ny * spread) * shotSpd,
-                        (ny - nx * spread) * shotSpd, 1);
+                        (nx + ny * spread) * 2.5f,
+                        (ny - nx * spread) * 2.5f, 1);
                 }
             }
             break;
@@ -3464,7 +4371,7 @@ void enemies_update(Game *g) {
             /* Spawn flies periodically (only if under cap) */
             if (e->timer <= 0) {
                 int fly_count = count_alive_flies(r);
-                int interval = lowHP ? 80 : DUKE_SPAWN_INTERVAL;
+                int interval = lowHP ? 100 : DUKE_SPAWN_INTERVAL + 20;
                 e->timer = interval;
                 if (fly_count < DUKE_MAX_FLIES) {
                     boss_spawn_fly(g, r, e->x, e->y);
@@ -3476,7 +4383,7 @@ void enemies_update(Game *g) {
             if (lowHP) {
                 e->shoot_timer--;
                 if (e->shoot_timer <= 0) {
-                    e->shoot_timer = randi(80, 130);
+                    e->shoot_timer = randi(110, 160);
                     float spd = 1.8f;
                     boss_shoot_tear(g, e->x, e->y,  spd,  0);
                     boss_shoot_tear(g, e->x, e->y, -spd,  0);
@@ -3512,7 +4419,7 @@ void enemies_update(Game *g) {
                 /* Shoot timer - occasional shotgun blast while idle */
                 e->shoot_timer--;
                 if (e->shoot_timer <= 0) {
-                    e->shoot_timer = randi(90, 140);
+                    e->shoot_timer = randi(120, 170);
                     monstro_shotgun(g, e->x, e->y);
                     trigger_shake(g, 2.0f, 8);
                 }
@@ -3523,18 +4430,18 @@ void enemies_update(Game *g) {
                     if (e->attack_pattern == 2) {
                         /* Big jump to player position */
                         e->phase = 1;
-                        e->timer = 45;
+                        e->timer = 50;
                         e->target_x = p->x;
                         e->target_y = p->y;
                         e->jump_vz = -4.0f; /* launch upward */
                         e->jump_z = 0;
                         /* Store start position for interpolation */
-                        e->dx = (e->target_x - e->x) / 45.0f;
-                        e->dy = (e->target_y - e->y) / 45.0f;
+                        e->dx = (e->target_x - e->x) / 50.0f;
+                        e->dy = (e->target_y - e->y) / 50.0f;
                     } else {
                         /* Small hop attack */
                         e->phase = 1;
-                        e->timer = 30;
+                        e->timer = 34;
                         float jdx = p->x - e->x;
                         float jdy = p->y - e->y;
                         float jm = sqrtf(jdx * jdx + jdy * jdy);
@@ -3575,7 +4482,7 @@ void enemies_update(Game *g) {
                 e->dy *= 0.85f;
                 if (e->timer <= 0) {
                     e->phase = 0;
-                    e->timer = randi(50, 100);
+                    e->timer = randi(65, 115);
                     e->dx = 0;
                     e->dy = 0;
                 }
@@ -3606,22 +4513,24 @@ void enemies_update(Game *g) {
                 }
 
                 /* Companion follows main body with tether constraint */
-                float tdx = e->x - e->gemini_cx;
-                float tdy = e->y - e->gemini_cy;
-                float td = sqrtf(tdx * tdx + tdy * tdy);
-                if (td > GEMINI_TETHER_DIST) {
-                    /* Snap to tether distance */
-                    e->gemini_cx = e->x - (tdx / td) * GEMINI_TETHER_DIST;
-                    e->gemini_cy = e->y - (tdy / td) * GEMINI_TETHER_DIST;
+                if (e->gemini_chp > 0) {
+                    float tdx = e->x - e->gemini_cx;
+                    float tdy = e->y - e->gemini_cy;
+                    float td = sqrtf(tdx * tdx + tdy * tdy);
+                    if (td > GEMINI_TETHER_DIST) {
+                        /* Snap to tether distance */
+                        e->gemini_cx = e->x - (tdx / td) * GEMINI_TETHER_DIST;
+                        e->gemini_cy = e->y - (tdy / td) * GEMINI_TETHER_DIST;
+                    }
+                    /* Companion gently follows */
+                    if (td > 10.0f) {
+                        e->gemini_cx += (tdx / td) * 0.8f;
+                        e->gemini_cy += (tdy / td) * 0.8f;
+                    }
+                    /* Companion wobbles */
+                    e->gemini_cx += sinf(g->frame * 0.07f) * 0.5f;
+                    e->gemini_cy += cosf(g->frame * 0.09f) * 0.5f;
                 }
-                /* Companion gently follows */
-                if (td > 10.0f) {
-                    e->gemini_cx += (tdx / td) * 0.8f;
-                    e->gemini_cy += (tdy / td) * 0.8f;
-                }
-                /* Companion wobbles */
-                e->gemini_cx += sinf(g->frame * 0.07f) * 0.5f;
-                e->gemini_cy += cosf(g->frame * 0.09f) * 0.5f;
             } else {
                 /* Post-split: main body continues chasing, but faster */
                 float gdx = p->x - e->x;
@@ -3633,9 +4542,11 @@ void enemies_update(Game *g) {
                     e->y += (gdy / gm) * post_spd;
                 }
 
-                /* Companion: aggressive charge behavior */
+                /* Companion: aggressive charge behavior (while it lives) */
                 e->timer--;
-                if (e->state == 0) {
+                if (e->gemini_chp <= 0) {
+                    /* Companion dead: nothing to update */
+                } else if (e->state == 0) {
                     /* Waiting to charge */
                     e->gemini_cdx *= 0.92f;
                     e->gemini_cdy *= 0.92f;
@@ -3670,12 +4581,12 @@ void enemies_update(Game *g) {
                                       ROOM_BOTTOM - ENEMY_SIZE);
             }
 
-            /* Companion collision with player */
-            if (p->iframes == 0) {
+            /* Companion collision with player (only while it lives) */
+            if (e->gemini_chp > 0 && p->iframes == 0) {
                 float cdx = p->x - e->gemini_cx;
                 float cdy = p->y - e->gemini_cy;
                 float cdsq = cdx * cdx + cdy * cdy;
-                float crad = PLAYER_SIZE + ENEMY_SIZE;
+                float crad = PLAYER_HURT_RADIUS + ENEMY_SIZE;
                 if (cdsq < crad * crad) {
                     p->hp -= player_absorb_dmg(p, 1);
                     p->iframes = PLAYER_IFRAMES;
@@ -3773,7 +4684,7 @@ void enemies_update(Game *g) {
                     LarrySegment *seg = &e->segments[s];
                     float sdx = p->x - seg->x;
                     float sdy = p->y - seg->y;
-                    float sr = PLAYER_SIZE + ENEMY_SIZE * 0.8f;
+                    float sr = PLAYER_HURT_RADIUS + ENEMY_SIZE * 0.8f;
                     if (sdx * sdx + sdy * sdy < sr * sr) {
                         p->hp -= player_absorb_dmg(p, 1);
                         p->iframes = PLAYER_IFRAMES;
@@ -3813,7 +4724,7 @@ void enemies_update(Game *g) {
             /* Shoot timer (both phases) */
             e->famine_shoot_cd--;
             if (e->famine_shoot_cd <= 0) {
-                int interval = (e->phase == 1) ? randi(30, 50) : randi(50, 90);
+                int interval = (e->phase == 1) ? randi(40, 65) : randi(65, 100);
                 e->famine_shoot_cd = interval;
                 /* Shoot aimed tears at player */
                 float fdx = p->x - e->x;
@@ -3847,9 +4758,9 @@ void enemies_update(Game *g) {
 
                 if (e->timer <= 0) {
                     e->state = 1;
-                    e->timer = (e->phase == 1) ? 35 : 28;
+                    e->timer = (e->phase == 1) ? 30 : 24;
                     /* Charge toward player */
-                    float chg_speed = ((e->phase == 1) ? FAMINE_CHARGE_SPEED * 1.3f : FAMINE_CHARGE_SPEED) * fi->boss_speed_scale;
+                    float chg_speed = ((e->phase == 1) ? FAMINE_CHARGE_SPEED * 1.15f : FAMINE_CHARGE_SPEED * 0.95f) * fi->boss_speed_scale;
                     e->dx = (p->x > e->x) ? chg_speed : -chg_speed;
                     e->dy = (p->y - e->y) * 0.02f; /* slight vertical aim */
                     /* Spawn a fly on charge start */
@@ -3871,7 +4782,7 @@ void enemies_update(Game *g) {
 
                 if (e->timer <= 0) {
                     e->state = 0;
-                    e->timer = randi(30, 65);
+                    e->timer = randi(40, 75);
                 }
             }
             break;
@@ -3920,7 +4831,7 @@ void enemies_update(Game *g) {
             e->shoot_timer--;
             if (e->shoot_timer <= 0) {
                 boss_spread_4way(g, e->x, e->y, BOSS_SHOT_SPEED * 0.9f);
-                e->shoot_timer = (e->phase == 1) ? 80 : 130;
+                e->shoot_timer = (e->phase == 1) ? 95 : 145;
             }
             break;
         }
@@ -3975,7 +4886,7 @@ void enemies_update(Game *g) {
                         float spd = BOSS_SHOT_SPEED * 1.2f;
                         boss_shoot_tear(g, e->x, e->y, (fdx / fm) * spd, (fdy / fm) * spd);
                     }
-                    e->timer = 75;
+                    e->timer = 90;
                 }
             }
             break;
@@ -4037,13 +4948,13 @@ void enemies_update(Game *g) {
                         boss_shoot_tear(g, e->x, e->y,
                                        cosf(angle - 0.3f) * spd, sinf(angle - 0.3f) * spd);
                     }
-                    e->shoot_timer = 22;
+                    e->shoot_timer = 28;
                 }
 
                 if (e->timer <= 0) {
                     /* Burrow again */
                     e->phase = 1;
-                    e->timer = 80;
+                    e->timer = 95;
                 }
             }
             break;
@@ -4097,7 +5008,7 @@ void enemies_update(Game *g) {
                         float spd = BOSS_SHOT_SPEED * 0.9f;
                         boss_shoot_tear(g, e->x, e->y, (fdx2 / fm2) * spd, (fdy2 / fm2) * spd);
                     }
-                    e->shoot_timer = 90;
+                    e->shoot_timer = 110;
                 }
             } else {
                 /* Brimstone phase: chase player faster, fire cross spreads */
@@ -4117,7 +5028,7 @@ void enemies_update(Game *g) {
                 if (e->shoot_timer <= 0) {
                     /* 8-way brimstone burst */
                     boss_spread_8way(g, e->x, e->y, BOSS_SHOT_SPEED);
-                    e->shoot_timer = 80;
+                    e->shoot_timer = 100;
                 }
             }
             break;
@@ -4179,7 +5090,7 @@ void enemies_update(Game *g) {
                     /* Shoot 4-way burst on landing */
                     boss_spread_4way(g, e->x, e->y, BOSS_SHOT_SPEED * 0.9f);
                     trigger_shake(g, 3.5f, 12);
-                    e->timer = randi(40, 70);
+                    e->timer = randi(50, 80);
                 }
             }
 
@@ -4193,7 +5104,7 @@ void enemies_update(Game *g) {
                     float spd = BOSS_SHOT_SPEED;
                     boss_shoot_tear(g, e->x, e->y, (fdx / fm) * spd, (fdy / fm) * spd);
                 }
-                e->shoot_timer = 90;
+                e->shoot_timer = 110;
             }
             break;
         }
@@ -4230,12 +5141,12 @@ void enemies_update(Game *g) {
                     boss_spread_8way(g, e->x, e->y, BOSS_SHOT_SPEED);
                     /* Spawn 2 spiders to keep pressure */
                     boss_spawn_spider(r, e->x, e->y);
-                    e->timer = 100;
+                    e->timer = 115;
                 } else if (e->phase == 1) {
                     /* Brimstone: rapid aimed bursts */
-                    e->shoot_timer = 6;
-                    e->attack_pattern = 5;  /* burst count */
-                    e->timer = 80;
+                    e->shoot_timer = 8;
+                    e->attack_pattern = 4;  /* burst count */
+                    e->timer = 100;
                 } else {
                     /* Fireball spread: 12-way */
                     for (int i = 0; i < 12; i++) {
@@ -4244,7 +5155,7 @@ void enemies_update(Game *g) {
                                        cosf(angle) * BOSS_SHOT_SPEED * 1.1f,
                                        sinf(angle) * BOSS_SHOT_SPEED * 1.1f);
                     }
-                    e->timer = 100;
+                    e->timer = 115;
                 }
             }
 
@@ -4272,21 +5183,22 @@ void enemies_update(Game *g) {
 
         case ENEMY_EYE: {
             /* Pursue player slowly, occasional tear shots */
-            float fdx = p->x - e->x;
-            float fdy = p->y - e->y;
-            float fm = sqrtf(fdx * fdx + fdy * fdy);
-            if (fm > 1.0f) {
-                e->dx = (fdx / fm) * 1.5f;
-                e->dy = (fdy / fm) * 1.5f;
-            }
             if (!suppressAI) {
+                enemy_steer_toward(r, e,
+                                   p->x + p->vx * 2.0f,
+                                   p->y + p->vy * 2.0f,
+                                   1.5f);
                 e->x += e->dx;
                 e->y += e->dy;
             }
             e->shoot_timer--;
             if (e->shoot_timer <= 0) {
-                float spd = BOSS_SHOT_SPEED * 0.8f;
-                boss_shoot_tear(g, e->x, e->y, (fdx / fm) * spd, (fdy / fm) * spd);
+                float shot_dx, shot_dy;
+                float shot_speed = BOSS_SHOT_SPEED * 0.8f;
+                if (enemy_predictive_aim(p, e->x, e->y, shot_speed,
+                                         &shot_dx, &shot_dy)) {
+                    boss_shoot_tear(g, e->x, e->y, shot_dx, shot_dy);
+                }
                 e->shoot_timer = randi(80, 130);
             }
             break;
@@ -4315,26 +5227,7 @@ void enemies_update(Game *g) {
 
         } /* end switch */
 
-        /* Keep in bounds */
-        float sz = ENEMY_SIZE;
-        switch (e->type) {
-        case ENEMY_BOSS_DUKE:
-        case ENEMY_BOSS_MONSTRO:
-        case ENEMY_BOSS_GEMINI:
-        case ENEMY_BOSS_LARRY:
-        case ENEMY_BOSS_FAMINE:
-        case ENEMY_BOSS_PEEP:
-        case ENEMY_BOSS_GURDY:
-        case ENEMY_BOSS_PIN:
-        case ENEMY_BOSS_HAUNT:
-        case ENEMY_BOSS_WIDOW:
-        case ENEMY_BOSS_MEGA_SATAN:
-            sz = ENEMY_SIZE * 2;
-            break;
-        default: break;
-        }
-        e->x = clampf(e->x, ROOM_LEFT + sz, ROOM_RIGHT - sz);
-        e->y = clampf(e->y, ROOM_TOP + sz, ROOM_BOTTOM - sz);
+        resolve_enemy_motion(r, e, old_x, old_y);
     }
 
     /* === Enemy-vs-enemy separation pass ===
@@ -4349,14 +5242,18 @@ void enemies_update(Game *g) {
             int bBoss = (b->type >= ENEMY_BOSS_DUKE && b->type <= ENEMY_BOSS_MEGA_SATAN);
             float dx = b->x - a->x;
             float dy = b->y - a->y;
-            float minD = ENEMY_SIZE * 1.6f;
+            float minD = (enemy_body_radius(a) + enemy_body_radius(b)) * 0.8f;
             float d2 = dx * dx + dy * dy;
             if (d2 < minD * minD && d2 > 0.01f) {
+                float old_ax = a->x, old_ay = a->y;
+                float old_bx = b->x, old_by = b->y;
                 float d = sqrtf(d2);
                 float overlap = (minD - d) * 0.5f * ENEMY_SEPARATION;
                 float nx = dx / d, ny = dy / d;
                 if (!aBoss) { a->x -= nx * overlap; a->y -= ny * overlap; }
                 if (!bBoss) { b->x += nx * overlap; b->y += ny * overlap; }
+                if (!aBoss) resolve_enemy_motion(r, a, old_ax, old_ay);
+                if (!bBoss) resolve_enemy_motion(r, b, old_bx, old_by);
             }
         }
     }
@@ -4378,6 +5275,252 @@ static int is_boss_type(EnemyType t) {
     return t >= ENEMY_BOSS_DUKE && t <= ENEMY_BOSS_MEGA_SATAN;
 }
 
+static int handle_enemy_death(Game *g, Room *r, Enemy *e) {
+    if (e->type == ENEMY_GLOBIN && e->state == 0 && !e->split_done) {
+        e->state = 1;
+        e->hp = 1;
+        e->regen_timer = 120;
+        e->split_done = 1;
+        return 0;
+    }
+
+    if (e->type == ENEMY_GAPER && !e->split_done) {
+        spawn_gaper_split(r, e->x, e->y);
+        spawn_gaper_split(r, e->x, e->y);
+    }
+
+    if (e->type == ENEMY_BOOM_FLY) {
+        boom_fly_explode(g, e->x, e->y);
+    }
+
+    if (e->type == ENEMY_MULLIGAN) {
+        const FloorInfo *fi = get_floor_info(g->current_floor);
+        int nflies = randi(2, 3);
+        for (int spawn_idx = 0; spawn_idx < nflies; spawn_idx++) {
+            spawn_fly_from_death(r, e->x, e->y, fi);
+        }
+    }
+
+    enemy_death_drops(g, r, e);
+
+    if (e->champion != CHAMP_NONE) {
+        enemy_drop_champion_reward(g, e);
+        if (e->champion == CHAMP_BLACK && e->split_pending) {
+            int split_hp = (e->max_hp > 1) ? (e->max_hp / 2) : 1;
+            for (int copy_idx = 0; copy_idx < 2; copy_idx++) {
+                for (int enemy_idx = 0; enemy_idx < MAX_ENEMIES; enemy_idx++) {
+                    if (!r->enemies[enemy_idx].active) {
+                        Enemy *new_enemy = &r->enemies[enemy_idx];
+                        memset(new_enemy, 0, sizeof(Enemy));
+                        new_enemy->type = e->type;
+                        new_enemy->x = e->x + randf(-12.0f, 12.0f);
+                        new_enemy->y = e->y + randf(-12.0f, 12.0f);
+                        new_enemy->hp = new_enemy->max_hp = split_hp;
+                        new_enemy->active = 1;
+                        new_enemy->champion = CHAMP_NONE;
+                        new_enemy->dx = randf(-1.0f, 1.0f);
+                        new_enemy->dy = randf(-1.0f, 1.0f);
+                        if (enemy_idx >= r->enemy_count) r->enemy_count = enemy_idx + 1;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    e->active = 0;
+    g->score += is_boss_type(e->type) ? 100 : 10;
+    g->kills++;
+    audio_play(SFX_ENEMY_DEATH);
+
+    if (is_boss_type(e->type)) {
+        trigger_shake(g, 7.0f, 40);
+        g->boss_active = 0;
+        g->boss_death_anim = 60;
+        {
+            int boss_idx = (int)e->type - (int)ENEMY_BOSS_DUKE;
+            if (boss_idx >= 0 && boss_idx < 16) {
+                g_config.bosses_defeated |= (1 << boss_idx);
+                config_save(&g_config);
+            }
+        }
+        music_play(music_for_floor(g->current_floor));
+    } else {
+        trigger_shake(g, 1.5f, 6);
+    }
+
+    return 1;
+}
+
+/* Apply an active item's on-use effect. Returns 1 if the use "took" (charge
+ * should be spent), 0 if it was a no-op (e.g. healing at full HP). */
+static int do_active_item_effect(Game *g, ItemType item) {
+    Player *p = &g->player;
+    Room *r = current_room(g);
+
+    switch (item) {
+    case ITEM_YUM_HEART:
+        if (p->hp >= p->stats.max_hp) return 0;
+        p->hp += 2;
+        player_clamp_health(p);
+        return 1;
+
+    case ITEM_BIBLE:
+        if (p->hp >= p->stats.max_hp) return 0;
+        p->hp = p->stats.max_hp;
+        player_clamp_health(p);
+        return 1;
+
+    case ITEM_BOOK_OF_BELIAL:
+        p->book_belial_dmg_timer = 0x3fffffff;
+        recalc_player_stats(p);
+        return 1;
+
+    case ITEM_NECRONOMICON: {
+        trigger_shake(g, 7.0f, 24);
+        /* Snapshot the count so enemies spawned by these kills (splits, flies)
+         * aren't instantly destroyed by the same pass - matches the bomb code. */
+        int n = r->enemy_count;
+        for (int i = 0; i < n; i++) {
+            Enemy *e = &r->enemies[i];
+            if (!e->active) continue;
+            if (e->type == ENEMY_HOST && e->hidden) continue;
+            if (e->type == ENEMY_BOSS_PIN && e->phase == 1) continue;
+            e->hp -= 40;
+            e->flash = 20;
+            spawn_blood_splatter(g, e->x, e->y, 0.0f, 1.0f, 1);
+            if (e->hp <= 0) handle_enemy_death(g, r, e);
+        }
+        return 1;
+    }
+
+    case ITEM_MOMS_BRA:
+        for (int i = 0; i < MAX_ENEMY_SHOTS; i++) g->enemy_shots[i].active = 0;
+        if (p->iframes < 60) p->iframes = 60;  /* brief breathing room */
+        trigger_shake(g, 3.0f, 10);
+        return 1;
+
+    case ITEM_FORGET_ME_NOW:
+        /* Re-roll the entire current floor (same depth, fresh layout). */
+        finish_floor_transition(g);
+        return 1;
+
+    case ITEM_D6:
+        /* Re-roll the item(s) sitting on pedestals in this room. No-op (and
+         * no charge spent) if there is nothing to re-roll. */
+        if (!r->pedestal.active && !r->devil_pedestal.active) return 0;
+        if (r->pedestal.active)        r->pedestal.item       = pick_random_item(g);
+        if (r->devil_pedestal.active)  r->devil_pedestal.item = pick_random_item(g);
+        trigger_shake(g, 2.0f, 8);
+        return 1;
+
+    default:
+        return 0;
+    }
+}
+
+/* ================================================================
+ * Familiars (orbiting helpers granted by passive items)
+ * ================================================================ */
+
+/* Per-familiar combat profile. */
+static void familiar_def(ItemType t, u32 *col, float *dmg, int *cd,
+                         int *homing, float *range) {
+    switch (t) {
+    case ITEM_BROTHER_BOBBY:
+        *col = C2D_Color32(120, 200, 255, 255); *dmg = 2.0f; *cd = 28; *homing = 0; *range = 160.0f; break;
+    case ITEM_SISTER_MAGGY:
+        *col = C2D_Color32(255, 150, 200, 255); *dmg = 3.0f; *cd = 44; *homing = 0; *range = 160.0f; break;
+    case ITEM_LITTLE_STEVEN:
+        *col = C2D_Color32(190, 120, 255, 255); *dmg = 1.5f; *cd = 34; *homing = 1; *range = 180.0f; break;
+    case ITEM_DEMON_BABY:
+        *col = C2D_Color32(230, 80, 80, 255);   *dmg = 1.2f; *cd = 16; *homing = 0; *range = 95.0f;  break;
+    default:
+        *col = C2D_Color32(230, 230, 230, 255); *dmg = 1.5f; *cd = 30; *homing = 0; *range = 150.0f; break;
+    }
+}
+
+/* Spawn a familiar's tear into the shared (player) tear array, so existing
+ * tear movement and tear-vs-enemy collision handle it for free. */
+static void spawn_familiar_tear(Game *g, float x, float y,
+                                float tx, float ty, float dmg, int homing,
+                                float max_range) {
+    Tear *t = NULL;
+    for (int i = 0; i < MAX_TEARS; i++) {
+        if (!g->tears[i].active) { t = &g->tears[i]; break; }
+    }
+    if (!t) return;
+
+    float dx = tx - x, dy = ty - y;
+    float m = sqrtf(dx * dx + dy * dy);
+    if (m < 0.1f) { dx = 0.0f; dy = -1.0f; m = 1.0f; }
+
+    memset(t, 0, sizeof(Tear));
+    t->active = 1;
+    t->x = x;  t->y = y;
+    float spd = 4.0f;
+    t->dx = dx / m * spd;
+    t->dy = dy / m * spd;
+    t->speed = spd;
+    t->dist = 0.0f;
+    /* Travel at least as far as the familiar's targeting range (+a margin)
+     * so it never fires shots that expire before reaching a locked target. */
+    t->max_dist = max_range + 12.0f;
+    t->dmg = dmg;
+    t->homing = homing;
+    t->is_enemy = 0;
+    t->z = 0.0f;
+    t->vz = TEAR_ARC_VEL;
+    t->rotation = atan2f(t->dy, t->dx);
+    float dscale = dmg / 2.0f;
+    if (dscale < 0.6f) dscale = 0.6f;
+    if (dscale > 1.4f) dscale = 1.4f;
+    t->size = dscale;
+}
+
+static void familiars_update(Game *g) {
+    Player *p = &g->player;
+    if (p->familiar_count <= 0) return;
+    Room *r = current_room(g);
+    const float orbit_r = 26.0f;
+
+    for (int i = 0; i < MAX_FAMILIARS; i++) {
+        Familiar *f = &p->familiars[i];
+        if (f->type == ITEM_NONE) continue;
+
+        /* Orbit the player (slight ellipse), lerping toward the orbit point */
+        f->orbit_phase += 0.05f;
+        float ox = p->x + cosf(f->orbit_phase) * orbit_r;
+        float oy = p->y + sinf(f->orbit_phase) * orbit_r * 0.8f;
+        f->x += (ox - f->x) * 0.25f;
+        f->y += (oy - f->y) * 0.25f;
+
+        if (f->fire_cd > 0) f->fire_cd--;
+
+        u32 col; float dmg; int cd; int homing; float range;
+        familiar_def(f->type, &col, &dmg, &cd, &homing, &range);
+
+        if (f->fire_cd <= 0) {
+            /* Target the nearest currently-hittable enemy in range */
+            float best = 1e9f;
+            Enemy *be = NULL;
+            for (int j = 0; j < r->enemy_count; j++) {
+                Enemy *e = &r->enemies[j];
+                if (!e->active) continue;
+                if (e->type == ENEMY_HOST && e->hidden) continue;
+                if (e->type == ENEMY_BOSS_PIN && e->phase == 1) continue;
+                float dx = e->x - f->x, dy = e->y - f->y;
+                float d = dx * dx + dy * dy;
+                if (d < best) { best = d; be = e; }
+            }
+            if (be && best <= range * range) {
+                spawn_familiar_tear(g, f->x, f->y, be->x, be->y, dmg, homing, range);
+                f->fire_cd = cd;
+            }
+        }
+    }
+}
+
 void collisions_update(Game *g) {
     Player *p = &g->player;
     Room *r = current_room(g);
@@ -4392,15 +5535,31 @@ void collisions_update(Game *g) {
         for (int j = 0; j < MAX_TEARS; j++) {
             Tear *t = &g->tears[j];
             if (!t->active) continue;
+            unsigned int enemy_bit = 1u << i;
+            if (t->hit_mask & enemy_bit) continue;
 
-            if (circle_overlap(t->x, t->y, TEAR_RADIUS, e->x, e->y, esz)) {
+            if (circle_overlap(t->x, t->y, tear_hit_radius(t), e->x, e->y, esz)) {
+                /* Pin cannot be hit while it is fully underground. */
+                if (e->type == ENEMY_BOSS_PIN && e->phase == 1) continue;
+
                 /* Host is invulnerable when hidden */
                 if (e->type == ENEMY_HOST && e->hidden) {
-                    if (!t->piercing) t->active = 0;
+                    if (t->explosive) detonate_player_tear(g, t);
+                    else if (!t->piercing) t->active = 0;
                     continue;
                 }
-                int dmg = (int)t->dmg;
-                if (dmg < 1) dmg = 1;
+
+                if (t->explosive) {
+                    detonate_player_tear(g, t);
+                    break;
+                }
+                t->hit_mask |= enemy_bit;
+
+                /* Enemy HP is integer-based, so retain fractional damage on
+                 * the enemy instead of rounding every tear up or down. */
+                float accumulated_damage = t->dmg + e->damage_carry;
+                int dmg = (int)floorf(accumulated_damage);
+                e->damage_carry = accumulated_damage - dmg;
                 e->hp -= dmg;
                 /* Snappier hit-flash (was 6) — about 14 frames feels more
                    responsive and reads clearly in motion. */
@@ -4423,93 +5582,55 @@ void collisions_update(Game *g) {
                 }
 
                 if (e->hp <= 0) {
-                    /* Globin: collapse into pile instead of dying (first time) */
-                    if (e->type == ENEMY_GLOBIN && e->state == 0 && !e->split_done) {
-                        e->state = 1;          /* collapsed pile */
-                        e->hp = 1;
-                        e->regen_timer = 120;   /* ticks until full regen */
-                        e->split_done = 1;      /* only collapse once */
-                        goto skip_death;
-                    }
-
-                    /* Gaper split on death */
-                    if (e->type == ENEMY_GAPER && !e->split_done) {
-                        spawn_gaper_split(r, e->x, e->y);
-                        spawn_gaper_split(r, e->x, e->y);
-                    }
-
-                    /* Boom Fly: explode on death */
-                    if (e->type == ENEMY_BOOM_FLY) {
-                        boom_fly_explode(g, e->x, e->y);
-                    }
-
-                    /* Mulligan: spawn 2-3 flies on death */
-                    if (e->type == ENEMY_MULLIGAN) {
-                        const FloorInfo *fi = get_floor_info(g->current_floor);
-                        int nflies = randi(2, 3);
-                        for (int f = 0; f < nflies; f++) {
-                            spawn_fly_from_death(r, e->x, e->y, fi);
-                        }
-                    }
-                    
-                    /* Drops (difficulty-scaled) */
-                    enemy_death_drops(g, r, e);
-
-                    /* Champion bonus reward + black champion split */
-                    if (e->champion != CHAMP_NONE) {
-                        enemy_drop_champion_reward(g, e);
-                        if (e->champion == CHAMP_BLACK && e->split_pending) {
-                            /* Spawn 2 weaker copies of base enemy at same location */
-                            for (int ci = 0; ci < 2; ci++) {
-                                for (int ei = 0; ei < MAX_ENEMIES; ei++) {
-                                    if (!r->enemies[ei].active) {
-                                        Enemy *ne = &r->enemies[ei];
-                                        memset(ne, 0, sizeof(Enemy));
-                                        ne->type = e->type;
-                                        ne->x = e->x + randf(-12.0f, 12.0f);
-                                        ne->y = e->y + randf(-12.0f, 12.0f);
-                                        ne->hp = ne->max_hp = 3;
-                                        ne->active = 1;
-                                        ne->champion = CHAMP_NONE;
-                                        ne->dx = randf(-1.0f, 1.0f);
-                                        ne->dy = randf(-1.0f, 1.0f);
-                                        r->enemy_count++;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    e->active = 0;
-                    g->score += is_boss_type(e->type) ? 100 : 10;
-                    g->kills++;
-                    audio_play(SFX_ENEMY_DEATH);
-                    if (is_boss_type(e->type)) {
-                        trigger_shake(g, 7.0f, 40);
-                        g->boss_active = 0;
-                        g->boss_death_anim = 60; /* boss death explosion effect */
-                        /* Track in persistent unlocks (bosses_defeated bitmask) */
-                        {
-                            int boss_idx = (int)e->type - (int)ENEMY_BOSS_DUKE;
-                            if (boss_idx >= 0 && boss_idx < 16) {
-                                g_config.bosses_defeated |= (1 << boss_idx);
-                                config_save(&g_config);
-                            }
-                        }
-                        /* Return to floor music after boss defeat */
-                        music_play(music_for_floor(g->current_floor));
-                    } else {
-                        trigger_shake(g, 1.5f, 6);
-                    }
+                    handle_enemy_death(g, r, e);
+                    /* Stop testing further tears against a dead enemy, or a
+                     * multi-shot volley can trigger death drops/splits twice. */
+                    if (!e->active) break;
                 }
-                skip_death: ; /* Globin collapse jumps here */
             }
         }
 
-        /* Player vs Enemy */
-        if (e->active && p->iframes == 0) {
-            if (circle_overlap(p->x, p->y, PLAYER_SIZE, e->x, e->y, esz)) {
+        /* Tears vs Gemini companion (Suture): it has its own HP pool and
+         * must be killable, not just a permanent contact hazard. */
+        if (e->active && e->type == ENEMY_BOSS_GEMINI && e->gemini_chp > 0) {
+            for (int j = 0; j < MAX_TEARS; j++) {
+                Tear *t = &g->tears[j];
+                if (!t->active) continue;
+                if (!circle_overlap(t->x, t->y, tear_hit_radius(t),
+                                    e->gemini_cx, e->gemini_cy, ENEMY_SIZE))
+                    continue;
+                if (t->explosive) {
+                    detonate_player_tear(g, t);
+                    continue;
+                }
+                int cdmg = (int)(t->dmg + 0.5f);
+                if (cdmg < 1) cdmg = 1;
+                e->gemini_chp -= cdmg;
+                e->gemini_cflash = 14;  /* flash the companion, not the body */
+                audio_play(SFX_HIT);
+                spawn_blood_splatter(g, t->x, t->y, t->dx, t->dy, 0);
+                if (!t->piercing) t->active = 0;
+                if (e->gemini_chp <= 0) {
+                    e->gemini_chp = 0;
+                    spawn_blood_splatter(g, e->gemini_cx, e->gemini_cy,
+                                         0.0f, 1.0f, 1);
+                    audio_play(SFX_ENEMY_DEATH);
+                    g->score += 25;
+                    break;
+                }
+            }
+        }
+
+        /* Player vs Enemy.
+         * Skip contact damage from bosses that aren't physically on the
+         * floor: a burrowed Pin is underground (and invulnerable), and a
+         * jumping Monstro/Widow is high in the air until it lands. */
+        int not_touchable =
+            (e->type == ENEMY_BOSS_PIN && e->phase == 1) ||
+            (e->type == ENEMY_BOSS_MONSTRO && e->jump_z < -8.0f) ||
+            (e->type == ENEMY_BOSS_WIDOW && e->jump_z > 8.0f);
+        if (e->active && p->iframes == 0 && !not_touchable) {
+            if (circle_overlap(p->x, p->y, PLAYER_HURT_RADIUS, e->x, e->y, esz)) {
                 p->hp -= player_absorb_dmg(p, 1);
                 p->iframes = PLAYER_IFRAMES;
                 /* Knockback: push player away from enemy with stun frames */
@@ -4549,8 +5670,59 @@ void collisions_update(Game *g) {
             for (int k = 0; k < MAX_ENEMY_SHOTS; k++) g->enemy_shots[k].active = 0;
 
             if (r->type == ROOM_BOSS) {
+                r->pedestal.x = (ROOM_LEFT + ROOM_RIGHT) / 2.0f;
+                r->pedestal.y = (ROOM_TOP + ROOM_BOTTOM) / 2.0f - 24.0f;
+                r->pedestal.item = pick_random_item(g);
+                r->pedestal.active = 1;
                 /* Drop trapdoor to next floor */
                 r->has_trapdoor = 1;
+
+                /* Devil deal: chance for a second, dark pedestal that costs
+                 * a heart container. Pool holds the strongest items. */
+                if (randi(0, 99) < 40) {
+                    static const ItemType devil_pool[] = {
+                        ITEM_BRIMSTONE, ITEM_MOMS_KNIFE, ITEM_PENTAGRAM,
+                        ITEM_DR_FETUS, ITEM_SACRED_HEART, ITEM_POLYPHEMUS,
+                        ITEM_EPIC_FETUS, ITEM_IPECAC, ITEM_BLOOD_OF_MARTYR,
+                        ITEM_STIGMATA
+                    };
+                    const int pool_n = (int)(sizeof(devil_pool) / sizeof(devil_pool[0]));
+                    ItemType pick = devil_pool[randi(0, pool_n - 1)];
+                    for (int tries = 0;
+                         tries < 8 && player_has_item(&g->player, pick); tries++) {
+                        pick = devil_pool[randi(0, pool_n - 1)];
+                    }
+                    if (!player_has_item(&g->player, pick)) {
+                        r->devil_pedestal.x = (ROOM_LEFT + ROOM_RIGHT) / 2.0f + 56.0f;
+                        r->devil_pedestal.y = (ROOM_TOP + ROOM_BOTTOM) / 2.0f - 24.0f;
+                        r->devil_pedestal.item = pick;
+                        r->devil_pedestal.active = 1;
+                    }
+                }
+            } else if (r->type == ROOM_NORMAL && randi(0, 99) < 18) {
+                spawn_room_clear_reward(g, r);
+            }
+
+            if ((r->type == ROOM_NORMAL || r->type == ROOM_BOSS)
+                && g->player.active_max_charge > 0
+                && g->player.active_charge < g->player.active_max_charge) {
+                g->player.active_charge++;
+                /* AAA Battery: an extra charge per room clear */
+                if (g->player.trinket == TRINKET_AAA_BATTERY &&
+                    g->player.active_charge < g->player.active_max_charge) {
+                    g->player.active_charge++;
+                }
+            }
+
+            /* Trinket room-clear rewards (normal/boss rooms only) */
+            if (r->type == ROOM_NORMAL || r->type == ROOM_BOSS) {
+                if (g->player.trinket == TRINKET_SWALLOWED_PENNY) {
+                    g->player.coins += 1;
+                    if (g->player.coins > 99) g->player.coins = 99;
+                } else if (g->player.trinket == TRINKET_MATCH_STICK && randi(0, 99) < 25) {
+                    g->player.bombs += 1;
+                    if (g->player.bombs > 99) g->player.bombs = 99;
+                }
             }
         }
     }
@@ -4615,6 +5787,11 @@ void check_door_transition(Game *g) {
 
     if (g->transition > 0) return;
 
+    /* Boss rooms stay sealed until the fight is actually over. This hard
+     * gate prevents any special-door logic from letting the player leave
+     * while the boss encounter is still active. */
+    if (r->type == ROOM_BOSS && !r->cleared) return;
+
     float midX = (ROOM_LEFT + ROOM_RIGHT) / 2.0f;
     float midY = (ROOM_TOP + ROOM_BOTTOM) / 2.0f;
 
@@ -4634,11 +5811,10 @@ void check_door_transition(Game *g) {
     for (int d = 0; d < 4; d++) {
         if (!in_range[d]) continue;
 
-        /* Normal (unlocked) doors require room to be cleared first.
-         * Locked/special doors (treasure, curse) can always be interacted
-         * with — the lock/cost check happens inside try_door_unlock. */
-        int is_special = r->door_locked[d] || r->door_type[d] != 0;
-        if (!r->cleared && !is_special) return;
+        /* ALL doors seal while enemies are alive — including treasure and
+         * curse doors. Otherwise any fight next to a special door could be
+         * escaped mid-combat. Lock/cost checks happen in try_door_unlock. */
+        if (!r->cleared) return;
 
         if (try_door_unlock(g, r, d)) do_room_transition(g, dirs[d]);
         return;
@@ -4662,12 +5838,23 @@ void do_room_transition(Game *g, Direction dir) {
 
     d->cur_x = nx;
     d->cur_y = ny;
+    g->player.brimstone_charge = 0;
+    g->player.brimstone_dir = DIR_NONE;
+    if (g->player.book_belial_dmg_timer > 0) {
+        g->player.book_belial_dmg_timer = 0;
+        recalc_player_stats(&g->player);
+    }
 
     Room *newRoom = &d->rooms[ny][nx];
     newRoom->visited = 1;
 
     for (int i = 0; i < MAX_TEARS; i++)
         g->tears[i].active = 0;
+
+    /* A bomb ticking in the previous room must not detonate in this one
+     * (it would explode at stale coordinates and could even reveal this
+     * room's secret door from a wall the player never bombed). */
+    g->bomb_timer = 0;
 
     audio_play(SFX_DOOR);
 
@@ -4750,9 +5937,13 @@ void game_update(Game *g, u32 kDown, u32 kHeld, circlePosition circlePos) {
             break;
         case STATE_GAMEOVER:
             music_fade_out(60);  /* ~1s fade out on death */
+            delete_run_save();   /* death ends the run - no continue */
+            g->transition = 45;  /* brief lockout so A-mashing can't skip the screen */
             break;
         case STATE_WIN:
             music_fade_out(90);  /* ~1.5s fade out on victory */
+            delete_run_save();   /* run complete - no continue */
+            g->transition = 45;
             break;
         default:
             break;
@@ -4793,14 +5984,14 @@ void game_update(Game *g, u32 kDown, u32 kHeld, circlePosition circlePos) {
                     g->transition = 0;
                     break;
                 case MENU_CONTINUE:
-                    /* No save system yet: option is grayed out and does nothing.
-                       When implemented, this would load g_config save slot. */
+                    /* Resume the saved run at the start of its floor */
+                    if (run_save_exists()) {
+                        continue_saved_run(g);
+                    }
                     break;
                 case MENU_CHALLENGES:
-                    /* Map Challenges to mode select for now (Story/Infinite).
-                       Future: dedicated challenge list screen. */
-                    g->state = STATE_MODE_SELECT;
-                    g->mode_sel = 1;  /* default to Infinite as the challenge mode */
+                    g->state = STATE_CHALLENGE_SELECT;
+                    g->challenge_sel = 0;
                     g->transition = 0;
                     break;
                 case MENU_STATS:
@@ -4813,6 +6004,7 @@ void game_update(Game *g, u32 kDown, u32 kHeld, circlePosition circlePos) {
                     g->state = STATE_SETTINGS;
                     g->settings_sel = 0;
                     g->settings_changed = 0;
+                    g->settings_erase_armed = 0;
                     g->transition = 0;
                     break;
             }
@@ -4823,16 +6015,10 @@ void game_update(Game *g, u32 kDown, u32 kHeld, circlePosition circlePos) {
         }
         if (kDown & KEY_START) {
             /* Quick-start: Normal Story mode */
+            g->active_challenge = CHALLENGE_NONE;
             g->game_mode = MODE_STORY;
             g->difficulty = DIFF_NORMAL;
             start_new_game(g);
-        }
-        /* Audio debug: X plays a synthesized test tone, B plays a SFX */
-        if (kDown & KEY_X) {
-            audio_test_tone();
-        }
-        if (kDown & KEY_B) {
-            audio_play(SFX_SHOOT);
         }
         break;
 
@@ -4849,6 +6035,7 @@ void game_update(Game *g, u32 kDown, u32 kHeld, circlePosition circlePos) {
         if (g->transition > 0) g->transition--;
 
         if (kDown & KEY_A) {
+            g->active_challenge = CHALLENGE_NONE;
             g->game_mode = (g->mode_sel == 0) ? MODE_STORY : MODE_INFINITE;
             g->state = STATE_CHARACTER_SELECT;
             g->char_sel = 0;
@@ -4856,6 +6043,36 @@ void game_update(Game *g, u32 kDown, u32 kHeld, circlePosition circlePos) {
         }
         if (kDown & (KEY_B)) {
             g->state = STATE_MENU;
+        }
+        break;
+
+    case STATE_CHALLENGE_SELECT:
+        if (kDown & KEY_DUP) {
+            g->challenge_sel--;
+            if (g->challenge_sel < 0) g->challenge_sel = CHALLENGE_COUNT - 1;
+        }
+        if (kDown & KEY_DDOWN) {
+            g->challenge_sel++;
+            if (g->challenge_sel >= CHALLENGE_COUNT) g->challenge_sel = 0;
+        }
+        if (abs(circlePos.dy) > 100 && g->transition <= 0) {
+            if (circlePos.dy > 100) {
+                g->challenge_sel--;
+                if (g->challenge_sel < 0) g->challenge_sel = CHALLENGE_COUNT - 1;
+            } else {
+                g->challenge_sel++;
+                if (g->challenge_sel >= CHALLENGE_COUNT) g->challenge_sel = 0;
+            }
+            g->transition = 10;
+        }
+        if (g->transition > 0) g->transition--;
+
+        if (kDown & KEY_A) {
+            start_challenge(g, (ChallengeType)g->challenge_sel);
+        }
+        if (kDown & KEY_B) {
+            g->state = STATE_MENU;
+            g->transition = 0;
         }
         break;
 
@@ -4953,21 +6170,51 @@ void game_update(Game *g, u32 kDown, u32 kHeld, circlePosition circlePos) {
         break;
 
     case STATE_SETTINGS: {
-        /* Settings menu with 3 items: Audio toggle, SFX Vol, Music Vol */
-        #define SETTINGS_COUNT 3
+        /* Settings menu: Audio toggle, SFX Vol, Music Vol, Erase Data */
         if (kDown & KEY_DUP) {
             g->settings_sel--;
             if (g->settings_sel < 0) g->settings_sel = SETTINGS_COUNT - 1;
+            g->settings_erase_armed = 0;  /* moving away disarms the erase */
         }
         if (kDown & KEY_DDOWN) {
             g->settings_sel++;
             if (g->settings_sel >= SETTINGS_COUNT) g->settings_sel = 0;
+            g->settings_erase_armed = 0;
+        }
+        /* Erase Save Data: A once to arm, A again to confirm */
+        if ((kDown & KEY_A) && g->settings_sel == 3) {
+            if (g->settings_erase_armed == 1) {
+                delete_run_save();
+                /* Reset progression but keep audio preferences */
+                g_config.unlocked_chars       = CONFIG_DEFAULT_UNLOCKED_CHARS;
+                g_config.total_wins           = 0;
+                g_config.bosses_defeated      = 0;
+                g_config.characters_completed = 0;
+                g_config.challenges_completed = 0;
+                g_config.floors_reached       = 0;
+                g_config.total_runs_started   = 0;
+                config_save(&g_config);
+                g->settings_erase_armed = 2;  /* show "erased" feedback */
+                audio_play(SFX_ENEMY_DEATH);
+            } else if (g->settings_erase_armed == 0) {
+                g->settings_erase_armed = 1;
+            }
         }
         /* Left/Right to change values */
         if (kDown & (KEY_DLEFT | KEY_DRIGHT | KEY_A)) {
             if (g->settings_sel == 0) {
                 /* Toggle audio enabled */
                 g_config.audio_enabled = g_config.audio_enabled ? 0 : 1;
+                g->settings_changed = 1;
+            } else if ((kDown & KEY_A) && g->settings_sel == 1 && g_config.sfx_volume < 0.95f) {
+                g_config.sfx_volume += 0.1f;
+                if (g_config.sfx_volume > 1.0f) g_config.sfx_volume = 1.0f;
+                audio_set_volume(g_config.sfx_volume);
+                g->settings_changed = 1;
+            } else if ((kDown & KEY_A) && g->settings_sel == 2 && g_config.music_volume < 0.95f) {
+                g_config.music_volume += 0.1f;
+                if (g_config.music_volume > 1.0f) g_config.music_volume = 1.0f;
+                music_set_volume(g_config.music_volume);
                 g->settings_changed = 1;
             }
         }
@@ -5013,9 +6260,10 @@ void game_update(Game *g, u32 kDown, u32 kHeld, circlePosition circlePos) {
         g->frame++;
         g->play_time_frames++;
 
-        /* Pause toggle: START opens stats screen */
+        /* Pause toggle: START opens pause menu + stats screen */
         if (kDown & KEY_START) {
             g->state = STATE_PAUSED;
+            g->pause_sel = 0;
             break;
         }
 
@@ -5042,27 +6290,8 @@ void game_update(Game *g, u32 kDown, u32 kHeld, circlePosition circlePos) {
             g->player.book_belial_dmg_timer--;
             if (g->player.book_belial_dmg_timer == 0) recalc_player_stats(&g->player);
         }
-        if (g->player.yum_heart_cd > 0) g->player.yum_heart_cd--;
         if (g->homing_timer > 0) g->homing_timer--;
         if (g->curse_display_timer > 0) g->curse_display_timer--;
-
-        /* Yum Heart auto-trigger: heal 1 HP every 10s if cooldown expired & wounded */
-        if (player_has_item(&g->player, ITEM_YUM_HEART)
-            && g->player.yum_heart_cd == 0
-            && g->player.hp < g->player.stats.max_hp) {
-            g->player.hp += 1;
-            if (g->player.hp > g->player.stats.max_hp) g->player.hp = g->player.stats.max_hp;
-            g->player.yum_heart_cd = 600;          /* 10 second cooldown */
-            audio_play(SFX_PICKUP);
-        }
-
-        /* Book of Belial: auto-activate damage buff when entering boss room */
-        if (player_has_item(&g->player, ITEM_BOOK_OF_BELIAL)
-            && g->boss_intro_timer > 0
-            && g->player.book_belial_dmg_timer == 0) {
-            g->player.book_belial_dmg_timer = 600;  /* 10 seconds of bonus damage */
-            recalc_player_stats(&g->player);
-        }
 
         /* Boss intro pause */
         if (g->boss_intro_timer > 0) {
@@ -5079,30 +6308,22 @@ void game_update(Game *g, u32 kDown, u32 kHeld, circlePosition circlePos) {
 
         player_update(g, kHeld, circlePos);
 
-        if (kHeld & KEY_X) shoot_tear(g, DIR_UP);
-        if (kHeld & KEY_B) shoot_tear(g, DIR_DOWN);
-        if (kHeld & KEY_Y) shoot_tear(g, DIR_LEFT);
-        if (kHeld & KEY_A) shoot_tear(g, DIR_RIGHT);
+        update_player_shooting(g, kHeld);
 
-        /* Bomb placement (SELECT) */
+        /* Physical utility controls */
         if (kDown & KEY_SELECT) place_bomb(g);
+        if (kDown & KEY_R) place_bomb(g);
+        if (kDown & KEY_L) try_use_active_item(g);
 
-        /* Use held pill (L) */
-        if ((kDown & KEY_L) && g->player.has_pill) {
-            apply_pill_effect(g, g->player.held_pill);
-            g->player.has_pill = 0;
-            audio_play(SFX_PICKUP);
-        }
-        /* Use held card (R) */
-        if ((kDown & KEY_R) && g->player.has_card) {
-            apply_tarot_card(g, g->player.held_card);
-            g->player.has_card = 0;
-            audio_play(SFX_PICKUP);
+        /* Bottom-screen touch action panel */
+        if (kDown & KEY_TOUCH) {
+            handle_touch_action_panel(g);
         }
 
         /* Active item use (Yum Heart / Book of Belial / etc) on Y? Use ZL via select? */
         /* Active items handled via button: ZL (which 3DS lacks); use SELECT+Y combo, or auto when items exist */
 
+        familiars_update(g);
         tears_update(g);
         enemies_update(g);
         enemy_shots_update(g);
@@ -5114,9 +6335,33 @@ void game_update(Game *g, u32 kDown, u32 kHeld, circlePosition circlePos) {
         break;
 
     case STATE_PAUSED:
-        /* Stats overlay shown - resume on START */
+        /* Pause menu on top screen, stats overlay on bottom screen */
         if (kDown & (KEY_START | KEY_B)) {
             g->state = STATE_PLAYING;
+            break;
+        }
+        if (kDown & KEY_DUP) {
+            g->pause_sel--;
+            if (g->pause_sel < 0) g->pause_sel = 2;
+        }
+        if (kDown & KEY_DDOWN) {
+            g->pause_sel++;
+            if (g->pause_sel > 2) g->pause_sel = 0;
+        }
+        if (kDown & KEY_A) {
+            switch (g->pause_sel) {
+            case 0:  /* Resume */
+                g->state = STATE_PLAYING;
+                break;
+            case 1:  /* Restart run (same character/mode/difficulty) */
+                start_new_game(g);
+                break;
+            case 2:  /* Save & Quit to menu */
+                write_run_save(g);
+                g->state = STATE_MENU;
+                g->menu_sel = 0;
+                break;
+            }
         }
         break;
 
@@ -5129,17 +6374,26 @@ void game_update(Game *g, u32 kDown, u32 kHeld, circlePosition circlePos) {
 
     case STATE_GAMEOVER:
         if (g->player.hp == -999) return;
+        if (g->transition > 0) { g->transition--; break; }
         if (kDown & KEY_START) {
             g->state = STATE_MENU;
             g->menu_sel = 0;
             g->player.hp = 0;
         }
+        if (kDown & KEY_A) {
+            /* Quick retry: same character / mode / difficulty / challenge */
+            start_new_game(g);
+        }
         break;
 
     case STATE_WIN:
+        if (g->transition > 0) { g->transition--; break; }
         if (kDown & KEY_START) {
             g->state = STATE_MENU;
             g->menu_sel = 0;
+        }
+        if (kDown & KEY_A) {
+            start_new_game(g);
         }
         break;
     }
@@ -5395,7 +6649,7 @@ void render_menu(Game *g, C2D_TextBuf textBuf) {
 
     for (int i = 0; i < MENU_COUNT; i++) {
         int selected = (i == g->menu_sel);
-        int disabled = (i == MENU_CONTINUE);   /* CONTINUE grayed out (no save) */
+        int disabled = (i == MENU_CONTINUE) && !run_save_exists();
         float yPos = opt_y0 + i * opt_gap;
 
         /* Selected option: subtle bounce + slight scale up */
@@ -5441,9 +6695,27 @@ void render_menu(Game *g, C2D_TextBuf textBuf) {
         }
     }
 
+    /* Saved-run details when CONTINUE is highlighted */
+    if (g->menu_sel == MENU_CONTINUE) {
+        const RunSaveData *sv = get_continue_info();
+        if (sv) {
+            const FloorInfo *cfi = get_floor_info(sv->current_floor);
+            char cbuf[64];
+            snprintf(cbuf, sizeof(cbuf), "%s - %s",
+                     character_name((CharacterType)sv->player.character),
+                     cfi->name);
+            C2D_Text contText;
+            C2D_TextParse(&contText, textBuf, cbuf);
+            C2D_TextOptimize(&contText);
+            C2D_DrawText(&contText, C2D_WithColor,
+                         opt_x + 130.0f, opt_y0 + MENU_CONTINUE * opt_gap + 2.0f,
+                         0, 0.42f, 0.42f, C2D_Color32(110, 85, 60, 230));
+        }
+    }
+
     /* ===== 6. BOTTOM HINT TEXT ===== */
     C2D_Text hint;
-    C2D_TextParse(&hint, textBuf, "A: Select   D-Pad: Move   Y: Controls");
+    C2D_TextParse(&hint, textBuf, "A: Select   D-Pad: Move   Y: Controls   START: Quick Run");
     C2D_TextOptimize(&hint);
     float hint_alpha = 0.6f + sinf(g->menu_timer * 0.08f) * 0.2f;
     C2D_DrawText(&hint, C2D_WithColor, 60, TOP_SCREEN_HEIGHT - 16, 0,
@@ -5452,58 +6724,12 @@ void render_menu(Game *g, C2D_TextBuf textBuf) {
 
     /* Version text bottom-right */
     C2D_Text version;
-    C2D_TextParse(&version, textBuf, "v2.0");
+    C2D_TextParse(&version, textBuf, "v2.5");
     C2D_TextOptimize(&version);
     C2D_DrawText(&version, C2D_WithColor,
                  TOP_SCREEN_WIDTH - 35, TOP_SCREEN_HEIGHT - 16, 0,
                  0.4f, 0.4f, C2D_Color32(120, 100, 80, 220));
 
-    /* ==== AUDIO DEBUG OVERLAY ====
-     * Shown on the title screen so audio failures are diagnosable on
-     * real hardware without a debug console.  Press X to play a test
-     * tone, B to play a test SFX. */
-    {
-        AudioDebug ad;
-        audio_debug_get(&ad);
-
-        char dbg[160];
-        snprintf(dbg, sizeof(dbg),
-                 "AUDIO: %s  init=%d sfx_loaded=%d/%d",
-                 audio_status_string(),
-                 ad.init_result, ad.sfx_load_count, SFX_COUNT);
-
-        C2D_Text line1;
-        C2D_TextParse(&line1, textBuf, dbg);
-        C2D_TextOptimize(&line1);
-        C2D_DrawText(&line1, C2D_WithColor, 5, 2, 0,
-                     0.36f, 0.36f, C2D_Color32(0, 100, 0, 255));
-
-        char dbg2[160];
-        snprintf(dbg2, sizeof(dbg2),
-                 "csndChan=0x%08lX last_play=%d chn=%d sfx=%d tone=%d",
-                 (unsigned long)ad.csnd_channels,
-                 ad.last_play_result, ad.last_play_chn, ad.last_play_sfx,
-                 ad.test_tone_result);
-
-        C2D_Text line2;
-        C2D_TextParse(&line2, textBuf, dbg2);
-        C2D_TextOptimize(&line2);
-        C2D_DrawText(&line2, C2D_WithColor, 5, 14, 0,
-                     0.34f, 0.34f, C2D_Color32(0, 80, 0, 255));
-
-        char dbg3[160];
-        snprintf(dbg3, sizeof(dbg3),
-                 "mus_load=%d/%d last_mus_play=%d  [X]=tone [B]=sfx",
-                 ad.music_load_attempts - ad.music_load_failures,
-                 ad.music_load_attempts,
-                 ad.last_music_play_result);
-
-        C2D_Text line3;
-        C2D_TextParse(&line3, textBuf, dbg3);
-        C2D_TextOptimize(&line3);
-        C2D_DrawText(&line3, C2D_WithColor, 5, 26, 0,
-                     0.34f, 0.34f, C2D_Color32(0, 80, 0, 255));
-    }
 }
 
 /* ================================================================
@@ -5514,56 +6740,36 @@ void render_menu(Game *g, C2D_TextBuf textBuf) {
 static void draw_menu_background(Game *g) {
     g->menu_timer++;
 
-    /* Initialize particles on first frame */
-    if (!g->particles_init) {
-        for (int i = 0; i < 20; i++) {
-            g->particle_x[i] = randf(0, TOP_SCREEN_WIDTH);
-            g->particle_y[i] = randf(0, TOP_SCREEN_HEIGHT);
-            g->particle_vx[i] = randf(-0.3f, 0.3f);
-            g->particle_vy[i] = randf(-0.5f, -0.1f);
-        }
-        g->particles_init = 1;
+    u32 bg_col     = C2D_Color32(232, 218, 198, 255);
+    u32 grain_col  = C2D_Color32(206, 190, 168, 110);
+    u32 doodle_col = C2D_Color32(155, 136, 116, 170);
+    u32 edge_col   = C2D_Color32(186, 166, 140, 255);
+    u32 line_col   = C2D_Color32(198, 178, 152, 170);
+
+    C2D_DrawRectSolid(0, 0, 0, TOP_SCREEN_WIDTH, TOP_SCREEN_HEIGHT, bg_col);
+
+    for (int i = 0; i < 42; i++) {
+        float gx = (i * 37) % TOP_SCREEN_WIDTH;
+        float gy = (i * 29) % TOP_SCREEN_HEIGHT;
+        C2D_DrawRectSolid(gx, gy, 0, 1, 1, grain_col);
     }
 
-    /* Animated gradient background */
-    float grad_shift = sinf(g->menu_timer * 0.02f) * 15.0f;
-    for (int y = 0; y < TOP_SCREEN_HEIGHT; y += 4) {
-        float ratio = y / (float)TOP_SCREEN_HEIGHT;
-        int rv = (int)(20 + ratio * 15 + grad_shift);
-        int gv = (int)(10 + ratio * 8 + grad_shift * 0.5f);
-        int bv = (int)(5 + ratio * 5);
-        C2D_DrawRectSolid(0, y, 0, TOP_SCREEN_WIDTH, 4,
-                          C2D_Color32(rv, gv, bv, 255));
+    for (int y = 24; y < TOP_SCREEN_HEIGHT; y += 22) {
+        C2D_DrawRectSolid(18, y, 0, TOP_SCREEN_WIDTH - 36, 1, line_col);
     }
 
-    /* Floating particles */
-    for (int i = 0; i < 20; i++) {
-        g->particle_x[i] += g->particle_vx[i];
-        g->particle_y[i] += g->particle_vy[i];
-        if (g->particle_y[i] < -10) {
-            g->particle_y[i] = TOP_SCREEN_HEIGHT + 10;
-            g->particle_x[i] = randf(0, TOP_SCREEN_WIDTH);
-        }
-        if (g->particle_x[i] < -10) g->particle_x[i] = TOP_SCREEN_WIDTH + 10;
-        if (g->particle_x[i] > TOP_SCREEN_WIDTH + 10) g->particle_x[i] = -10;
-        float pulse = sinf(g->menu_timer * 0.05f + i * 0.3f);
-        int alpha = (int)(30 + pulse * 20);
-        int size = (i % 3) + 2;
-        C2D_DrawRectSolid(g->particle_x[i], g->particle_y[i], 0, size, size,
-                          C2D_Color32(200, 150, 100, alpha));
-    }
+    draw_doodle_bug(28.0f, 30.0f, doodle_col);
+    draw_doodle_bug(TOP_SCREEN_WIDTH - 28.0f, 208.0f, doodle_col);
+    draw_doodle_stickfig(35.0f, 170.0f, doodle_col);
+    draw_doodle_chest(TOP_SCREEN_WIDTH - 38.0f, 58.0f, doodle_col);
+    draw_doodle_scratch(25.0f, 70.0f, 52.0f, 62.0f, doodle_col);
+    draw_doodle_scratch(TOP_SCREEN_WIDTH - 58.0f, 150.0f,
+                        TOP_SCREEN_WIDTH - 25.0f, 160.0f, doodle_col);
 
-    /* Decorative border */
-    u32 borderGlow = C2D_Color32(150, 100, 50, 180);
-    u32 borderMain = C2D_Color32(200, 140, 80, 255);
-    C2D_DrawRectSolid(5, 5, 0, TOP_SCREEN_WIDTH - 10, 2, borderGlow);
-    C2D_DrawRectSolid(5, TOP_SCREEN_HEIGHT - 7, 0, TOP_SCREEN_WIDTH - 10, 2, borderGlow);
-    C2D_DrawRectSolid(5, 5, 0, 2, TOP_SCREEN_HEIGHT - 10, borderGlow);
-    C2D_DrawRectSolid(TOP_SCREEN_WIDTH - 7, 5, 0, 2, TOP_SCREEN_HEIGHT - 10, borderGlow);
-    C2D_DrawRectSolid(8, 8, 0, TOP_SCREEN_WIDTH - 16, 3, borderMain);
-    C2D_DrawRectSolid(8, TOP_SCREEN_HEIGHT - 11, 0, TOP_SCREEN_WIDTH - 16, 3, borderMain);
-    C2D_DrawRectSolid(8, 8, 0, 3, TOP_SCREEN_HEIGHT - 16, borderMain);
-    C2D_DrawRectSolid(TOP_SCREEN_WIDTH - 11, 8, 0, 3, TOP_SCREEN_HEIGHT - 16, borderMain);
+    C2D_DrawRectSolid(8, 8, 0, TOP_SCREEN_WIDTH - 16, 2, edge_col);
+    C2D_DrawRectSolid(8, TOP_SCREEN_HEIGHT - 10, 0, TOP_SCREEN_WIDTH - 16, 2, edge_col);
+    C2D_DrawRectSolid(8, 8, 0, 2, TOP_SCREEN_HEIGHT - 16, edge_col);
+    C2D_DrawRectSolid(TOP_SCREEN_WIDTH - 10, 8, 0, 2, TOP_SCREEN_HEIGHT - 16, edge_col);
 }
 
 /* Helper: draw a selection option row (used by mode and difficulty screens).
@@ -5573,61 +6779,51 @@ static void draw_menu_background(Game *g) {
    the eye is drawn straight to the active one. */
 static void draw_menu_option(C2D_TextBuf textBuf, const char *label, const char *desc,
                              float yPos, int selected, int timer) {
+    float sel_pulse = sinf(timer * 0.12f);
+    float box_width = 290 + (selected ? sel_pulse * 5.0f : 0.0f);
+    float box_x = (TOP_SCREEN_WIDTH - box_width) / 2.0f;
+
+    C2D_DrawRectSolid(box_x - 2, yPos - 6, 0, box_width + 4, 44,
+                      selected ? C2D_Color32(185, 155, 120, 220)
+                               : C2D_Color32(176, 158, 136, 150));
+    C2D_DrawRectSolid(box_x, yPos - 4, 0, box_width, 40,
+                      selected ? C2D_Color32(250, 236, 210, 255)
+                               : C2D_Color32(236, 222, 200, 215));
+
     if (selected) {
-        float sel_pulse = sinf(timer * 0.15f);
-        float box_width = 300 + sel_pulse * 10;
-        float box_x = (TOP_SCREEN_WIDTH - box_width) / 2;
 
-        /* Outer glow (large soft halo) */
-        C2D_DrawRectSolid(box_x - 10, yPos - 12, 0, box_width + 20, 58,
-                          C2D_Color32(255, 180, 80, 60));
-        C2D_DrawRectSolid(box_x - 6,  yPos - 9,  0, box_width + 12, 52,
-                          C2D_Color32(255, 200, 100, 120));
-
-        /* Bright accent border (thick, pulsing) */
-        u8 borderA = (u8)(220 + sinf(timer * 0.18f) * 35);
-        C2D_DrawRectSolid(box_x - 3, yPos - 6, 0, box_width + 6, 46,
-                          C2D_Color32(255, 215, 130, borderA));
-
-        /* Inner fill */
-        C2D_DrawRectSolid(box_x, yPos - 3, 0, box_width, 40,
-                          C2D_Color32(110, 60, 30, 255));
-
-        /* Left vertical accent rail (bright) */
-        C2D_DrawRectSolid(box_x, yPos - 3, 0, 5, 40,
-                          C2D_Color32(255, 230, 150, 255));
-
-        /* Animated chevron arrows (larger and brighter than before) */
+        C2D_DrawRectSolid(box_x + 6, yPos - 1, 0, 10, 30,
+                          C2D_Color32(210, 70, 60, 220));
         C2D_Text al, ar;
-        float ao = sinf(timer * 0.22f) * 4.5f;
-        C2D_TextParse(&al, textBuf, ">>");
+        float ao = sinf(timer * 0.22f) * 3.0f;
+        C2D_TextParse(&al, textBuf, ">");
         C2D_TextOptimize(&al);
-        C2D_DrawText(&al, C2D_WithColor, box_x + 14 + ao, yPos - 1, 0,
-                     0.85f, 0.85f, C2D_Color32(255, 240, 170, 255));
-        C2D_TextParse(&ar, textBuf, "<<");
+        C2D_DrawText(&al, C2D_WithColor, box_x + 18 + ao, yPos + 2, 0,
+                     0.8f, 0.8f, C2D_Color32(90, 50, 35, 255));
+        C2D_TextParse(&ar, textBuf, "<");
         C2D_TextOptimize(&ar);
-        C2D_DrawText(&ar, C2D_WithColor, box_x + box_width - 38 - ao, yPos - 1, 0,
-                     0.85f, 0.85f, C2D_Color32(255, 240, 170, 255));
+        C2D_DrawText(&ar, C2D_WithColor, box_x + box_width - 24 - ao, yPos + 2, 0,
+                     0.8f, 0.8f, C2D_Color32(90, 50, 35, 255));
     }
 
     /* Label text — bigger, brighter when selected; dimmer when not */
     C2D_Text lbl;
     C2D_TextParse(&lbl, textBuf, label);
     C2D_TextOptimize(&lbl);
-    float ts = selected ? 0.75f : 0.50f;
-    u32 tc = selected ? C2D_Color32(255, 250, 220, 255)
-                      : C2D_Color32(130, 105, 80,  200);
-    C2D_DrawText(&lbl, C2D_WithColor, TOP_SCREEN_WIDTH / 2.0f - 55, yPos, 0, ts, ts, tc);
+    float ts = selected ? 0.70f : 0.52f;
+    u32 tc = selected ? C2D_Color32(78, 44, 30, 255)
+                      : C2D_Color32(120, 92, 72, 230);
+    C2D_DrawText(&lbl, C2D_WithColor, TOP_SCREEN_WIDTH / 2.0f - 58, yPos, 0, ts, ts, tc);
 
     /* Description text (smaller, below label) */
     if (desc) {
         C2D_Text dt;
         C2D_TextParse(&dt, textBuf, desc);
         C2D_TextOptimize(&dt);
-        u32 dc = selected ? C2D_Color32(220, 200, 170, 240)
-                          : C2D_Color32(110, 90,  75,  150);
-        C2D_DrawText(&dt, C2D_WithColor, TOP_SCREEN_WIDTH / 2.0f - 80, yPos + 21, 0,
-                     0.38f, 0.38f, dc);
+        u32 dc = selected ? C2D_Color32(118, 84, 62, 255)
+                          : C2D_Color32(132, 108, 88, 180);
+        C2D_DrawText(&dt, C2D_WithColor, TOP_SCREEN_WIDTH / 2.0f - 92, yPos + 20, 0,
+                     0.36f, 0.36f, dc);
     }
 }
 
@@ -5640,12 +6836,12 @@ void render_mode_select(Game *g, C2D_TextBuf textBuf) {
     C2D_TextOptimize(&title);
     float tp = sinf(g->menu_timer * 0.04f) * 0.03f;
     C2D_DrawText(&title, C2D_WithColor, 95, 28, 0, 0.8f + tp, 0.8f + tp,
-                 C2D_Color32(255, 230, 180, 255));
+                 C2D_Color32(80, 48, 34, 255));
 
     /* Decorative line under title */
     float lw = 200 + sinf(g->menu_timer * 0.06f) * 10;
     C2D_DrawRectSolid((TOP_SCREEN_WIDTH - lw) / 2, 55, 0, lw, 2,
-                      C2D_Color32(200, 140, 80, 200));
+                      C2D_Color32(170, 135, 100, 220));
 
     /* Mode options */
     draw_menu_option(textBuf, "Story Mode",
@@ -5661,7 +6857,73 @@ void render_mode_select(Game *g, C2D_TextBuf textBuf) {
     C2D_TextOptimize(&hint);
     float ha = 0.5f + sinf(g->menu_timer * 0.1f) * 0.3f;
     C2D_DrawText(&hint, C2D_WithColor, 115, 218, 0, 0.48f, 0.48f,
-                 C2D_Color32(150, 130, 110, (int)(ha * 255)));
+                 C2D_Color32(110, 84, 62, (int)(ha * 255)));
+}
+
+void render_challenge_select(Game *g, C2D_TextBuf textBuf) {
+    draw_menu_background(g);
+
+    C2D_Text title;
+    C2D_TextParse(&title, textBuf, "CHALLENGES");
+    C2D_TextOptimize(&title);
+    C2D_DrawText(&title, C2D_WithColor, 125, 18, 0, 0.85f, 0.85f,
+                 C2D_Color32(80, 48, 34, 255));
+    C2D_DrawRectSolid(72, 47, 0, 256, 2, C2D_Color32(170, 135, 100, 220));
+
+    for (int i = 0; i < CHALLENGE_COUNT; i++) {
+        const ChallengeDef *def = &challenge_defs[i];
+        int selected = i == g->challenge_sel;
+        int completed = (g_config.challenges_completed & (1 << i)) != 0;
+        float y = 56.0f + i * 31.0f;
+        u32 row_bg = selected ? C2D_Color32(112, 78, 54, 235)
+                              : C2D_Color32(224, 207, 184, 210);
+        u32 name_col = selected ? C2D_Color32(255, 242, 220, 255)
+                                : C2D_Color32(62, 43, 30, 255);
+        u32 sub_col = selected ? C2D_Color32(232, 211, 185, 255)
+                               : C2D_Color32(120, 92, 68, 255);
+
+        if (selected) {
+            float pulse = sinf(g->menu_timer * 0.14f) * 2.0f;
+            C2D_DrawRectSolid(30 - pulse, y - 3, 0, 340 + pulse * 2, 28,
+                              C2D_Color32(157, 116, 80, 90));
+        }
+        C2D_DrawRectSolid(34, y, 0, 332, 24, row_bg);
+        C2D_DrawRectSolid(34, y, 0, 4, 24,
+                          completed ? C2D_Color32(92, 158, 92, 255)
+                                    : C2D_Color32(150, 110, 78, 255));
+
+        char number[8];
+        snprintf(number, sizeof(number), "%d", i + 1);
+        C2D_Text nt;
+        C2D_TextParse(&nt, textBuf, number);
+        C2D_TextOptimize(&nt);
+        C2D_DrawText(&nt, C2D_WithColor, 44, y + 5, 0, 0.36f, 0.36f, name_col);
+
+        C2D_Text name;
+        C2D_TextParse(&name, textBuf, def->name);
+        C2D_TextOptimize(&name);
+        C2D_DrawText(&name, C2D_WithColor, 63, y + 3, 0, 0.42f, 0.42f, name_col);
+
+        C2D_Text subtitle;
+        C2D_TextParse(&subtitle, textBuf, def->subtitle);
+        C2D_TextOptimize(&subtitle);
+        C2D_DrawText(&subtitle, C2D_WithColor, 63, y + 14, 0, 0.25f, 0.25f, sub_col);
+
+        if (completed) {
+            C2D_Text mark;
+            C2D_TextParse(&mark, textBuf, "DONE");
+            C2D_TextOptimize(&mark);
+            C2D_DrawText(&mark, C2D_WithColor, 326, y + 6, 0, 0.30f, 0.30f,
+                         selected ? C2D_Color32(170, 255, 170, 255)
+                                  : C2D_Color32(60, 130, 60, 255));
+        }
+    }
+
+    C2D_Text hint;
+    C2D_TextParse(&hint, textBuf, "A: Start Challenge    B: Back");
+    C2D_TextOptimize(&hint);
+    C2D_DrawText(&hint, C2D_WithColor, 105, 218, 0, 0.44f, 0.44f,
+                 C2D_Color32(110, 84, 62, 255));
 }
 
 /* ================================================================
@@ -5680,12 +6942,12 @@ void render_difficulty_select(Game *g, C2D_TextBuf textBuf) {
     C2D_TextOptimize(&title);
     float tp = sinf(g->menu_timer * 0.04f) * 0.02f;
     C2D_DrawText(&title, C2D_WithColor, 42, 20, 0, 0.65f + tp, 0.65f + tp,
-                 C2D_Color32(255, 230, 180, 255));
+                 C2D_Color32(80, 48, 34, 255));
 
     /* Decorative line */
     float lw = 220 + sinf(g->menu_timer * 0.06f) * 10;
     C2D_DrawRectSolid((TOP_SCREEN_WIDTH - lw) / 2, 45, 0, lw, 2,
-                      C2D_Color32(200, 140, 80, 200));
+                      C2D_Color32(170, 135, 100, 220));
 
     /* Difficulty options with descriptions */
     const char *labels[] = { "Easy", "Normal", "Hard" };
@@ -5722,7 +6984,7 @@ void render_difficulty_select(Game *g, C2D_TextBuf textBuf) {
     C2D_TextOptimize(&hint);
     float ha = 0.5f + sinf(g->menu_timer * 0.1f) * 0.3f;
     C2D_DrawText(&hint, C2D_WithColor, 118, 218, 0, 0.48f, 0.48f,
-                 C2D_Color32(150, 130, 110, (int)(ha * 255)));
+                 C2D_Color32(110, 84, 62, (int)(ha * 255)));
 }
 
 /* ================================================================
@@ -5742,9 +7004,9 @@ const char *character_name(CharacterType c) {
 static const char *character_blurb(CharacterType c) {
     switch (c) {
         case CHAR_ISAAC:     return "Balanced. 3 hearts. The default.";
-        case CHAR_MAGDALENE: return "4 hearts, slower. Yum Heart heals.";
-        case CHAR_CAIN:      return "2 hearts, +damage, +speed, +luck.";
-        case CHAR_JUDAS:     return "1 heart, glass cannon. Book of Belial.";
+        case CHAR_MAGDALENE: return "4 hearts, slightly slower. Yum Heart heals.";
+        case CHAR_CAIN:      return "2 hearts, modest offense, starts richer.";
+        case CHAR_JUDAS:     return "1 heart + soul buffer, high damage, Belial.";
         default:             return "";
     }
 }
@@ -5768,12 +7030,12 @@ void render_character_select(Game *g, C2D_TextBuf textBuf) {
     C2D_TextOptimize(&title);
     float tp = sinf(g->menu_timer * 0.04f) * 0.03f;
     C2D_DrawText(&title, C2D_WithColor, 95, 18, 0, 0.8f + tp, 0.8f + tp,
-                 C2D_Color32(255, 230, 180, 255));
+                 C2D_Color32(80, 48, 34, 255));
 
     /* Decorative line */
     float lw = 240 + sinf(g->menu_timer * 0.06f) * 10;
     C2D_DrawRectSolid((TOP_SCREEN_WIDTH - lw) / 2, 45, 0, lw, 2,
-                      C2D_Color32(200, 140, 80, 200));
+                      C2D_Color32(170, 135, 100, 220));
 
     /* 4 character cards side-by-side */
     const float card_w = 80.0f;
@@ -5888,13 +7150,13 @@ void render_character_select(Game *g, C2D_TextBuf textBuf) {
         C2D_TextParse(&desc, textBuf, character_blurb((CharacterType)g->char_sel));
         C2D_TextOptimize(&desc);
         C2D_DrawText(&desc, C2D_WithColor, 35, 185, 0, 0.45f, 0.45f,
-                     C2D_Color32(220, 200, 160, 255));
+                     C2D_Color32(92, 62, 42, 255));
     } else {
         C2D_Text desc;
         C2D_TextParse(&desc, textBuf, "Complete the game with another character to unlock.");
         C2D_TextOptimize(&desc);
         C2D_DrawText(&desc, C2D_WithColor, 20, 185, 0, 0.45f, 0.45f,
-                     C2D_Color32(160, 130, 90, 255));
+                     C2D_Color32(120, 92, 72, 255));
     }
 
     /* Hint */
@@ -5903,7 +7165,7 @@ void render_character_select(Game *g, C2D_TextBuf textBuf) {
     C2D_TextOptimize(&hint);
     float ha = 0.5f + sinf(g->menu_timer * 0.1f) * 0.3f;
     C2D_DrawText(&hint, C2D_WithColor, 65, 218, 0, 0.45f, 0.45f,
-                 C2D_Color32(150, 130, 110, (int)(ha * 255)));
+                 C2D_Color32(110, 84, 62, (int)(ha * 255)));
 }
 
 /* ================================================================
@@ -5956,9 +7218,9 @@ void render_stats_overlay(Game *g, C2D_TextBuf textBuf) {
     } while (0)
 
     STAT_LINE("Damage:",    "%.2f", p->stats.damage);
-    STAT_LINE("Tears:",     "%.2f", p->stats.fire_rate);
-    STAT_LINE("Speed:",     "%.2f", p->stats.speed);
-    STAT_LINE("Range:",     "%.0f", p->stats.range);
+    STAT_LINE("Tears:",     "%.2f", display_tears_stat(p));
+    STAT_LINE("Speed:",     "%.2f", display_speed_stat(p));
+    STAT_LINE("Range:",     "%.2f", display_range_stat(p));
     STAT_LINE("Max HP:",    "%d",   p->stats.max_hp);
     STAT_LINE("Luck:",      "%.1f", p->stats.luck);
     STAT_LINE("Items:",     "%d",   p->item_count);
@@ -5981,9 +7243,9 @@ void render_stats_overlay(Game *g, C2D_TextBuf textBuf) {
 
     /* Bottom hint */
     C2D_Text hint;
-    C2D_TextParse(&hint, textBuf, "START or B: Resume");
+    C2D_TextParse(&hint, textBuf, "Pause menu on top screen   START/B: Resume");
     C2D_TextOptimize(&hint);
-    C2D_DrawText(&hint, C2D_WithColor, 88, 218, 0, 0.45f, 0.45f,
+    C2D_DrawText(&hint, C2D_WithColor, 38, 218, 0, 0.45f, 0.45f,
                  C2D_Color32(150, 130, 110, 255));
 }
 
@@ -5993,11 +7255,15 @@ void render_stats_overlay(Game *g, C2D_TextBuf textBuf) {
 
 void render_pickup_message(Game *g, C2D_TextBuf textBuf) {
     if (g->pickup_msg_timer <= 0) return;
-    /* Fade in then out */
+    /* Fade in then out, relative to the message's actual duration (the old
+     * math assumed every message lasted exactly 180 frames, so shorter ones
+     * popped in at full opacity with no fade-in). */
     int t = g->pickup_msg_timer;
+    int total = (g->pickup_msg_total > 0) ? g->pickup_msg_total : 180;
+    int elapsed = total - t;
     int alpha = 255;
     if (t < 30) alpha = (t * 255) / 30;
-    if (t > 150) alpha = ((180 - t) * 255) / 30;
+    if (elapsed < 30) alpha = (elapsed * 255) / 30;
     if (alpha < 0) alpha = 0;
     if (alpha > 255) alpha = 255;
 
@@ -6023,6 +7289,11 @@ void render_pickup_message(Game *g, C2D_TextBuf textBuf) {
         textcol = C2D_Color32(220, 235, 255, alpha);
         tag = "CARD";
         tagcol = C2D_Color32(190, 215, 255, alpha);
+    } else if (strncmp(msg_text, "Trinket:", 8) == 0) {
+        accent  = C2D_Color32(200, 160, 90, alpha);   /* bronze trinket */
+        textcol = C2D_Color32(245, 225, 185, alpha);
+        tag = "TRINK";
+        tagcol = C2D_Color32(220, 190, 130, alpha);
     }
 
     /* Background banner near bottom-center of top screen */
@@ -6050,6 +7321,452 @@ void render_pickup_message(Game *g, C2D_TextBuf textBuf) {
     C2D_DrawText(&msg, C2D_WithColor, bx + 52, by + 6, 0, 0.48f, 0.48f, textcol);
 }
 
+static int touch_rect_hit(int px, int py, float x, float y, float w, float h) {
+    return px >= (int)x && px <= (int)(x + w) &&
+           py >= (int)y && py <= (int)(y + h);
+}
+
+/* Pill colors in 0xAABBGGRR, index-aligned with pill_color_names[]
+ * (red, blue, yellow, green, orange, pink, white, black, purple, cyan,
+ *  brown, silver, lime, magenta, teal) so the announced color matches
+ * the rendered color - essential for pill identification. */
+static const u32 g_pill_palette[PILL_EFFECT_COUNT] = {
+    0xFF4040D8, 0xFFE06050, 0xFF50D8E0, 0xFF70C850, 0xFF3090E8,
+    0xFFC080F0, 0xFFF0F0F0, 0xFF302828, 0xFFD05090, 0xFFD8D850,
+    0xFF2B5A8B, 0xFFC8C0BC, 0xFF40E890, 0xFFE040E0, 0xFF909010
+};
+
+static u32 touch_panel_pill_color(const Game *g, PillEffect effect) {
+    if (!g || effect < 0 || effect >= PILL_EFFECT_COUNT) return 0xFFFFFFFF;
+    return g_pill_palette[g->pill_color_map[effect] % PILL_EFFECT_COUNT];
+}
+
+static void draw_touch_charge_pips(float x, float y, float w, int charge, int max_charge) {
+    if (max_charge <= 0) return;
+
+    float pip_w = 9.0f;
+    float pip_h = 6.0f;
+    float gap = 3.0f;
+    float total_w = pip_w * max_charge + gap * (max_charge - 1);
+
+    if (total_w > w) {
+        pip_w = (w - gap * (max_charge - 1)) / (float)max_charge;
+        if (pip_w < 4.0f) pip_w = 4.0f;
+        total_w = pip_w * max_charge + gap * (max_charge - 1);
+    }
+
+    float px = x + (w - total_w) * 0.5f;
+    for (int i = 0; i < max_charge; i++) {
+        u32 fill = (i < charge)
+            ? C2D_Color32(245, 201, 111, 255)
+            : C2D_Color32(88, 76, 66, 255);
+        C2D_DrawRectSolid(px - 1, y - 1, 0, pip_w + 2, pip_h + 2,
+                          C2D_Color32(36, 28, 22, 255));
+        C2D_DrawRectSolid(px, y, 0, pip_w, pip_h, fill);
+        px += pip_w + gap;
+    }
+}
+
+static void draw_touch_pill_icon(const Game *g, PillEffect effect, float cx, float cy, int enabled) {
+    u32 outline = C2D_Color32(42, 30, 25, 255);
+    u32 left = enabled ? touch_panel_pill_color(g, effect)
+                       : C2D_Color32(160, 150, 146, 255);
+    u32 right = enabled ? C2D_Color32(247, 241, 233, 255)
+                        : C2D_Color32(190, 182, 176, 255);
+    float w = 26.0f;
+    float h = 12.0f;
+    float r = h * 0.5f;
+    float left_cx = cx - (w - h) * 0.5f;
+    float right_cx = cx + (w - h) * 0.5f;
+
+    C2D_DrawCircleSolid(left_cx, cy, 0, r + 1, outline);
+    C2D_DrawCircleSolid(right_cx, cy, 0, r + 1, outline);
+    C2D_DrawRectSolid(cx - (w - h) * 0.5f, cy - r - 1, 0, w - h, h + 2, outline);
+
+    C2D_DrawCircleSolid(left_cx, cy, 0, r, right);
+    C2D_DrawCircleSolid(right_cx, cy, 0, r, right);
+    C2D_DrawRectSolid(cx - (w - h) * 0.5f, cy - r, 0, w - h, h, right);
+
+    C2D_DrawCircleSolid(left_cx, cy, 0, r, left);
+    C2D_DrawRectSolid(cx - (w - h) * 0.5f, cy - r, 0, (w - h) * 0.5f, h, left);
+    C2D_DrawRectSolid(cx - 1, cy - r + 1, 0, 2, h - 2, C2D_Color32(60, 45, 35, 190));
+    C2D_DrawRectSolid(cx - 8, cy - 3, 0, 7, 2, C2D_Color32(255, 255, 255, 60));
+}
+
+static void draw_touch_card_icon(float cx, float cy, int enabled) {
+    if (g_sprites_loaded) {
+        spr_draw(sheet_ui_items, ui_items_atlas_item_tarot_card_idx, cx, cy, 1.0f, 1.0f);
+        if (!enabled) {
+            C2D_DrawRectSolid(cx - 10, cy - 13, 0, 20, 26, C2D_Color32(20, 18, 18, 90));
+        }
+        return;
+    }
+
+    u32 edge = C2D_Color32(80, 54, 32, 255);
+    u32 face = enabled ? C2D_Color32(241, 234, 224, 255)
+                       : C2D_Color32(196, 190, 182, 255);
+    C2D_DrawRectSolid(cx - 9, cy - 13, 0, 18, 26, edge);
+    C2D_DrawRectSolid(cx - 7, cy - 11, 0, 14, 22, face);
+    C2D_DrawCircleSolid(cx, cy - 2, 0, 4, C2D_Color32(120, 100, 78, 255));
+    C2D_DrawRectSolid(cx - 1, cy + 4, 0, 2, 4, C2D_Color32(120, 100, 78, 255));
+}
+
+static void get_touch_action_button_rect(int idx, float *x, float *y, float *w, float *h) {
+    static const float bx[] = { 12.0f, 114.0f, 216.0f };
+    static const float by[] = { 46.0f, 46.0f, 46.0f };
+    *x = bx[idx];
+    *y = by[idx];
+    *w = 92.0f;
+    *h = 76.0f;
+}
+
+static void handle_touch_action_panel(Game *g) {
+    touchPosition touch;
+    hidTouchRead(&touch);
+
+    for (int idx = 0; idx < 3; idx++) {
+        float x, y, w, h;
+        get_touch_action_button_rect(idx, &x, &y, &w, &h);
+        if (!touch_rect_hit(touch.px, touch.py, x, y, w, h)) continue;
+
+        switch (idx) {
+            case 0:
+                try_use_active_item(g);
+                break;
+            case 1:
+                if (g->player.has_pill) {
+                    PillEffect used = g->player.held_pill;
+                    apply_pill_effect(g, used);
+                    g->player.has_pill = 0;
+                    /* Reveal what the pill actually was - this is how
+                     * unidentified pills get identified for the player */
+                    snprintf(g->pickup_msg_text, sizeof(g->pickup_msg_text),
+                             "Pill: %s", pill_name(used, 1));
+                    g->pickup_msg_timer = 150;
+                    g->pickup_msg_total = 150;
+                    audio_play(SFX_PICKUP);
+                }
+                break;
+            case 2:
+                if (g->player.has_card) {
+                    TarotCard used_card = g->player.held_card;
+                    apply_tarot_card(g, used_card);
+                    g->player.has_card = 0;
+                    /* "Card:" prefix selects the blue CARD banner styling */
+                    snprintf(g->pickup_msg_text, sizeof(g->pickup_msg_text),
+                             "Card: %s", tarot_name(used_card));
+                    g->pickup_msg_timer = 120;
+                    g->pickup_msg_total = 120;
+                    audio_play(SFX_PICKUP);
+                }
+                break;
+        }
+        return;
+    }
+}
+
+/* Compact 5x5 floor map drawn inside the bottom-screen action panel.
+ * Honors visited/revealed state, so Spelunker Hat / The World / The Sun /
+ * Amnesia all visibly affect it. */
+static void draw_compact_minimap(Game *g, float mapOffX, float mapOffY,
+                                 float cellW, float cellH) {
+    Dungeon *d = &g->dungeon;
+    for (int ry = 0; ry < DUNGEON_H; ry++) {
+        for (int rx = 0; rx < DUNGEON_W; rx++) {
+            Room *rm = &d->rooms[ry][rx];
+            if (rm->type == ROOM_NONE) continue;
+            float x = mapOffX + rx * cellW;
+            float y = mapOffY + ry * cellH;
+            int isCurrent = (rx == d->cur_x && ry == d->cur_y);
+
+            if (!rm->visited) {
+                /* Unvisited: dim hint if adjacent to a visited room's door */
+                int adjVis = 0;
+                if (ry > 0 && d->rooms[ry-1][rx].visited && d->rooms[ry-1][rx].doors[1]) adjVis = 1;
+                if (ry < DUNGEON_H-1 && d->rooms[ry+1][rx].visited && d->rooms[ry+1][rx].doors[0]) adjVis = 1;
+                if (rx > 0 && d->rooms[ry][rx-1].visited && d->rooms[ry][rx-1].doors[3]) adjVis = 1;
+                if (rx < DUNGEON_W-1 && d->rooms[ry][rx+1].visited && d->rooms[ry][rx+1].doors[2]) adjVis = 1;
+                /* Secret rooms stay hidden until bombed open */
+                if (rm->type == ROOM_SECRET && !rm->secret_revealed) adjVis = 0;
+                if (adjVis) {
+                    C2D_DrawRectSolid(x + 1, y + 1, 0, cellW - 2, cellH - 2,
+                                      C2D_Color32(96, 84, 70, 200));
+                }
+                continue;
+            }
+
+            u32 roomCol;
+            if (isCurrent) {
+                float pulse = sinf((float)g->frame * 0.12f) * 30.0f;
+                int v = 225 + (int)pulse;
+                roomCol = C2D_Color32(v, v, v, 255);
+            } else {
+                switch (rm->type) {
+                    case ROOM_START:    roomCol = C2D_Color32(100, 200, 100, 255); break;
+                    case ROOM_BOSS:     roomCol = C2D_Color32(255, 60, 60, 255);   break;
+                    case ROOM_TREASURE: roomCol = C2D_Color32(255, 215, 0, 255);   break;
+                    case ROOM_SHOP:     roomCol = C2D_Color32(100, 180, 255, 255); break;
+                    case ROOM_SECRET:   roomCol = C2D_Color32(160, 160, 160, 255); break;
+                    case ROOM_CURSE:    roomCol = C2D_Color32(180, 60, 180, 255);  break;
+                    default:
+                        roomCol = rm->cleared ? C2D_Color32(110, 100, 88, 255)
+                                              : C2D_Color32(146, 132, 114, 255);
+                        break;
+                }
+            }
+            C2D_DrawRectSolid(x + 1, y + 1, 0, cellW - 2, cellH - 2, roomCol);
+
+            /* Cleared-room dot */
+            if (rm->cleared && rm->type == ROOM_NORMAL && !isCurrent) {
+                C2D_DrawRectSolid(x + cellW * 0.5f - 1, y + cellH * 0.5f - 1, 0,
+                                  2, 2, C2D_Color32(70, 200, 70, 220));
+            }
+        }
+    }
+}
+
+static void render_touch_action_panel(Game *g, C2D_TextBuf textBuf) {
+    u32 bg_col = C2D_Color32(228, 213, 192, 255);
+    u32 grain_col = C2D_Color32(205, 188, 165, 110);
+    u32 edge_col = C2D_Color32(160, 140, 120, 180);
+    u32 text_col = C2D_Color32(60, 42, 28, 255);
+    u32 sub_col = C2D_Color32(115, 90, 68, 255);
+
+    C2D_DrawRectSolid(0, 0, 0, BOT_SCREEN_WIDTH, BOT_SCREEN_HEIGHT, bg_col);
+    for (int i = 0; i < 28; i++) {
+        float gx = (i * 47) % BOT_SCREEN_WIDTH;
+        float gy = (i * 31) % BOT_SCREEN_HEIGHT;
+        C2D_DrawRectSolid(gx, gy, 0, 1, 1, grain_col);
+    }
+
+    C2D_DrawRectSolid(8, 8, 0, BOT_SCREEN_WIDTH - 16, 2, edge_col);
+    C2D_DrawRectSolid(8, BOT_SCREEN_HEIGHT - 10, 0, BOT_SCREEN_WIDTH - 16, 2, edge_col);
+    C2D_DrawRectSolid(8, 8, 0, 2, BOT_SCREEN_HEIGHT - 16, edge_col);
+    C2D_DrawRectSolid(BOT_SCREEN_WIDTH - 10, 8, 0, 2, BOT_SCREEN_HEIGHT - 16, edge_col);
+
+    C2D_Text title, hint;
+    const FloorInfo *fi = get_floor_info(g->current_floor);
+    char title_buf[64];
+    const ChallengeDef *challenge = get_challenge_def(g->active_challenge);
+    if (challenge) {
+        snprintf(title_buf, sizeof(title_buf), "CH %d  -  %s",
+                 g->active_challenge + 1, challenge->name);
+    } else {
+        snprintf(title_buf, sizeof(title_buf), "ITEMS & STATS  -  %s", fi->name);
+    }
+    C2D_TextParse(&title, textBuf, title_buf);
+    C2D_TextOptimize(&title);
+    C2D_DrawText(&title, C2D_WithColor, 42, 12, 0, 0.52f, 0.52f, text_col);
+
+    C2D_TextParse(&hint, textBuf, "L Active   R Bomb   Tap slots");
+    C2D_TextOptimize(&hint);
+    C2D_DrawText(&hint, C2D_WithColor, 80, 220, 0, 0.38f, 0.38f, sub_col);
+
+    for (int idx = 0; idx < 3; idx++) {
+        float x, y, w, h;
+        get_touch_action_button_rect(idx, &x, &y, &w, &h);
+
+        u32 slot_bg = C2D_Color32(214, 196, 171, 245);
+        u32 slot_edge = C2D_Color32(97, 74, 56, 255);
+        u32 slot_inner = C2D_Color32(78, 63, 51, 255);
+        u32 accent = C2D_Color32(154, 116, 84, 255);
+        u32 name_col = C2D_Color32(240, 227, 208, 255);
+        const char *label = "";
+        const char *badge = "";
+        int enabled = 0;
+        int ready = 0;
+        char detail[64];
+        detail[0] = '\0';
+
+        switch (idx) {
+            case 0: {
+                ItemType active = player_active_item(&g->player);
+                const ItemDef *def = get_item_def(active);
+                label = "ACTIVE";
+                badge = "L";
+                if (active != ITEM_NONE && def) {
+                    enabled = 1;
+                    ready = active_item_is_ready(&g->player);
+                    accent = ready ? C2D_Color32(214, 136, 83, 255)
+                                   : C2D_Color32(150, 124, 97, 255);
+                } else {
+                    snprintf(detail, sizeof(detail), "EMPTY");
+                    slot_inner = C2D_Color32(100, 88, 76, 255);
+                    name_col = C2D_Color32(190, 177, 160, 255);
+                }
+                break;
+            }
+            case 1:
+                label = "PILL";
+                badge = "TAP";
+                if (g->player.has_pill) {
+                    enabled = 1;
+                    snprintf(detail, sizeof(detail), "%s",
+                             pill_name(g->player.held_pill,
+                                       g->pill_known[g->player.held_pill]));
+                    accent = C2D_Color32(184, 102, 158, 255);
+                } else {
+                    snprintf(detail, sizeof(detail), "EMPTY");
+                    slot_inner = C2D_Color32(100, 88, 76, 255);
+                    name_col = C2D_Color32(190, 177, 160, 255);
+                }
+                break;
+            case 2:
+                label = "CARD";
+                badge = "TAP";
+                if (g->player.has_card) {
+                    enabled = 1;
+                    snprintf(detail, sizeof(detail), "%s", tarot_name(g->player.held_card));
+                    accent = C2D_Color32(96, 139, 201, 255);
+                } else {
+                    snprintf(detail, sizeof(detail), "EMPTY");
+                    slot_inner = C2D_Color32(100, 88, 76, 255);
+                    name_col = C2D_Color32(190, 177, 160, 255);
+                }
+                break;
+        }
+
+        C2D_DrawRectSolid(x - 2, y - 2, 0, w + 4, h + 4, slot_edge);
+        C2D_DrawRectSolid(x, y, 0, w, h, slot_bg);
+        C2D_DrawRectSolid(x + 4, y + 4, 0, w - 8, h - 8, slot_inner);
+        C2D_DrawRectSolid(x + 4, y + 4, 0, w - 8, 14, accent);
+        C2D_DrawRectSolid(x + 4, y + h - 15, 0, w - 8, 1, C2D_Color32(150, 132, 111, 180));
+        if (enabled) {
+            C2D_DrawRectSolid(x + 5, y + 5, 0, w - 10, 2, C2D_Color32(255, 244, 224, 55));
+        }
+
+        C2D_Text lt, bt, dt;
+        C2D_TextParse(&lt, textBuf, label);
+        C2D_TextOptimize(&lt);
+        C2D_DrawText(&lt, C2D_WithColor, x + 8, y + 7, 0, 0.27f, 0.27f,
+                     C2D_Color32(248, 238, 222, 255));
+
+        C2D_TextParse(&bt, textBuf, badge);
+        C2D_TextOptimize(&bt);
+        C2D_DrawText(&bt, C2D_WithColor, x + w - 24, y + 7, 0, 0.24f, 0.24f,
+                     C2D_Color32(248, 238, 222, 255));
+
+        {
+            float cx = x + w * 0.5f;
+            float cy = y + 38.0f;
+            if (idx == 0) {
+                ItemType active = player_active_item(&g->player);
+                if (active != ITEM_NONE) {
+                    C2D_DrawCircleSolid(cx, cy - 2, 0, ready ? 15.0f : 11.0f,
+                                        ready ? C2D_Color32(255, 222, 126, 70)
+                                              : C2D_Color32(255, 255, 255, 28));
+                    if (g_sprites_loaded) {
+                        spr_draw(sheet_ui_items, ui_items_atlas_ui_item_pickup_idx,
+                                 cx, cy + 8, 0.72f, 0.72f);
+                        spr_draw(sheet_ui_items, item_sprite_idx(active),
+                                 cx, cy - 1, 0.82f, 0.82f);
+                    } else if (active == ITEM_YUM_HEART) {
+                        draw_heart(cx, cy - 2, 14.0f,
+                                   ready ? COL_HEART_FULL : C2D_Color32(180, 90, 90, 255));
+                    } else {
+                        C2D_DrawRectSolid(cx - 8, cy - 8, 0, 16, 16,
+                                          ready ? C2D_Color32(215, 164, 92, 255)
+                                                : C2D_Color32(155, 126, 96, 255));
+                    }
+                    draw_touch_charge_pips(x + 8, y + h - 10, w - 16,
+                                           g->player.active_charge, g->player.active_max_charge);
+                } else {
+                    C2D_DrawCircleSolid(cx, cy, 0, 12, C2D_Color32(62, 51, 43, 255));
+                    C2D_DrawCircleSolid(cx, cy, 0, 9, C2D_Color32(88, 75, 64, 255));
+                }
+            } else if (idx == 1) {
+                if (g->player.has_pill) {
+                    draw_touch_pill_icon(g, g->player.held_pill, cx, cy, 1);
+                } else {
+                    C2D_DrawCircleSolid(cx, cy, 0, 12, C2D_Color32(62, 51, 43, 255));
+                    C2D_DrawCircleSolid(cx, cy, 0, 9, C2D_Color32(88, 75, 64, 255));
+                }
+            } else {
+                if (g->player.has_card) {
+                    draw_touch_card_icon(cx, cy, 1);
+                } else {
+                    C2D_DrawCircleSolid(cx, cy, 0, 12, C2D_Color32(62, 51, 43, 255));
+                    C2D_DrawCircleSolid(cx, cy, 0, 9, C2D_Color32(88, 75, 64, 255));
+                }
+            }
+        }
+
+        if (detail[0] != '\0') {
+            C2D_TextParse(&dt, textBuf, detail);
+            C2D_TextOptimize(&dt);
+            C2D_DrawText(&dt, C2D_WithColor | C2D_AlignCenter,
+                         x + w * 0.5f, y + 57, 0, 0.22f, 0.22f, name_col);
+        }
+    }
+
+    {
+        Player *p = &g->player;
+        float sx = 16.0f;
+        float sy = 136.0f;
+        float sw = BOT_SCREEN_WIDTH - 32.0f - 112.0f;  /* leave room for map */
+        int   has_trinket = (p->trinket != TRINKET_NONE);
+        float sh = has_trinket ? 80.0f : 70.0f;
+        char line1[96];
+        char line2[96];
+        char line3[96];
+        char line4[64];
+        C2D_Text st1, st2, st3, st4, stTitle;
+
+        C2D_DrawRectSolid(sx - 2, sy - 2, 0, sw + 4, sh + 4, C2D_Color32(170, 145, 118, 220));
+        C2D_DrawRectSolid(sx, sy, 0, sw, sh, C2D_Color32(241, 229, 208, 240));
+
+        C2D_TextParse(&stTitle, textBuf, "STATS");
+        C2D_TextOptimize(&stTitle);
+        C2D_DrawText(&stTitle, C2D_WithColor, sx + 8, sy + 5, 0, 0.38f, 0.38f, text_col);
+
+        snprintf(line1, sizeof(line1), "DMG %.2f  SPD %.2f",
+                 p->stats.damage, display_speed_stat(p));
+        snprintf(line2, sizeof(line2), "TEARS %.2f  RNG %.2f",
+                 display_tears_stat(p), display_range_stat(p));
+        snprintf(line3, sizeof(line3), "LUCK %.1f  B/K/C %d/%d/%d",
+                 p->stats.luck, p->bombs, p->keys, p->coins);
+
+        C2D_TextParse(&st1, textBuf, line1);
+        C2D_TextOptimize(&st1);
+        C2D_DrawText(&st1, C2D_WithColor, sx + 8, sy + 21, 0, 0.31f, 0.31f, text_col);
+
+        C2D_TextParse(&st2, textBuf, line2);
+        C2D_TextOptimize(&st2);
+        C2D_DrawText(&st2, C2D_WithColor, sx + 8, sy + 37, 0, 0.31f, 0.31f, text_col);
+
+        C2D_TextParse(&st3, textBuf, line3);
+        C2D_TextOptimize(&st3);
+        C2D_DrawText(&st3, C2D_WithColor, sx + 8, sy + 53, 0, 0.31f, 0.31f, sub_col);
+
+        if (has_trinket) {
+            snprintf(line4, sizeof(line4), "TRINKET: %s", trinket_name(p->trinket));
+            C2D_TextParse(&st4, textBuf, line4);
+            C2D_TextOptimize(&st4);
+            C2D_DrawText(&st4, C2D_WithColor, sx + 8, sy + 67, 0, 0.31f, 0.31f,
+                         C2D_Color32(150, 96, 60, 255));
+        }
+    }
+
+    /* Floor minimap (right of stats). Curse of the Lost hides it. */
+    {
+        float mx = BOT_SCREEN_WIDTH - 16.0f - 98.0f;
+        float my = 136.0f;
+        C2D_DrawRectSolid(mx - 2, my - 2, 0, 98 + 4, 70 + 4,
+                          C2D_Color32(170, 145, 118, 220));
+        C2D_DrawRectSolid(mx, my, 0, 98, 70, C2D_Color32(52, 46, 40, 255));
+        if (g->active_curse == CURSE_LOST ||
+            challenge_has_flag(g, CHALLENGE_FLAG_HIDE_MAP)) {
+            C2D_Text lostTxt;
+            C2D_TextParse(&lostTxt, textBuf, "MAP LOST");
+            C2D_TextOptimize(&lostTxt);
+            C2D_DrawText(&lostTxt, C2D_WithColor, mx + 18, my + 28, 0,
+                         0.34f, 0.34f, C2D_Color32(190, 90, 90, 230));
+        } else {
+            draw_compact_minimap(g, mx + 4.0f, my + 5.0f, 18.0f, 12.0f);
+        }
+    }
+}
+
 /* ================================================================
  * Render: Controls screen
  * ================================================================ */
@@ -6058,21 +7775,21 @@ void render_pickup_message(Game *g, C2D_TextBuf textBuf) {
  * Render: Settings screen
  * ================================================================ */
 void render_settings(Game *g, C2D_TextBuf textBuf) {
-    /* Background */
-    C2D_DrawRectSolid(0, 0, 0, TOP_SCREEN_WIDTH, TOP_SCREEN_HEIGHT, COL_MENU_BG);
+    draw_menu_background(g);
 
     /* Title */
     C2D_Text title;
     C2D_TextParse(&title, textBuf, "=== SETTINGS ===");
     C2D_TextOptimize(&title);
-    C2D_DrawText(&title, C2D_WithColor, 120, 12, 0, 0.7f, 0.7f, COL_MENU_SEL);
+    C2D_DrawText(&title, C2D_WithColor, 120, 12, 0, 0.7f, 0.7f,
+                 C2D_Color32(80, 48, 34, 255));
 
     /* Audio status indicator */
     C2D_Text status_label, status_val;
     C2D_TextParse(&status_label, textBuf, "Audio Status:");
     C2D_TextOptimize(&status_label);
     C2D_DrawText(&status_label, C2D_WithColor, 30, 42, 0, 0.5f, 0.5f,
-                 C2D_Color32(180, 180, 180, 255));
+                 C2D_Color32(115, 88, 68, 255));
 
     const char *status_str = audio_status_string();
     C2D_TextParse(&status_val, textBuf, status_str);
@@ -6085,13 +7802,14 @@ void render_settings(Game *g, C2D_TextBuf textBuf) {
     C2D_DrawText(&status_val, C2D_WithColor, 175, 42, 0, 0.5f, 0.5f, status_col);
 
     /* Separator line */
-    C2D_DrawRectSolid(30, 62, 0, 340, 1, C2D_Color32(100, 80, 60, 180));
+    C2D_DrawRectSolid(30, 62, 0, 340, 1, C2D_Color32(170, 135, 100, 220));
 
     /* Settings items */
     const char *labels[SETTINGS_COUNT] = {
         "Audio Enabled:",
         "SFX Volume:",
-        "Music Volume:"
+        "Music Volume:",
+        "Erase Save Data"
     };
 
     for (int i = 0; i < SETTINGS_COUNT; i++) {
@@ -6109,8 +7827,13 @@ void render_settings(Game *g, C2D_TextBuf textBuf) {
         C2D_Text lbl;
         C2D_TextParse(&lbl, textBuf, labels[i]);
         C2D_TextOptimize(&lbl);
-        u32 lbl_col = selected ? C2D_Color32(255, 240, 200, 255)
-                               : C2D_Color32(180, 160, 130, 255);
+        u32 lbl_col = selected ? C2D_Color32(85, 50, 35, 255)
+                               : C2D_Color32(120, 92, 72, 255);
+        if (i == 3) {
+            /* Destructive action reads red */
+            lbl_col = selected ? C2D_Color32(190, 40, 40, 255)
+                               : C2D_Color32(160, 90, 80, 255);
+        }
         C2D_DrawText(&lbl, C2D_WithColor, 40, yPos, 0, 0.5f, 0.5f, lbl_col);
 
         /* Value */
@@ -6121,15 +7844,27 @@ void render_settings(Game *g, C2D_TextBuf textBuf) {
         } else if (i == 1) {
             snprintf(val_buf, sizeof(val_buf), "< %d%% >",
                      (int)(g_config.sfx_volume * 100.0f + 0.5f));
-        } else {
+        } else if (i == 2) {
             snprintf(val_buf, sizeof(val_buf), "< %d%% >",
                      (int)(g_config.music_volume * 100.0f + 0.5f));
+        } else {
+            if (g->settings_erase_armed == 1) {
+                snprintf(val_buf, sizeof(val_buf), "A again to confirm!");
+            } else if (g->settings_erase_armed == 2) {
+                snprintf(val_buf, sizeof(val_buf), "Erased.");
+            } else {
+                snprintf(val_buf, sizeof(val_buf), "(unlocks + run)");
+            }
         }
         C2D_Text val_txt;
         C2D_TextParse(&val_txt, textBuf, val_buf);
         C2D_TextOptimize(&val_txt);
-        u32 val_col = selected ? C2D_Color32(255, 220, 150, 255)
-                               : C2D_Color32(200, 180, 140, 255);
+        u32 val_col = selected ? C2D_Color32(120, 70, 50, 255)
+                               : C2D_Color32(145, 116, 92, 255);
+        if (i == 3 && g->settings_erase_armed == 1) {
+            float blink = sinf(g->menu_timer * 0.25f);
+            val_col = C2D_Color32(220, 40, 40, (int)(190 + blink * 60));
+        }
         C2D_DrawText(&val_txt, C2D_WithColor, 250, yPos, 0, 0.5f, 0.5f, val_col);
     }
 
@@ -6146,14 +7881,14 @@ void render_settings(Game *g, C2D_TextBuf textBuf) {
 
     /* Hint at bottom (audio backend implementation detail no longer shown) */
     C2D_Text hint;
-    C2D_TextParse(&hint, textBuf, "D-Pad: Navigate   A/L/R: Change   B: Save & Back");
+    C2D_TextParse(&hint, textBuf, "D-Pad: Navigate   Left/Right or A: Change   B: Save & Back");
     C2D_TextOptimize(&hint);
     C2D_DrawText(&hint, C2D_WithColor, 45, 228, 0, 0.38f, 0.38f,
                  C2D_Color32(120, 100, 80, 200));
 }
 
-void render_controls(C2D_TextBuf textBuf) {
-    C2D_DrawRectSolid(0, 0, 0, TOP_SCREEN_WIDTH, TOP_SCREEN_HEIGHT, COL_MENU_BG);
+void render_controls(Game *g, C2D_TextBuf textBuf) {
+    draw_menu_background(g);
 
     C2D_Text lines[12];
     const char *text[] = {
@@ -6161,14 +7896,14 @@ void render_controls(C2D_TextBuf textBuf) {
         "",
         "D-Pad / Circle Pad : Move",
         "X / B / Y / A : Shoot U / D / L / R",
-        "SELECT : Place Bomb",
-        "L : Use Pill   R : Use Card",
-        "START : Pause / Stats",
+        "R or SELECT : Place Bomb",
+        "L : Active   Touch : Pill / Card",
+        "START : Pause / Stats   Touch: items",
         "",
-        "Clear rooms to open doors!",
-        "Champions glow with auras!",
-        "Use trapdoor after boss to descend!",
-        "Press A/B to go back"
+        "Clear rooms to open doors.",
+        "Boss rooms lock until cleared.",
+        "Use the trapdoor after boss items.",
+        "Press A, B, or START to go back"
     };
     float ypos[] = { 12, 0, 38, 58, 78, 98, 118, 0, 145, 162, 179, 200 };
 
@@ -6177,7 +7912,9 @@ void render_controls(C2D_TextBuf textBuf) {
         C2D_TextParse(&lines[i], textBuf, text[i]);
         C2D_TextOptimize(&lines[i]);
         float scale = (i == 0) ? 0.7f : 0.42f;
-        u32 col = (i == 0) ? COL_MENU_SEL : (i == 11 ? C2D_Color32(120, 120, 120, 255) : COL_TEXT);
+        u32 col = (i == 0) ? C2D_Color32(80, 48, 34, 255)
+                           : (i == 11 ? C2D_Color32(120, 92, 72, 255)
+                                      : C2D_Color32(92, 62, 42, 255));
         float xoff = (i == 0) ? 100 : 40;
         C2D_DrawText(&lines[i], C2D_WithColor, xoff, ypos[i], 0, scale, scale, col);
     }
@@ -6188,17 +7925,18 @@ void render_controls(C2D_TextBuf textBuf) {
  * ================================================================ */
 
 void render_unlocks_screen(Game *g, C2D_TextBuf textBuf) {
-    C2D_DrawRectSolid(0, 0, 0, TOP_SCREEN_WIDTH, TOP_SCREEN_HEIGHT, COL_MENU_BG);
+    draw_menu_background(g);
 
     /* Title */
     C2D_Text title;
     C2D_TextParse(&title, textBuf, "=== UNLOCKS & STATS ===");
     C2D_TextOptimize(&title);
-    C2D_DrawText(&title, C2D_WithColor, 80, 8, 0, 0.62f, 0.62f, COL_MENU_SEL);
+    C2D_DrawText(&title, C2D_WithColor, 80, 8, 0, 0.62f, 0.62f,
+                 C2D_Color32(80, 48, 34, 255));
 
     /* Build all the lines */
-    char buf[16][64];
-    const char *lines_text[16];
+    char buf[32][64];
+    const char *lines_text[32];
     int line_count = 0;
 
     /* Header section: characters */
@@ -6238,6 +7976,21 @@ void render_unlocks_screen(Game *g, C2D_TextBuf textBuf) {
     snprintf(buf[line_count], 64, "Bosses Defeated: %d / 11", boss_count);
     lines_text[line_count] = buf[line_count]; line_count++;
 
+    int challenge_count = 0;
+    for (int i = 0; i < CHALLENGE_COUNT; i++) {
+        if (g_config.challenges_completed & (1 << i)) challenge_count++;
+    }
+    snprintf(buf[line_count], 64, "-- CHALLENGES %d/%d --",
+             challenge_count, CHALLENGE_COUNT);
+    lines_text[line_count] = buf[line_count]; line_count++;
+    for (int i = 0; i < CHALLENGE_COUNT; i++) {
+        int completed = (g_config.challenges_completed & (1 << i)) != 0;
+        snprintf(buf[line_count], 64, "  %c %s",
+                 completed ? 'X' : '-',
+                 challenge_defs[i].name);
+        lines_text[line_count] = buf[line_count]; line_count++;
+    }
+
     /* Boss list */
     snprintf(buf[line_count], 64, "-- BOSSES --");
     lines_text[line_count] = buf[line_count]; line_count++;
@@ -6247,7 +8000,7 @@ void render_unlocks_screen(Game *g, C2D_TextBuf textBuf) {
         "Peep", "Gurdy", "Pin", "The Haunt", "Widow", "Mega Satan"
     };
     /* Pack two columns - we'll show ones we have seen vs ???  */
-    for (int b = 0; b < 11 && line_count < 16; b++) {
+    for (int b = 0; b < 11 && line_count < 32; b++) {
         int defeated = (g_config.bosses_defeated & (1 << b)) != 0;
         snprintf(buf[line_count], 64, "  %c %s",
                 defeated ? 'X' : '-',
@@ -6261,7 +8014,7 @@ void render_unlocks_screen(Game *g, C2D_TextBuf textBuf) {
     if (g->unlocks_scroll > max_scroll) g->unlocks_scroll = max_scroll;
 
     /* Render visible lines */
-    C2D_Text txt[16];
+    C2D_Text txt[32];
     float y = 32.0f;
     int start = g->unlocks_scroll;
     int end = start + 11;
@@ -6269,8 +8022,10 @@ void render_unlocks_screen(Game *g, C2D_TextBuf textBuf) {
     for (int i = start; i < end; i++) {
         C2D_TextParse(&txt[i], textBuf, lines_text[i]);
         C2D_TextOptimize(&txt[i]);
-        u32 col = COL_TEXT;
-        if (lines_text[i][0] == '-' && lines_text[i][1] == '-') col = COL_MENU_SEL;
+        u32 col = C2D_Color32(92, 62, 42, 255);
+        if (lines_text[i][0] == '-' && lines_text[i][1] == '-') {
+            col = C2D_Color32(120, 80, 56, 255);
+        }
         C2D_DrawText(&txt[i], C2D_WithColor, 30, y, 0, 0.42f, 0.42f, col);
         y += 16;
     }
@@ -6321,11 +8076,43 @@ void render_hud(Game *g, C2D_TextBuf textBuf) {
         }
     }
 
+    /* Soul hearts render after red containers, capped to remaining HUD room */
+    {
+        int soulHearts = (g->player.soul_hp + 1) / 2;
+        int maxSoulHearts = 8 - maxHearts;
+        if (soulHearts > maxSoulHearts) soulHearts = maxSoulHearts;
+        for (int i = 0; i < soulHearts; i++) {
+            float hx = 12 + (maxHearts + i) * 15;
+            float hy = 8;
+            int hpForThisHeart = (g->player.soul_hp - i * 2);
+
+            if (g_sprites_loaded) {
+                float hs = 0.75f;
+                if (hpForThisHeart >= 2) {
+                    spr_draw(sheet_ui_items, ui_items_atlas_heart_soul_full_idx, hx, hy, hs, hs);
+                } else {
+                    spr_draw(sheet_ui_items, ui_items_atlas_heart_soul_half_idx, hx, hy, hs, hs);
+                }
+            } else {
+                u32 soulCol = C2D_Color32(120, 180, 255, 255);
+                if (hpForThisHeart >= 2) {
+                    draw_heart(hx, hy, 12, soulCol);
+                } else {
+                    draw_heart(hx, hy, 12, COL_HEART_EMPTY);
+                    draw_heart(hx, hy, 8, soulCol);
+                }
+            }
+        }
+    }
+
     /* Consumable counts (bomb/key/coin) in HUD - right of hearts */
     {
+        int displayedHeartSlots = maxHearts + (g->player.soul_hp + 1) / 2;
+        if (displayedHeartSlots > 8) displayedHeartSlots = 8;
         float cx = 12 + maxHearts * 15 + 8;
         float cy = 8;
         float iconSc = 0.55f;
+        cx = 12 + displayedHeartSlots * 15 + 8;
         if (g_sprites_loaded) {
             spr_draw(sheet_ui_items, ui_items_atlas_item_bomb_idx, cx, cy, iconSc, iconSc);
         } else {
@@ -6410,7 +8197,10 @@ void render_hud(Game *g, C2D_TextBuf textBuf) {
             C2D_Color32(255, 80, 80, 200)     /* red */
         };
         char mode_buf[16];
-        if (g->game_mode == MODE_INFINITE) {
+        if (g->active_challenge >= 0) {
+            snprintf(mode_buf, sizeof(mode_buf), "CH %d",
+                     g->active_challenge + 1);
+        } else if (g->game_mode == MODE_INFINITE) {
             snprintf(mode_buf, sizeof(mode_buf), "%s INF",
                      diff_labels[g->difficulty < DIFF_COUNT ? g->difficulty : 1]);
         } else {
@@ -6437,6 +8227,19 @@ void render_hud(Game *g, C2D_TextBuf textBuf) {
     }
 
     /* Active ability indicators – fit within 16px HUD */
+    if (g->player.active_max_charge > 0) {
+        C2D_Text activeText;
+        char activeBuf[24];
+        snprintf(activeBuf, sizeof(activeBuf), "ACT %d/%d",
+                 g->player.active_charge, g->player.active_max_charge);
+        C2D_TextParse(&activeText, textBuf, activeBuf);
+        C2D_TextOptimize(&activeText);
+        C2D_DrawText(&activeText, C2D_WithColor, 298, 14, 0, 0.3f, 0.3f,
+                     active_item_is_ready(&g->player)
+                        ? C2D_Color32(255, 220, 120, 255)
+                        : C2D_Color32(170, 170, 170, 255));
+    }
+
     float indX = 360;
     float indY = 8;
     if (g->player.stats.flags & ITEM_FLAG_HOMING) {
@@ -6460,7 +8263,8 @@ void render_hud(Game *g, C2D_TextBuf textBuf) {
     /* ============================================
      * Top-screen Minimap (upper-right overlay)
      * ============================================ */
-    {
+    if (!challenge_has_flag(g, CHALLENGE_FLAG_HIDE_MAP) &&
+        g->active_curse != CURSE_LOST) {
         Dungeon *d = &g->dungeon;
 
         /* Minimap dimensions - compact to fit in upper-right corner */
@@ -6702,6 +8506,52 @@ void render_hud(Game *g, C2D_TextBuf textBuf) {
  * Render: Room
  * ================================================================ */
 
+/* Draw poop / spike obstacles procedurally (no atlas art for these).
+ * Returns 1 if the obstacle was drawn, 0 if it's a rock (caller draws it). */
+static int draw_obstacle_special(const Obstacle *o) {
+    if (o->type == OBST_POOP) {
+        /* Stacked brown mound; darkens and shrinks as it takes damage */
+        float dmg = (float)(POOP_HP - o->hp) / (float)POOP_HP;  /* 0..1 */
+        int shade = (int)(dmg * 45.0f);
+        u32 base = C2D_Color32(145 - shade, 95 - shade, 45 - shade / 2, 255);
+        u32 dark = C2D_Color32(105 - shade, 65 - shade, 30 - shade / 2, 255);
+        float shrink = 1.0f - dmg * 0.25f;
+
+        C2D_DrawCircleSolid(o->x, o->y + 4, 0, 7.5f * shrink, dark);
+        C2D_DrawCircleSolid(o->x, o->y + 3, 0, 6.8f * shrink, base);
+        C2D_DrawCircleSolid(o->x, o->y - 1, 0, 5.2f * shrink, base);
+        C2D_DrawCircleSolid(o->x - 0.5f, o->y - 5 * shrink, 0, 3.0f * shrink, base);
+        /* Highlight swirl */
+        C2D_DrawCircleSolid(o->x - 2, o->y - 2, 0, 1.4f,
+                            C2D_Color32(185, 135, 80, 200));
+        /* Cracks once damaged */
+        if (o->hp < POOP_HP) {
+            C2D_DrawRectSolid(o->x - 1, o->y - 4, 0, 1.5f, 7, dark);
+            C2D_DrawRectSolid(o->x + 2, o->y, 0, 1.5f, 5, dark);
+        }
+        return 1;
+    }
+    if (o->type == OBST_SPIKES) {
+        /* Metal floor plate with a row of spikes */
+        u32 plate = C2D_Color32(60, 58, 64, 255);
+        u32 spike = C2D_Color32(176, 176, 188, 255);
+        u32 edge  = C2D_Color32(110, 110, 120, 255);
+        C2D_DrawRectSolid(o->x - 8, o->y + 3, 0, 16, 4, plate);
+        for (int k = 0; k < 3; k++) {
+            float bx = o->x - 7.0f + k * 5.0f;
+            /* Dark outline triangle then bright spike */
+            C2D_DrawTriangle(bx - 0.5f, o->y + 5, edge,
+                             bx + 4.5f, o->y + 5, edge,
+                             bx + 2.0f, o->y - 7, edge, 0);
+            C2D_DrawTriangle(bx, o->y + 4, spike,
+                             bx + 4.0f, o->y + 4, spike,
+                             bx + 2.0f, o->y - 5.5f, spike, 0);
+        }
+        return 1;
+    }
+    return 0;
+}
+
 static void render_room(Game *g) {
     Room *r = current_room(g);
     int fl = g->current_floor;
@@ -6832,10 +8682,11 @@ static void render_room(Game *g) {
                        door_pos[di][0], door_pos[di][1], 1.0f, 1.0f);
         }
 
-        /* Obstacles - use rock sprite */
+        /* Obstacles - rock sprite, or procedural poop/spikes */
         for (int i = 0; i < r->obstacle_count; i++) {
             Obstacle *o = &r->obstacles[i];
             if (!o->active) continue;
+            if (draw_obstacle_special(o)) continue;
             spr_draw(sheet_environment, environment_atlas_env_rock_idx,
                      o->x, o->y, OBSTACLE_SIZE / 32.0f, OBSTACLE_SIZE / 32.0f);
         }
@@ -6897,14 +8748,58 @@ static void render_room(Game *g) {
             }
         }
 
+        /* Devil deal pedestal - dark twin of the item pedestal */
+        if (r->devil_pedestal.active) {
+            float px = r->devil_pedestal.x;
+            float py = r->devil_pedestal.y;
+            float t = (float)g->frame;
+
+            /* Ominous red glow pulse */
+            float pulse = sinf(t * 0.05f) * 0.3f + 0.7f;
+            C2D_DrawCircleSolid(px, py, 0, 26,
+                                C2D_Color32(120, 0, 0, (int)(pulse * 50)));
+            C2D_DrawCircleSolid(px, py, 0, 18,
+                                C2D_Color32(180, 20, 20, (int)(pulse * 70)));
+
+            /* Darkened pedestal base */
+            spr_draw_tinted(sheet_ui_items, ui_items_atlas_ui_item_pickup_idx,
+                            px, py + 5, 1.0f, 1.0f,
+                            C2D_Color32(60, 10, 10, 255), 0.55f);
+
+            /* Bobbing item (or "?" under Curse of the Blind) */
+            float bob = sinf(t * 0.06f) * 3.0f;
+            if (g->active_curse == CURSE_BLIND) {
+                C2D_DrawCircleSolid(px, py - 6 + bob, 0, 8,
+                                    C2D_Color32(200, 60, 60, 230));
+                C2D_DrawCircleSolid(px, py - 6 + bob, 0, 6,
+                                    C2D_Color32(40, 10, 10, 255));
+            } else {
+                int itemIdx = item_sprite_idx(r->devil_pedestal.item);
+                spr_draw(sheet_ui_items, itemIdx, px, py - 6 + bob, 1.0f, 1.0f);
+            }
+
+            /* Price tag: one heart container, drawn as a red heart + "1" */
+            float price_y = py + 16.0f;
+            if (g_sprites_loaded) {
+                spr_draw(sheet_ui_items, ui_items_atlas_heart_red_full_idx,
+                         px - 5, price_y, 0.6f, 0.6f);
+            } else {
+                draw_heart(px - 5, price_y, 9, COL_HEART_FULL);
+            }
+            /* small "-1" marker: minus bar left of the heart */
+            C2D_DrawRectSolid(px - 14, price_y - 1, 0, 5, 2,
+                              C2D_Color32(255, 80, 80, 255));
+        }
+
         /* Heart pickups */
         for (int i = 0; i < MAX_HEART_PICKUPS; i++) {
             HeartPickup *h = &r->hearts[i];
             if (!h->active) continue;
             
             /* Bobbing animation */
-            h->anim_timer++;
-            float bob_offset = sinf((float)h->anim_timer * 0.1f) * 3.0f;
+            /* Phase from g->frame + spawn-seeded offset: no state mutation
+             * in render, and bobbing freezes in lockstep when paused */
+            float bob_offset = sinf((float)(g->frame + h->anim_timer) * 0.1f) * 3.0f;
             
             /* Pick heart sprite based on type */
             int heart_idx;
@@ -6916,36 +8811,47 @@ static void render_room(Game *g) {
                 heart_idx = ui_items_atlas_heart_soul_full_idx;
             }
             
-            spr_draw(sheet_ui_items, heart_idx, h->x, h->y + bob_offset, 1.0f, 1.0f);
+            /* 0.7 scale: full-size heart art (32x30) rendered larger than
+             * Isaac himself; this matches the other floor pickups (~22px) */
+            spr_draw(sheet_ui_items, heart_idx, h->x, h->y + bob_offset, 0.7f, 0.7f);
         }
 
         /* Consumable pickups (bombs, keys, coins, pills, cards) */
         for (int i = 0; i < MAX_CONSUMABLE_PICKUPS; i++) {
             ConsumablePickup *c = &r->consumables[i];
             if (!c->active) continue;
-            c->anim_timer++;
-            float bob_off = sinf((float)c->anim_timer * CONSUMABLE_BOB_SPEED) * CONSUMABLE_BOB_AMP;
+            float bob_off = sinf((float)(g->frame + c->anim_timer) *
+                                 CONSUMABLE_BOB_SPEED) * CONSUMABLE_BOB_AMP;
             /* Pills and cards drawn as colored shapes (no atlas yet) */
             if (c->type == PICKUP_PILL) {
-                /* Pill: two-tone capsule. Color from scrambled map per run */
-                static const u32 pcols[12] = {
-                    0xFFFFFFFF, 0xFFD05050, 0xFF5070E0, 0xFF50C870, 0xFFE0E060,
-                    0xFFE060C0, 0xFFE08020, 0xFF8050E0, 0xFF40D0D0, 0xFFA0A0A0,
-                    0xFFB05858, 0xFFE0E0E0
-                };
-                int colidx = g->pill_color_map[c->sub_type % PILL_EFFECT_COUNT] % 12;
-                u32 col = pcols[colidx];
+                /* Pill: two-tone capsule. Color from scrambled map per run
+                 * (palette shared with the touch panel so colors match). */
+                int colidx = g->pill_color_map[c->sub_type % PILL_EFFECT_COUNT]
+                             % PILL_EFFECT_COUNT;
+                u32 col = g_pill_palette[colidx];
                 float cy = c->y + bob_off;
                 C2D_DrawRectSolid(c->x - 6, cy - 3, 0, 6, 6, col);
                 C2D_DrawRectSolid(c->x, cy - 3, 0, 6, 6, 0xFFFFFFFF);
                 continue;
             }
             if (c->type == PICKUP_CARD) {
-                /* Card: white rectangle outlined gold with letter T */
+                /* Card: white rectangle outlined gold with letter T.
+                 * (Raw u32 colors are ABGR - the old 0xFFFFD060 literal was
+                 * written as ARGB and rendered sky blue, not gold.) */
                 float cy = c->y + bob_off;
-                C2D_DrawRectSolid(c->x - 5, cy - 7, 0, 10, 14, 0xFFFFD060);
+                C2D_DrawRectSolid(c->x - 5, cy - 7, 0, 10, 14,
+                                  C2D_Color32(255, 208, 96, 255));
                 C2D_DrawRectSolid(c->x - 4, cy - 6, 0, 8, 12, 0xFFFFFFFF);
                 C2D_DrawRectSolid(c->x - 1, cy - 4, 0, 2, 6, 0xFF606060);
+                continue;
+            }
+            if (c->type == PICKUP_TRINKET) {
+                /* Bronze token with a bright core - distinct from coins */
+                float cy = c->y + bob_off;
+                C2D_DrawCircleSolid(c->x, cy, 0, 6.0f, C2D_Color32(110, 86, 52, 255));
+                C2D_DrawCircleSolid(c->x, cy, 0, 4.0f, C2D_Color32(196, 164, 110, 255));
+                C2D_DrawCircleSolid(c->x - 1.2f, cy - 1.2f, 0, 1.6f,
+                                    C2D_Color32(248, 232, 196, 255));
                 continue;
             }
             int cidx;
@@ -7069,7 +8975,7 @@ static void render_room(Game *g) {
                 else if (ntype == ROOM_CURSE)
                     doorCol = C2D_Color32(160, 50, 140, 255);  /* purple */
                 else if (ntype == ROOM_SHOP)
-                    doorCol = C2D_Color32(60, 180, 60, 255);   /* green */
+                    doorCol = C2D_Color32(100, 180, 255, 255); /* blue, matches minimap */
                 else
                     doorCol = COL_DOOR;
             }
@@ -7107,10 +9013,11 @@ static void render_room(Game *g) {
             }
         }
 
-        /* Obstacles */
+        /* Obstacles (procedural fallback) */
         for (int i = 0; i < r->obstacle_count; i++) {
             Obstacle *o = &r->obstacles[i];
             if (!o->active) continue;
+            if (draw_obstacle_special(o)) continue;
             C2D_DrawRectSolid(o->x - OBSTACLE_SIZE / 2, o->y - OBSTACLE_SIZE / 2, 0,
                               OBSTACLE_SIZE, OBSTACLE_SIZE, COL_OBSTACLE);
         }
@@ -7140,8 +9047,8 @@ static void render_room(Game *g) {
         for (int i = 0; i < MAX_CONSUMABLE_PICKUPS; i++) {
             ConsumablePickup *c = &r->consumables[i];
             if (!c->active) continue;
-            c->anim_timer++;
-            float bob_off = sinf((float)c->anim_timer * CONSUMABLE_BOB_SPEED) * CONSUMABLE_BOB_AMP;
+            float bob_off = sinf((float)(g->frame + c->anim_timer) *
+                                 CONSUMABLE_BOB_SPEED) * CONSUMABLE_BOB_AMP;
             if (c->type == PICKUP_PILL) {
                 C2D_DrawRectSolid(c->x - 5, c->y + bob_off - 3, 0, 5, 6, C2D_Color32(220, 80, 80, 255));
                 C2D_DrawRectSolid(c->x, c->y + bob_off - 3, 0, 5, 6, 0xFFFFFFFF);
@@ -7149,6 +9056,12 @@ static void render_room(Game *g) {
             }
             if (c->type == PICKUP_CARD) {
                 C2D_DrawRectSolid(c->x - 5, c->y + bob_off - 7, 0, 10, 14, 0xFFFFFFFF);
+                continue;
+            }
+            if (c->type == PICKUP_TRINKET) {
+                float cyt = c->y + bob_off;
+                C2D_DrawCircleSolid(c->x, cyt, 0, 6.0f, C2D_Color32(110, 86, 52, 255));
+                C2D_DrawCircleSolid(c->x, cyt, 0, 4.0f, C2D_Color32(196, 164, 110, 255));
                 continue;
             }
             u32 ccol;
@@ -7215,6 +9128,14 @@ static void render_player(Game *g) {
     /* Shadow under player */
     C2D_DrawEllipseSolid(p->x - PLAYER_SIZE, p->y + PLAYER_SIZE * 0.4f, 0,
                          PLAYER_SIZE * 2, PLAYER_SIZE * 0.6f, COL_SHADOW);
+
+    if ((p->stats.flags & ITEM_FLAG_BRIMSTONE) && p->brimstone_charge > 0) {
+        float charge = p->brimstone_charge / 30.0f;
+        if (charge > 1.0f) charge = 1.0f;
+        C2D_DrawCircleSolid(p->x, p->y - 3.0f, 0,
+                            3.0f + charge * 5.0f,
+                            C2D_Color32(180, 15, 25, (int)(70 + charge * 120)));
+    }
 
     /* Blink during iframes - faster blink for better feedback */
     if (p->iframes > 0 && (p->iframes / 3) % 2 == 0) return;
@@ -7298,6 +9219,20 @@ static void render_tears(Game *g) {
         /* Render y position adjusted by arc (z offset) */
         float render_y = t->y + t->z;
 
+        if (t->laser) {
+            u32 beam_color = t->dmg >= 2.0f
+                ? C2D_Color32(210, 35, 45, 230)
+                : C2D_Color32(80, 210, 255, 230);
+            float velocity = sqrtf(t->dx * t->dx + t->dy * t->dy);
+            if (velocity > 0.1f) {
+                float trail = t->knife ? 10.0f : 18.0f;
+                C2D_DrawLine(t->x - t->dx / velocity * trail,
+                             render_y - t->dy / velocity * trail,
+                             beam_color, t->x, render_y, beam_color,
+                             t->size * 2.2f, 0);
+            }
+        }
+
         if (sheet_bullets) {
             /* Pick tear sprite size based on damage */
             int base_idx;
@@ -7332,7 +9267,22 @@ static void render_tears(Game *g) {
                                TEAR_RADIUS * 0.6f * base_scale,
                                C2D_Color32(0, 0, 0, 40));
 
-            if (t->spectral) {
+            if (t->bomb_tear) {
+                spr_draw_rotated_tinted(sheet_bullets, tear_idx,
+                                        t->x, render_y, scale * 1.3f, scale * 1.3f,
+                                        t->rotation,
+                                        C2D_Color32(70, 55, 45, 255), 0.75f);
+            } else if (t->knife) {
+                spr_draw_rotated_tinted(sheet_bullets, tear_idx,
+                                        t->x, render_y, scale * 1.5f, scale * 0.75f,
+                                        t->rotation,
+                                        C2D_Color32(230, 230, 235, 255), 0.65f);
+            } else if (t->laser) {
+                spr_draw_rotated_tinted(sheet_bullets, tear_idx,
+                                        t->x, render_y, scale * 0.7f, scale * 0.7f,
+                                        t->rotation,
+                                        C2D_Color32(120, 220, 255, 230), 0.65f);
+            } else if (t->spectral) {
                 /* Spectral: semi-transparent with ghostly tint */
                 spr_draw_rotated_tinted(sheet_bullets, tear_idx,
                                         t->x, render_y, scale, scale,
@@ -7370,6 +9320,9 @@ static void render_tears(Game *g) {
             float radius = TEAR_RADIUS;
             if (t->homing) tearCol = COL_HOMING_TEAR;
             if (t->spectral) tearCol = COL_SPECTRAL_TEAR;
+            if (t->bomb_tear) tearCol = C2D_Color32(65, 50, 40, 255);
+            if (t->knife) tearCol = C2D_Color32(225, 225, 235, 255);
+            if (t->laser) tearCol = C2D_Color32(80, 210, 255, 255);
             if (t->dmg > 2.0f) radius = TEAR_RADIUS * 1.3f;
 
             C2D_DrawCircleSolid(t->x, render_y, 0, radius, tearCol);
@@ -7394,13 +9347,20 @@ static void render_enemies(Game *g) {
         int boss = is_boss_type(e->type);
         float sz = boss ? ENEMY_SIZE * 2 : ENEMY_SIZE;
 
-        /* Shadow */
+        /* Airborne body offset shared by the aura and the sprite, so the
+         * champion ring follows a jumping Hopper/Leaper instead of staying
+         * on the ground as a detached disc. (Negative jump_arc = up.) */
+        float body_y = e->y;
+        if (e->type == ENEMY_HOPPER || e->type == ENEMY_LEAPER)
+            body_y += e->jump_arc;
+
+        /* Shadow (stays on the ground) */
         C2D_DrawEllipseSolid(e->x - sz, e->y + sz * 0.3f, 0,
                              sz * 2, sz * 0.5f, COL_SHADOW);
 
         /* Champion aura: pulsing colored circle behind enemy */
         if (e->champion != CHAMP_NONE) {
-            u32 acol = 0xFF606060;
+            u32 acol = C2D_Color32(96, 96, 96, 255);
             switch (e->champion) {
                 case CHAMP_RED:    acol = C2D_Color32(255,  80,  80, 140); break;
                 case CHAMP_BLUE:   acol = C2D_Color32(100, 140, 255, 140); break;
@@ -7409,7 +9369,7 @@ static void render_enemies(Game *g) {
                 default: break;
             }
             float pulse = 1.0f + sinf((float)g->frame * 0.12f) * 0.15f;
-            C2D_DrawCircleSolid(e->x, e->y, 0, sz * 1.2f * pulse, acol);
+            C2D_DrawCircleSolid(e->x, body_y, 0, sz * 1.2f * pulse, acol);
         }
 
         if (g_sprites_loaded) {
@@ -7463,9 +9423,11 @@ static void render_enemies(Game *g) {
                 /* Flip horizontally when moving left */
                 if (e->dx < 0) {
                     if (e->flash > 0) {
-                        /* Can't easily flip+tint with current API, draw tinted normally */
-                        spr_draw_tinted(sheet_enemies, idx, e->x, e->y, scale, scale,
-                                       C2D_Color32(255, 255, 255, 255), 0.7f);
+                        /* Keep facing left during hit-flash (the old unflipped
+                         * tint draw made the pacer snap 180° on every hit) */
+                        spr_draw_fliph_tinted(sheet_enemies, idx, e->x, e->y,
+                                              scale, scale,
+                                              C2D_Color32(255, 255, 255, 255), 0.7f);
                     } else {
                         spr_draw_fliph(sheet_enemies, idx, e->x, e->y, scale, scale);
                     }
@@ -7492,10 +9454,20 @@ static void render_enemies(Game *g) {
                 float sprSrcSize;
                 if (boss) {
                     idx = boss_sprite_idx(e->type);
-                    sprSrcSize = 80.0f;
+                    sprSrcSize = 80.0f;  /* fallback if atlas missing */
                 } else {
                     idx = enemy_sprite_idx(e->type);
                     sprSrcSize = 20.0f;
+                }
+                /* Atlas sprites are NOT all one size (bosses: duke 80,
+                 * monstro 96, gemini 70, larry 90, famine 85; enemies:
+                 * 16/20/24 mixed). Read the real subtexture size so every
+                 * enemy renders at exactly sz*2 px - the same diameter the
+                 * collision code uses - instead of up to 20% off. */
+                if (sheet_sprites) {
+                    C2D_Image simg = C2D_SpriteSheetGetImage(sheet_sprites, idx);
+                    if (simg.subtex && simg.subtex->width > 0)
+                        sprSrcSize = (float)simg.subtex->width;
                 }
                 float scale = (sz * 2.0f) / sprSrcSize;
 
@@ -7534,6 +9506,35 @@ static void render_enemies(Game *g) {
                         draw_scaleY *= breath;
                     }
 
+                    /* Widow: jump arc offset (positive jump_z = up) +
+                     * stretch while airborne, so the no-contact window
+                     * during her jump reads visually. */
+                    if (e->type == ENEMY_BOSS_WIDOW) {
+                        draw_y -= e->jump_z;
+                        if (e->phase == 1) {
+                            draw_scaleX = scale * 0.88f;
+                            draw_scaleY = scale * 1.12f;
+                        }
+                    }
+
+                    /* Airborne landing shadows are drawn BEFORE the body so
+                     * they sit under it (painter's order), like every other
+                     * shadow in the game. */
+                    if (e->type == ENEMY_BOSS_MONSTRO && e->phase == 1) {
+                        float shadowAlpha = clampf(-e->jump_z / 40.0f, 0.2f, 0.6f);
+                        float shadowSz = sz + (-e->jump_z * 0.3f);
+                        C2D_DrawEllipseSolid(e->x - shadowSz, e->y + sz * 0.3f, 0,
+                                            shadowSz * 2, shadowSz * 0.4f,
+                                            C2D_Color32(0, 0, 0, (u8)(shadowAlpha * 180)));
+                    }
+                    if (e->type == ENEMY_BOSS_WIDOW && e->phase == 1) {
+                        float shadowAlpha = clampf(e->jump_z / 40.0f, 0.2f, 0.6f);
+                        float shadowSz = sz + (e->jump_z * 0.25f);
+                        C2D_DrawEllipseSolid(e->x - shadowSz, e->y + sz * 0.3f, 0,
+                                            shadowSz * 2, shadowSz * 0.4f,
+                                            C2D_Color32(0, 0, 0, (u8)(shadowAlpha * 180)));
+                    }
+
                     /* Famine: tint change in phase 2 (headless) */
                     if (e->type == ENEMY_BOSS_FAMINE && e->phase == 1) {
                         /* Leaning in charge direction */
@@ -7547,6 +9548,20 @@ static void render_enemies(Game *g) {
                                                    draw_scaleX, draw_scaleY, lean,
                                                    C2D_Color32(200, 60, 60, 255), 0.25f);
                         }
+                    } else if (e->type == ENEMY_BOSS_PIN && e->phase == 1) {
+                        /* Burrowed: only a travelling dirt mound is visible,
+                         * matching the fact that Pin can't be hit or touched
+                         * underground. */
+                        float mound = sz * 0.9f;
+                        C2D_DrawEllipseSolid(draw_x - mound, draw_y - mound * 0.25f, 0,
+                                            mound * 2.0f, mound * 0.55f,
+                                            C2D_Color32(70, 50, 35, 200));
+                        C2D_DrawEllipseSolid(draw_x - mound * 0.6f, draw_y - mound * 0.4f, 0,
+                                            mound * 1.2f, mound * 0.4f,
+                                            C2D_Color32(95, 70, 45, 220));
+                        /* Faint silhouette so the player can track it */
+                        spr_draw_alpha(sheet_sprites, idx, draw_x, draw_y + 4,
+                                       draw_scaleX * 0.8f, draw_scaleY * 0.55f, 0.18f);
                     } else if (e->flash > 0) {
                         spr_draw_tinted(sheet_sprites, idx, draw_x, draw_y,
                                        draw_scaleX, draw_scaleY,
@@ -7577,8 +9592,8 @@ static void render_enemies(Game *g) {
                         }
                     }
 
-                    /* Gemini: render companion entity + tether */
-                    if (e->type == ENEMY_BOSS_GEMINI) {
+                    /* Gemini: render companion entity + tether (while alive) */
+                    if (e->type == ENEMY_BOSS_GEMINI && e->gemini_chp > 0) {
                         /* Draw tether line (if not split) */
                         if (!e->gemini_split) {
                             u32 tetherCol = C2D_Color32(180, 60, 60, 180);
@@ -7591,10 +9606,12 @@ static void render_enemies(Game *g) {
                         C2D_DrawEllipseSolid(e->gemini_cx - csz, e->gemini_cy + csz * 0.3f, 0,
                                             csz * 2, csz * 0.5f, COL_SHADOW);
 
-                        /* Companion body - smaller version, possibly different tint */
+                        /* Companion body - smaller version, possibly different tint.
+                         * Flash keys off the companion's OWN hit timer, not the
+                         * main body's. */
                         float cScale = scale * 0.6f;
                         float cBob = sinf(g->frame * 0.1f) * 1.5f;
-                        if (e->flash > 0 || (e->gemini_split && e->state == 1)) {
+                        if (e->gemini_cflash > 0 || (e->gemini_split && e->state == 1)) {
                             spr_draw_tinted(sheet_sprites, idx, e->gemini_cx, e->gemini_cy + cBob,
                                            cScale, cScale,
                                            C2D_Color32(255, 150, 150, 255), 0.5f);
@@ -7604,22 +9621,10 @@ static void render_enemies(Game *g) {
                         }
                     }
 
-                    /* Monstro: landing shadow when in air */
-                    if (e->type == ENEMY_BOSS_MONSTRO && e->phase == 1) {
-                        float shadowAlpha = clampf(-e->jump_z / 40.0f, 0.2f, 0.6f);
-                        float shadowSz = sz + (-e->jump_z * 0.3f);
-                        C2D_DrawEllipseSolid(e->x - shadowSz, e->y + sz * 0.3f, 0,
-                                            shadowSz * 2, shadowSz * 0.4f,
-                                            C2D_Color32(0, 0, 0, (u8)(shadowAlpha * 180)));
-                    }
-
                 } else {
-                    /* Regular enemy sprite */
-                    float draw_y = e->y;
-                    /* Hopper/Leaper: offset Y by jump_arc for airborne effect */
-                    if (e->type == ENEMY_HOPPER || e->type == ENEMY_LEAPER) {
-                        draw_y -= e->jump_arc;
-                    }
+                    /* Regular enemy sprite. body_y already carries the
+                     * Hopper/Leaper jump_arc offset (negative = up). */
+                    float draw_y = body_y;
                     /* Host: draw at half alpha when hidden */
                     if (e->type == ENEMY_HOST && e->hidden) {
                         spr_draw_tinted(sheet_sprites, idx, e->x, draw_y, scale, scale,
@@ -7678,39 +9683,55 @@ static void render_enemies(Game *g) {
                 }
             }
 
-            C2D_DrawCircleSolid(e->x, e->y, 0, sz, col);
+            /* State-aware fallbacks, matching what the sprite path shows */
+            if (e->type == ENEMY_HOST && e->hidden) {
+                /* Invulnerable shell: translucent gray, no eyes */
+                C2D_DrawCircleSolid(e->x, body_y, 0, sz,
+                                    C2D_Color32(128, 128, 128, 130));
+                continue;
+            }
+            if (e->type == ENEMY_GLOBIN && e->state == 1) {
+                /* Collapsed regenerating pile: flattened blob, no eyes */
+                C2D_DrawEllipseSolid(e->x - sz * 1.2f, e->y + 4.0f - sz * 0.4f, 0,
+                                     sz * 2.4f, sz * 0.8f,
+                                     (e->flash > 0) ? COL_ENEMY_HIT
+                                                    : C2D_Color32(200, 80, 80, 200));
+                continue;
+            }
+
+            C2D_DrawCircleSolid(e->x, body_y, 0, sz, col);
 
             if (boss) {
                 u32 eyeW = C2D_Color32(255, 255, 255, 255);
                 u32 eyeB = C2D_Color32(255, 0, 0, 255);
-                C2D_DrawCircleSolid(e->x - 7, e->y - 4, 0, 5.0f, eyeW);
-                C2D_DrawCircleSolid(e->x + 7, e->y - 4, 0, 5.0f, eyeW);
-                C2D_DrawCircleSolid(e->x - 7, e->y - 3, 0, 3.0f, eyeB);
-                C2D_DrawCircleSolid(e->x + 7, e->y - 3, 0, 3.0f, eyeB);
-                C2D_DrawRectSolid(e->x - 8, e->y + 6, 0, 16, 4, C2D_Color32(50, 0, 0, 255));
+                C2D_DrawCircleSolid(e->x - 7, body_y - 4, 0, 5.0f, eyeW);
+                C2D_DrawCircleSolid(e->x + 7, body_y - 4, 0, 5.0f, eyeW);
+                C2D_DrawCircleSolid(e->x - 7, body_y - 3, 0, 3.0f, eyeB);
+                C2D_DrawCircleSolid(e->x + 7, body_y - 3, 0, 3.0f, eyeB);
+                C2D_DrawRectSolid(e->x - 8, body_y + 6, 0, 16, 4, C2D_Color32(50, 0, 0, 255));
 
                 float barW = 40.0f;
                 float hpPct = (float)e->hp / (float)e->max_hp;
                 if (hpPct < 0) hpPct = 0;
-                C2D_DrawRectSolid(e->x - barW / 2, e->y - sz - 8, 0,
+                C2D_DrawRectSolid(e->x - barW / 2, body_y - sz - 8, 0,
                                   barW, 4, C2D_Color32(60, 60, 60, 255));
                 u32 hpBarCol = (hpPct > 0.5f) ? COL_HEART_FULL :
                                (hpPct > 0.25f) ? C2D_Color32(255, 165, 0, 255) :
                                C2D_Color32(255, 50, 50, 255);
-                C2D_DrawRectSolid(e->x - barW / 2, e->y - sz - 8, 0,
+                C2D_DrawRectSolid(e->x - barW / 2, body_y - sz - 8, 0,
                                   barW * hpPct, 4, hpBarCol);
             } else if (e->type == ENEMY_FLY) {
                 u32 wingCol = C2D_Color32(120, 120, 120, 180);
                 float wOff = (g->frame % 10 < 5) ? 2.0f : -1.0f;
-                C2D_DrawCircleSolid(e->x - 8, e->y - 4 + wOff, 0, 5.0f, wingCol);
-                C2D_DrawCircleSolid(e->x + 8, e->y - 4 + wOff, 0, 5.0f, wingCol);
+                C2D_DrawCircleSolid(e->x - 8, body_y - 4 + wOff, 0, 5.0f, wingCol);
+                C2D_DrawCircleSolid(e->x + 8, body_y - 4 + wOff, 0, 5.0f, wingCol);
             } else {
                 u32 eyeW = C2D_Color32(255, 255, 255, 255);
                 u32 eyeB2 = C2D_Color32(10, 10, 10, 255);
-                C2D_DrawCircleSolid(e->x - 3, e->y - 2, 0, 3.0f, eyeW);
-                C2D_DrawCircleSolid(e->x + 3, e->y - 2, 0, 3.0f, eyeW);
-                C2D_DrawCircleSolid(e->x - 3, e->y - 1, 0, 1.5f, eyeB2);
-                C2D_DrawCircleSolid(e->x + 3, e->y - 1, 0, 1.5f, eyeB2);
+                C2D_DrawCircleSolid(e->x - 3, body_y - 2, 0, 3.0f, eyeW);
+                C2D_DrawCircleSolid(e->x + 3, body_y - 2, 0, 3.0f, eyeW);
+                C2D_DrawCircleSolid(e->x - 3, body_y - 1, 0, 1.5f, eyeB2);
+                C2D_DrawCircleSolid(e->x + 3, body_y - 1, 0, 1.5f, eyeB2);
             }
         }
     }
@@ -7741,7 +9762,8 @@ void render_floor_transition(Game *g, C2D_TextBuf textBuf) {
     if (alpha > 1) alpha = 1;
 
     u32 textCol = C2D_Color32(255, 220, 150, (int)(alpha * 255));
-    C2D_DrawText(&t1, C2D_WithColor, 130, 90, 0, 0.9f, 0.9f, textCol);
+    C2D_DrawText(&t1, C2D_WithColor | C2D_AlignCenter,
+                 TOP_SCREEN_WIDTH / 2.0f, 90, 0, 0.9f, 0.9f, textCol);
 
     /* Floor number (show total in infinite mode) */
     C2D_Text t2;
@@ -7754,8 +9776,19 @@ void render_floor_transition(Game *g, C2D_TextBuf textBuf) {
     }
     C2D_TextParse(&t2, textBuf, floorBuf);
     C2D_TextOptimize(&t2);
-    C2D_DrawText(&t2, C2D_WithColor, 140, 130, 0, 0.6f, 0.6f,
-                C2D_Color32(180, 180, 180, (int)(alpha * 255)));
+    C2D_DrawText(&t2, C2D_WithColor | C2D_AlignCenter,
+                 TOP_SCREEN_WIDTH / 2.0f, 130, 0, 0.6f, 0.6f,
+                 C2D_Color32(180, 180, 180, (int)(alpha * 255)));
+
+    const ChallengeDef *challenge = get_challenge_def(g->active_challenge);
+    if (challenge) {
+        C2D_Text ct;
+        C2D_TextParse(&ct, textBuf, challenge->name);
+        C2D_TextOptimize(&ct);
+        C2D_DrawText(&ct, C2D_WithColor | C2D_AlignCenter,
+                     TOP_SCREEN_WIDTH / 2.0f, 160, 0, 0.42f, 0.42f,
+                     C2D_Color32(210, 150, 100, (int)(alpha * 255)));
+    }
 }
 
 /* ================================================================
@@ -7785,6 +9818,10 @@ void render_gameover(Game *g, C2D_TextBuf textBuf) {
     if (g->game_mode == MODE_INFINITE) {
         int total = g->best_floor + 1;
         snprintf(flBuf, sizeof(flBuf), "Deepest Floor: %d (%s)", total, fi->name);
+    } else if (g->active_challenge >= 0) {
+        const ChallengeDef *challenge = get_challenge_def(g->active_challenge);
+        snprintf(flBuf, sizeof(flBuf), "%s failed on %s",
+                 challenge ? challenge->name : "Challenge", fi->name);
     } else {
         snprintf(flBuf, sizeof(flBuf), "Reached: %s", fi->name);
     }
@@ -7808,9 +9845,9 @@ void render_gameover(Game *g, C2D_TextBuf textBuf) {
                     C2D_Color32(180, 180, 255, 255));
     }
 
-    C2D_TextParse(&t3, textBuf, "Press START for menu");
+    C2D_TextParse(&t3, textBuf, "A: Retry   START: Menu");
     C2D_TextOptimize(&t3);
-    C2D_DrawText(&t3, C2D_WithColor, 110, 200, 0, 0.55f, 0.55f,
+    C2D_DrawText(&t3, C2D_WithColor, 118, 200, 0, 0.55f, 0.55f,
                  C2D_Color32(255, 220, 100, 255));
 }
 
@@ -7819,7 +9856,8 @@ void render_win(Game *g, C2D_TextBuf textBuf) {
     char scoreBuf[32];
     snprintf(scoreBuf, sizeof(scoreBuf), "Final Score: %d", g->score);
 
-    C2D_TextParse(&t1, textBuf, "YOU ESCAPED!");
+    const ChallengeDef *challenge = get_challenge_def(g->active_challenge);
+    C2D_TextParse(&t1, textBuf, challenge ? "CHALLENGE COMPLETE!" : "YOU ESCAPED!");
     C2D_TextOptimize(&t1);
     C2D_DrawText(&t1, C2D_WithColor, 110, 40, 0, 0.9f, 0.9f,
                  C2D_Color32(100, 255, 100, 255));
@@ -7830,7 +9868,11 @@ void render_win(Game *g, C2D_TextBuf textBuf) {
 
     C2D_Text t4;
     char floorBuf[48];
-    snprintf(floorBuf, sizeof(floorBuf), "All %d floors conquered!", MAX_FLOORS);
+    if (challenge) {
+        snprintf(floorBuf, sizeof(floorBuf), "%s marked complete", challenge->name);
+    } else {
+        snprintf(floorBuf, sizeof(floorBuf), "All %d floors conquered!", MAX_FLOORS);
+    }
     C2D_TextParse(&t4, textBuf, floorBuf);
     C2D_TextOptimize(&t4);
     C2D_DrawText(&t4, C2D_WithColor, 100, 115, 0, 0.55f, 0.55f,
@@ -7845,15 +9887,61 @@ void render_win(Game *g, C2D_TextBuf textBuf) {
     C2D_DrawText(&itemsText, C2D_WithColor, 120, 145, 0, 0.5f, 0.5f,
                 C2D_Color32(180, 180, 255, 255));
 
-    C2D_TextParse(&t3, textBuf, "Press START for menu");
+    C2D_TextParse(&t3, textBuf, "A: New Run   START: Menu");
     C2D_TextOptimize(&t3);
-    C2D_DrawText(&t3, C2D_WithColor, 108, 190, 0, 0.55f, 0.55f,
+    C2D_DrawText(&t3, C2D_WithColor, 112, 190, 0, 0.55f, 0.55f,
                  C2D_Color32(255, 220, 100, 255));
 }
 
 /* ================================================================
  * Top-screen composite render
  * ================================================================ */
+
+/* Damaging creep puddles (yellow champion trails, Widow landings).
+ * These hurt the player on contact, so they MUST be visible - previously
+ * they were never drawn at all. Rendered on the floor, under entities. */
+/* Draw the player's orbiting familiars (procedural, no atlas art). */
+static void render_familiars(Game *g) {
+    Player *p = &g->player;
+    for (int i = 0; i < MAX_FAMILIARS; i++) {
+        Familiar *f = &p->familiars[i];
+        if (f->type == ITEM_NONE) continue;
+        u32 col; float dmg; int cd; int homing; float range;
+        familiar_def(f->type, &col, &dmg, &cd, &homing, &range);
+
+        C2D_DrawEllipseSolid(f->x - 5.0f, f->y + 3.0f, 0, 10.0f, 4.0f, COL_SHADOW);
+        C2D_DrawCircleSolid(f->x, f->y, 0, 5.0f, col);
+        /* eyes */
+        C2D_DrawCircleSolid(f->x - 1.6f, f->y - 1.0f, 0, 1.5f, C2D_Color32(255, 255, 255, 255));
+        C2D_DrawCircleSolid(f->x + 1.6f, f->y - 1.0f, 0, 1.5f, C2D_Color32(255, 255, 255, 255));
+        C2D_DrawCircleSolid(f->x - 1.6f, f->y - 1.0f, 0, 0.7f, C2D_Color32(20, 20, 20, 255));
+        C2D_DrawCircleSolid(f->x + 1.6f, f->y - 1.0f, 0, 0.7f, C2D_Color32(20, 20, 20, 255));
+    }
+}
+
+static void render_creep(Game *g) {
+    for (int i = 0; i < MAX_CREEP; i++) {
+        CreepTile *c = &g->creep[i];
+        if (!c->active) continue;
+        /* Fade out over the last second of lifetime */
+        float a = 1.0f;
+        if (c->timer < 60) a = (float)c->timer / 60.0f;
+        u8 a0 = (u8)(a * 150.0f);
+        u8 a1 = (u8)(a * 110.0f);
+        /* Irregular puddle: three overlapping ellipses */
+        C2D_DrawEllipseSolid(c->x - c->radius, c->y - c->radius * 0.55f, 0,
+                             c->radius * 2.0f, c->radius * 1.1f,
+                             C2D_Color32(150, 25, 25, a0));
+        C2D_DrawEllipseSolid(c->x - c->radius * 0.7f - 4.0f,
+                             c->y - c->radius * 0.4f + 2.0f, 0,
+                             c->radius * 1.4f, c->radius * 0.8f,
+                             C2D_Color32(185, 45, 35, a1));
+        C2D_DrawEllipseSolid(c->x - c->radius * 0.45f + 5.0f,
+                             c->y - c->radius * 0.35f - 2.0f, 0,
+                             c->radius * 0.9f, c->radius * 0.7f,
+                             C2D_Color32(115, 15, 15, a1));
+    }
+}
 
 /* Render enemy projectiles (clotty blood shots) */
 static void render_enemy_shots(Game *g) {
@@ -7921,6 +10009,130 @@ static void render_shop_prices(Game *g, C2D_TextBuf textBuf) {
     }
 }
 
+/* The complete in-room world: room, entities, atmosphere overlays and
+ * world-anchored labels. Shared by STATE_PLAYING and STATE_PAUSED so the
+ * paused scene can never drift from the live one (previously pausing
+ * dropped the shop prices, the Womb/Sheol tint and - critically - the
+ * Curse of Darkness vignette, revealing the whole room for free). */
+static void render_world_scene(Game *g, C2D_TextBuf textBuf) {
+    Room *cr = current_room(g);
+
+    render_room(g);
+    render_creep(g);                 /* damage puddles, under entities */
+    render_tears(g);
+    render_enemy_shots(g);
+    render_blood_particles(g);
+    render_enemies(g);
+    render_player(g);
+    render_familiars(g);             /* orbit around the player, drawn on top */
+
+    /* Floor tint overlay for Womb (red) and Sheol (dark) */
+    if (g->current_floor == 5) {
+        C2D_DrawRectSolid(0, 0, 0, TOP_SCREEN_WIDTH, TOP_SCREEN_HEIGHT,
+                          C2D_Color32(140, 30, 40, 50));
+    } else if (g->current_floor == 6) {
+        C2D_DrawRectSolid(0, 0, 0, TOP_SCREEN_WIDTH, TOP_SCREEN_HEIGHT,
+                          C2D_Color32(20, 0, 0, 90));
+    }
+
+    /* Curse of Darkness vignette. Alpha blending cannot "punch out" an
+     * already-drawn dark layer (the old stacked-circles approach actually
+     * made the player's halo the DARKEST spot on screen). Instead, darkness
+     * is only drawn OUTSIDE the visible zone: four solid rects beyond the
+     * falloff box, and gradient quads ramping clear -> dark across the
+     * falloff band, leaving the area around Isaac genuinely untouched. */
+    if (g->active_curse == CURSE_DARKNESS) {
+        float cx = g->player.x;
+        float cy = g->player.y;
+        const float clear_r = 70.0f;   /* fully visible halo */
+        const float dim_r   = 130.0f;  /* darkness ramps to full here */
+        u32 dark  = C2D_Color32(0, 0, 0, 220);
+        u32 clear = C2D_Color32(0, 0, 0, 0);
+
+        float ix0 = cx - clear_r, ix1 = cx + clear_r;
+        float iy0 = cy - clear_r, iy1 = cy + clear_r;
+        float ox0 = cx - dim_r,   ox1 = cx + dim_r;
+        float oy0 = cy - dim_r,   oy1 = cy + dim_r;
+
+        /* Solid darkness outside the falloff box */
+        if (oy0 > 0)
+            C2D_DrawRectSolid(0, 0, 0, TOP_SCREEN_WIDTH, oy0, dark);
+        if (oy1 < TOP_SCREEN_HEIGHT)
+            C2D_DrawRectSolid(0, oy1, 0, TOP_SCREEN_WIDTH,
+                              TOP_SCREEN_HEIGHT - oy1, dark);
+        if (ox0 > 0)
+            C2D_DrawRectSolid(0, oy0, 0, ox0, oy1 - oy0, dark);
+        if (ox1 < TOP_SCREEN_WIDTH)
+            C2D_DrawRectSolid(ox1, oy0, 0, TOP_SCREEN_WIDTH - ox1,
+                              oy1 - oy0, dark);
+
+        /* Falloff band: gradient side rects + corner quads
+         * (C2D_DrawRectangle corner colors: TL, TR, BL, BR) */
+        C2D_DrawRectangle(ix0, oy0, 0, ix1 - ix0, iy0 - oy0,
+                          dark, dark, clear, clear);             /* top    */
+        C2D_DrawRectangle(ix0, iy1, 0, ix1 - ix0, oy1 - iy1,
+                          clear, clear, dark, dark);             /* bottom */
+        C2D_DrawRectangle(ox0, iy0, 0, ix0 - ox0, iy1 - iy0,
+                          dark, clear, dark, clear);             /* left   */
+        C2D_DrawRectangle(ix1, iy0, 0, ox1 - ix1, iy1 - iy0,
+                          clear, dark, clear, dark);             /* right  */
+        C2D_DrawRectangle(ox0, oy0, 0, ix0 - ox0, iy0 - oy0,
+                          dark, dark, dark, clear);              /* TL     */
+        C2D_DrawRectangle(ix1, oy0, 0, ox1 - ix1, iy0 - oy0,
+                          dark, dark, clear, dark);              /* TR     */
+        C2D_DrawRectangle(ox0, iy1, 0, ix0 - ox0, oy1 - iy1,
+                          dark, clear, dark, dark);              /* BL     */
+        C2D_DrawRectangle(ix1, iy1, 0, ox1 - ix1, oy1 - iy1,
+                          clear, dark, dark, dark);              /* BR     */
+
+        /* Warm candle flicker around Isaac (freezes while paused) */
+        float flicker = sinf((float)g->frame * 0.25f) * 3.0f;
+        C2D_DrawCircleSolid(cx, cy, 0, clear_r * 0.75f + flicker,
+                            C2D_Color32(255, 200, 100, 12));
+    }
+
+    /* World-anchored text: drawn inside the (possibly shaken) view so the
+     * labels stay glued to their pedestals/items during screen shake. */
+    render_shop_prices(g, textBuf);
+
+    /* Pedestal item name (or ??? when Blind) */
+    if (cr->pedestal.active && g->active_curse != CURSE_BLIND) {
+        const ItemDef *def = get_item_def(cr->pedestal.item);
+        if (def) {
+            C2D_Text itemName;
+            C2D_TextParse(&itemName, textBuf, def->name);
+            C2D_TextOptimize(&itemName);
+            C2D_DrawText(&itemName, C2D_WithColor,
+                        cr->pedestal.x - 30, cr->pedestal.y + 16, 0,
+                        0.35f, 0.35f, C2D_Color32(255, 255, 200, 200));
+        }
+    } else if (cr->pedestal.active && g->active_curse == CURSE_BLIND) {
+        C2D_Text qm;
+        C2D_TextParse(&qm, textBuf, "???");
+        C2D_TextOptimize(&qm);
+        C2D_DrawText(&qm, C2D_WithColor,
+                    cr->pedestal.x - 8, cr->pedestal.y + 16, 0,
+                    0.4f, 0.4f, C2D_Color32(200, 100, 100, 200));
+    }
+
+    /* Devil deal label: item name (or ???) + what it costs */
+    if (cr->devil_pedestal.active) {
+        const ItemDef *ddef = get_item_def(cr->devil_pedestal.item);
+        char dbuf[64];
+        if (g->active_curse == CURSE_BLIND || !ddef) {
+            snprintf(dbuf, sizeof(dbuf), "??? - 1 heart");
+        } else {
+            snprintf(dbuf, sizeof(dbuf), "%s - 1 heart", ddef->name);
+        }
+        C2D_Text dtxt;
+        C2D_TextParse(&dtxt, textBuf, dbuf);
+        C2D_TextOptimize(&dtxt);
+        C2D_DrawText(&dtxt, C2D_WithColor,
+                    cr->devil_pedestal.x - 36, cr->devil_pedestal.y + 24, 0,
+                    0.35f, 0.35f, C2D_Color32(255, 120, 120, 220));
+    }
+}
+
 void game_render_top(Game *g, C2D_TextBuf textBuf) {
     C2D_TextBufClear(textBuf);
 
@@ -7936,6 +10148,10 @@ void game_render_top(Game *g, C2D_TextBuf textBuf) {
         render_mode_select(g, textBuf);
         break;
 
+    case STATE_CHALLENGE_SELECT:
+        render_challenge_select(g, textBuf);
+        break;
+
     case STATE_CHARACTER_SELECT:
         render_character_select(g, textBuf);
         break;
@@ -7945,7 +10161,7 @@ void game_render_top(Game *g, C2D_TextBuf textBuf) {
         break;
 
     case STATE_CONTROLS:
-        render_controls(textBuf);
+        render_controls(g, textBuf);
         break;
 
     case STATE_UNLOCKS:
@@ -7965,63 +10181,7 @@ void game_render_top(Game *g, C2D_TextBuf textBuf) {
             C2D_ViewTranslate(sox, soy);
         }
 
-        render_room(g);
-        render_shop_prices(g, textBuf);  /* price text overlay on shop items */
-        render_tears(g);
-        render_enemy_shots(g);
-        render_blood_particles(g);
-        render_enemies(g);
-        render_player(g);
-
-        /* Floor tint overlay for Womb (red) and Sheol (dark) */
-        if (g->current_floor == 5) {
-            /* Womb: red flesh tint */
-            C2D_DrawRectSolid(0, 0, 0, TOP_SCREEN_WIDTH, TOP_SCREEN_HEIGHT,
-                              C2D_Color32(140, 30, 40, 50));
-        } else if (g->current_floor == 6) {
-            /* Sheol: dark hellish tint */
-            C2D_DrawRectSolid(0, 0, 0, TOP_SCREEN_WIDTH, TOP_SCREEN_HEIGHT,
-                              C2D_Color32(20, 0, 0, 90));
-        }
-
-        /* Curse: Darkness - real circular vignette centered on the player.
-         * Only a small radius around Isaac is visible; the rest of the
-         * room is heavily darkened so the curse is actually a challenge. */
-        if (g->active_curse == CURSE_DARKNESS) {
-            float cx = g->player.x;
-            float cy = g->player.y;
-            /* Vision radius: ~80px clear, dim from there outward */
-            const float clear_r = 70.0f;
-            const float dim_r   = 130.0f;
-            /* Solid black corners (outside dim_r) - cover screen with 4 wide
-             * rectangles that don't include the visible center area */
-            const int OUTER_A = 220;          /* near-black outside */
-            const int MID_A   = 180;          /* heavy dim in middle band */
-
-            /* Full-screen black underlay, then "punch out" the visible area
-             * using stacked semi-transparent circles to fake a radial gradient. */
-            C2D_DrawRectSolid(0, 0, 0, TOP_SCREEN_WIDTH, TOP_SCREEN_HEIGHT,
-                              C2D_Color32(0, 0, 0, OUTER_A));
-
-            /* Larger faint circle to soften the dim->dark transition */
-            C2D_DrawCircleSolid(cx, cy, 0, dim_r + 18.0f,
-                                C2D_Color32(0, 0, 0, OUTER_A - MID_A));
-            /* Medium circle: heavy dim zone */
-            C2D_DrawCircleSolid(cx, cy, 0, dim_r,
-                                C2D_Color32(0, 0, 0, MID_A - 80));
-            /* Smaller circle: lighter dim closer to player */
-            C2D_DrawCircleSolid(cx, cy, 0, dim_r - 30.0f,
-                                C2D_Color32(0, 0, 0, 60));
-            /* Innermost circle: fully clear around Isaac */
-            C2D_DrawCircleSolid(cx, cy, 0, clear_r,
-                                C2D_Color32(0, 0, 0, 0));
-
-            /* Subtle warm flicker so the player feels like they're holding
-             * a candle - tiny radius pulse from the player */
-            float flicker = sinf((float)g->frame * 0.25f) * 3.0f;
-            C2D_DrawCircleSolid(cx, cy, 0, clear_r * 0.75f + flicker,
-                                C2D_Color32(255, 200, 100, 12));
-        }
+        render_world_scene(g, textBuf);
 
         /* Reset view for HUD (no shake on HUD) */
         if (sox != 0 || soy != 0) {
@@ -8065,28 +10225,9 @@ void game_render_top(Game *g, C2D_TextBuf textBuf) {
                               C2D_Color32(0, 0, 0, alpha));
         }
 
-        /* Boss intro overlay: dimmed screen + "BOSS" text */
-        if (g->boss_intro_timer > 0) {
-            int alpha = 100;
-            if (g->boss_intro_timer > BOSS_INTRO_FRAMES - 15) {
-                alpha = (BOSS_INTRO_FRAMES - g->boss_intro_timer) * 8;
-            } else if (g->boss_intro_timer < 15) {
-                alpha = g->boss_intro_timer * 7;
-            }
-            if (alpha < 0) alpha = 0;
-            if (alpha > 140) alpha = 140;
-            C2D_DrawRectSolid(0, 0, 0, TOP_SCREEN_WIDTH, TOP_SCREEN_HEIGHT,
-                              C2D_Color32(80, 0, 0, alpha));
-
-            /* BOSS text */
-            C2D_Text bossText;
-            C2D_TextParse(&bossText, textBuf, "! BOSS !");
-            C2D_TextOptimize(&bossText);
-            float pulseScale = 1.0f + sinf((float)g->frame * 0.3f) * 0.1f;
-            C2D_DrawText(&bossText, C2D_WithColor, 130, 90, 0,
-                         pulseScale, pulseScale,
-                         C2D_Color32(255, 60, 60, 240));
-        }
+        /* (Boss intro darkening + the dramatic boss-name reveal are drawn by
+         * render_hud; the old second "! BOSS !" overlay here both dimmed the
+         * name it overlapped and double-printed red text in the same band.) */
 
         /* Pickup flash overlay */
         if (g->pickup_flash > 0) {
@@ -8138,26 +10279,14 @@ void game_render_top(Game *g, C2D_TextBuf textBuf) {
             }
         }
 
-        /* Show item name briefly when pedestal exists (hidden if Blind) */
-        if (current_room(g)->pedestal.active && g->active_curse != CURSE_BLIND) {
-            const ItemDef *def = get_item_def(current_room(g)->pedestal.item);
-            if (def) {
-                C2D_Text itemName;
-                C2D_TextParse(&itemName, textBuf, def->name);
-                C2D_TextOptimize(&itemName);
-                C2D_DrawText(&itemName, C2D_WithColor,
-                            current_room(g)->pedestal.x - 30,
-                            current_room(g)->pedestal.y + 16, 0,
-                            0.35f, 0.35f, C2D_Color32(255, 255, 200, 200));
-            }
-        } else if (current_room(g)->pedestal.active && g->active_curse == CURSE_BLIND) {
-            C2D_Text qm;
-            C2D_TextParse(&qm, textBuf, "???");
-            C2D_TextOptimize(&qm);
-            C2D_DrawText(&qm, C2D_WithColor,
-                        current_room(g)->pedestal.x - 8,
-                        current_room(g)->pedestal.y + 16, 0,
-                        0.4f, 0.4f, C2D_Color32(200, 100, 100, 200));
+        /* (Pedestal + devil-deal labels are drawn inside render_world_scene
+         * so they shake with the world.) Screen-space deny flash stays here. */
+        if (current_room(g)->devil_pedestal.active && g->shop_deny_timer > 30) {
+            C2D_Text deny;
+            C2D_TextParse(&deny, textBuf, "NOT ENOUGH HEARTS!");
+            C2D_TextOptimize(&deny);
+            C2D_DrawText(&deny, C2D_WithColor, 140, 60, 0, 0.5f, 0.5f,
+                         C2D_Color32(255, 60, 60, 240));
         }
 
         /* Pickup description overlay */
@@ -8166,13 +10295,9 @@ void game_render_top(Game *g, C2D_TextBuf textBuf) {
     }
 
     case STATE_PAUSED: {
-        /* Render game underneath dimmed */
-        render_room(g);
-        render_tears(g);
-        render_enemy_shots(g);
-        render_blood_particles(g);
-        render_enemies(g);
-        render_player(g);
+        /* Render the live scene underneath, identically to STATE_PLAYING
+         * (including atmosphere overlays - see render_world_scene) */
+        render_world_scene(g, textBuf);
         render_hud(g, textBuf);
         /* Dim overlay */
         C2D_DrawRectSolid(0, 0, 0, TOP_SCREEN_WIDTH, TOP_SCREEN_HEIGHT,
@@ -8181,12 +10306,33 @@ void game_render_top(Game *g, C2D_TextBuf textBuf) {
         C2D_Text pausedText;
         C2D_TextParse(&pausedText, textBuf, "PAUSED");
         C2D_TextOptimize(&pausedText);
-        C2D_DrawText(&pausedText, C2D_WithColor, 145, 95, 0, 1.1f, 1.1f,
+        C2D_DrawText(&pausedText, C2D_WithColor, 145, 60, 0, 1.1f, 1.1f,
                      C2D_Color32(255, 230, 180, 255));
+
+        /* Pause menu options */
+        static const char *pause_opts[3] = {
+            "Resume", "Restart Run", "Save & Quit"
+        };
+        for (int i = 0; i < 3; i++) {
+            int sel = (g->pause_sel == i);
+            float y = 110.0f + i * 24.0f;
+            if (sel) {
+                C2D_DrawRectSolid(130, y - 3, 0, 140, 20,
+                                  C2D_Color32(120, 40, 40, 160));
+            }
+            C2D_Text optText;
+            C2D_TextParse(&optText, textBuf, pause_opts[i]);
+            C2D_TextOptimize(&optText);
+            C2D_DrawText(&optText, C2D_WithColor, sel ? 152.0f : 148.0f, y, 0,
+                         0.55f, 0.55f,
+                         sel ? C2D_Color32(255, 240, 200, 255)
+                             : C2D_Color32(170, 155, 130, 255));
+        }
+
         C2D_Text resumeText;
-        C2D_TextParse(&resumeText, textBuf, "Press START or B to resume");
+        C2D_TextParse(&resumeText, textBuf, "A: Select   START/B: Resume");
         C2D_TextOptimize(&resumeText);
-        C2D_DrawText(&resumeText, C2D_WithColor, 95, 130, 0, 0.5f, 0.5f,
+        C2D_DrawText(&resumeText, C2D_WithColor, 110, 200, 0, 0.45f, 0.45f,
                      C2D_Color32(200, 180, 150, 255));
         break;
     }
@@ -8212,9 +10358,13 @@ void game_render_top(Game *g, C2D_TextBuf textBuf) {
 void render_minimap(Game *g, C2D_TextBuf textBuf) {
     C2D_TextBufClear(textBuf);
 
-    /* For the main menu / settings / controls screens we draw a matching
-       beige parchment bottom screen with subtitle text. */
-    if (g->state == STATE_MENU || g->state == STATE_CONTROLS || g->state == STATE_SETTINGS) {
+    /* Menu-family screens use a matching parchment bottom screen with
+       context-specific help instead of the gameplay placeholder text. */
+    if (g->state == STATE_MENU || g->state == STATE_MODE_SELECT ||
+        g->state == STATE_CHALLENGE_SELECT ||
+        g->state == STATE_CHARACTER_SELECT || g->state == STATE_DIFFICULTY_SELECT ||
+        g->state == STATE_CONTROLS || g->state == STATE_SETTINGS ||
+        g->state == STATE_UNLOCKS) {
         /* Parchment background to match top screen */
         u32 bg_col      = C2D_Color32(228, 213, 192, 255);
         u32 text_col    = C2D_Color32(50,  35,  25, 255);
@@ -8247,30 +10397,97 @@ void render_minimap(Game *g, C2D_TextBuf textBuf) {
         C2D_DrawText(&t1, C2D_WithColor, 60, 30, 0, 0.7f, 0.7f, text_col);
 
         C2D_Text sub;
-        C2D_TextParse(&sub, textBuf, "REBIRTH  -  3DS Edition");
+        const char *sub_text = "REBIRTH  -  3DS Edition";
+        const char *line1 = "";
+        const char *line2 = "";
+        const char *line3 = "";
+        const char *line4 = "";
+
+        switch (g->state) {
+            case STATE_MENU:
+                sub_text = "Main Menu";
+                line1 = "Start a run, review stats, or change settings.";
+                line2 = "Y opens the controls reference.";
+                line3 = "START begins a quick Normal Story run.";
+                line4 = "CONTINUE resumes your saved run at its floor.";
+                break;
+            case STATE_MODE_SELECT:
+                sub_text = "Choose a Run Type";
+                line1 = "Story Mode is the classic Isaac progression.";
+                line2 = "Infinite Mode loops floors into a survival run.";
+                line3 = "A confirms the highlighted mode.";
+                line4 = "B returns to the main menu.";
+                break;
+            case STATE_CHALLENGE_SELECT: {
+                const ChallengeDef *def = get_challenge_def(g->challenge_sel);
+                sub_text = def ? def->name : "Challenges";
+                line1 = def ? def->subtitle : "";
+                line2 = def ? def->rule_text : "";
+                line3 = "Beat all seven floors to earn a completion mark.";
+                line4 = "A starts the fixed run. B returns to the menu.";
+                break;
+            }
+            case STATE_CHARACTER_SELECT:
+                sub_text = "Choose a Character";
+                line1 = "Each character starts with different strengths.";
+                line2 = "Locked characters must be unlocked through wins.";
+                line3 = "Left and Right move between character sheets.";
+                line4 = "A confirms the current unlocked character.";
+                break;
+            case STATE_DIFFICULTY_SELECT:
+                sub_text = "Choose Difficulty";
+                line1 = "Easy is forgiving, Normal is default, Hard is harsher.";
+                line2 = "Difficulty affects enemy health, drops, and shops.";
+                line3 = "A starts the run with the highlighted difficulty.";
+                line4 = "B returns to character select.";
+                break;
+            case STATE_CONTROLS:
+                sub_text = "How to Play";
+                line1 = "R or SELECT places bombs. L uses your active item.";
+                line2 = "Touch slots use held pills and cards.";
+                line3 = "START pauses and opens the in-run menu.";
+                line4 = "A, B, or START returns to the main menu.";
+                break;
+            case STATE_SETTINGS:
+                sub_text = "Options";
+                line1 = "Adjust audio enable, SFX, and music volume here.";
+                line2 = "Use Left/Right or A to change the selected row.";
+                line3 = "B or START saves changes and returns.";
+                line4 = "Audio enable changes apply on the next launch.";
+                break;
+            case STATE_UNLOCKS:
+                sub_text = "Stats and Unlocks";
+                line1 = "Review character progress, wins, and boss clears.";
+                line2 = "Up and Down scroll the unlock list.";
+                line3 = "Defeated bosses are shown by name.";
+                line4 = "B, A, or START returns to the main menu.";
+                break;
+            default:
+                break;
+        }
+
+        C2D_TextParse(&sub, textBuf, sub_text);
         C2D_TextOptimize(&sub);
         C2D_DrawText(&sub, C2D_WithColor, 75, 60, 0, 0.5f, 0.5f, text_dim);
 
         /* Decorative divider line under subtitle */
         C2D_DrawRectSolid(60, 82, 0, BOT_SCREEN_WIDTH - 120, 1, text_dim);
 
-        char floorIntro[48];
-        snprintf(floorIntro, sizeof(floorIntro), "%d floors of darkness await...", MAX_FLOORS);
-        C2D_TextParse(&t2, textBuf, floorIntro);
+        C2D_TextParse(&t2, textBuf, line1);
         C2D_TextOptimize(&t2);
-        C2D_DrawText(&t2, C2D_WithColor, 50, 100, 0, 0.45f, 0.45f, text_col);
+        C2D_DrawText(&t2, C2D_WithColor, 36, 100, 0, 0.43f, 0.43f, text_col);
 
-        C2D_TextParse(&t3, textBuf, "Collect items to grow stronger.");
+        C2D_TextParse(&t3, textBuf, line2);
         C2D_TextOptimize(&t3);
-        C2D_DrawText(&t3, C2D_WithColor, 50, 122, 0, 0.45f, 0.45f, text_col);
+        C2D_DrawText(&t3, C2D_WithColor, 36, 122, 0, 0.43f, 0.43f, text_col);
 
-        C2D_TextParse(&t4, textBuf, "Defeat bosses to descend.");
+        C2D_TextParse(&t4, textBuf, line3);
         C2D_TextOptimize(&t4);
-        C2D_DrawText(&t4, C2D_WithColor, 50, 144, 0, 0.45f, 0.45f, text_col);
+        C2D_DrawText(&t4, C2D_WithColor, 36, 144, 0, 0.43f, 0.43f, text_col);
 
-        C2D_TextParse(&t5, textBuf, "Defeat Mega Satan to win!");
+        C2D_TextParse(&t5, textBuf, line4);
         C2D_TextOptimize(&t5);
-        C2D_DrawText(&t5, C2D_WithColor, 50, 166, 0, 0.45f, 0.45f, text_col);
+        C2D_DrawText(&t5, C2D_WithColor, 36, 166, 0, 0.43f, 0.43f, text_col);
 
         /* Decorative divider near bottom */
         C2D_DrawRectSolid(80, 188, 0, BOT_SCREEN_WIDTH - 160, 1, text_dim);
@@ -8299,6 +10516,13 @@ void render_minimap(Game *g, C2D_TextBuf textBuf) {
         return;
     }
 
+    /* Gameplay bottom screen: action panel with stats + compact minimap */
+    render_touch_action_panel(g, textBuf);
+}
+
+#if 0  /* Legacy full-screen minimap. Superseded by draw_compact_minimap()
+          inside the touch action panel; kept briefly for reference. */
+{
     /* Curse of the Lost: hide the minimap entirely.
        Show only a faint, atmospheric notice instead of a placeholder. */
     if (g->active_curse == CURSE_LOST) {
@@ -8573,6 +10797,7 @@ void render_minimap(Game *g, C2D_TextBuf textBuf) {
     C2D_DrawText(&ctrl, C2D_WithColor, 15, statsY, 0, 0.35f, 0.35f,
                  C2D_Color32(100, 100, 100, 255));
 }
+#endif  /* legacy minimap */
 
 /* ================================================================
  * Pill / Tarot / Champion / Creep helpers
@@ -8581,7 +10806,8 @@ void render_minimap(Game *g, C2D_TextBuf textBuf) {
 static const char *pill_color_names[PILL_EFFECT_COUNT] = {
     "Red Pill", "Blue Pill", "Yellow Pill", "Green Pill",
     "Orange Pill", "Pink Pill", "White Pill", "Black Pill",
-    "Purple Pill", "Cyan Pill"
+    "Purple Pill", "Cyan Pill", "Brown Pill", "Silver Pill",
+    "Lime Pill", "Magenta Pill", "Teal Pill"
 };
 
 const char *pill_color_name(int color_idx) {
@@ -8592,7 +10818,8 @@ const char *pill_color_name(int color_idx) {
 static const char *pill_effect_text[PILL_EFFECT_COUNT] = {
     "Health Up", "Health Down", "Speed Up", "Speed Down",
     "Tears Up", "Tears Down", "Range Up", "Luck Up",
-    "Full Health", "Telepills"
+    "Full Health", "Telepills", "Explosive Diarrhea", "Payday",
+    "Lock Picker", "Amnesia", "Hematemesis"
 };
 
 const char *pill_name(PillEffect e, int known) {
@@ -8604,11 +10831,27 @@ const char *pill_name(PillEffect e, int known) {
 
 static const char *tarot_names[TAROT_COUNT] = {
     "The Fool", "The Magician", "The High Priestess", "The Emperor",
-    "The Hierophant", "The Lovers", "The Tower", "The World"
+    "The Hierophant", "The Lovers", "The Tower", "The World",
+    "Strength", "Death", "The Stars", "The Sun"
 };
 const char *tarot_name(TarotCard c) {
     if (c < 0 || c >= TAROT_COUNT) return "?";
     return tarot_names[c];
+}
+
+static const char *trinket_names[TRINKET_COUNT] = {
+    "None",
+    "Cancer",          /* + fire rate */
+    "Curved Horn",     /* + damage */
+    "Rabbit's Foot",   /* + luck */
+    "Swallowed Penny", /* coin on room clear */
+    "Match Stick",     /* chance bomb on room clear */
+    "Petrified Poop",  /* better drops */
+    "AAA Battery"      /* faster active charge */
+};
+const char *trinket_name(TrinketType t) {
+    if (t <= TRINKET_NONE || t >= TRINKET_COUNT) return "?";
+    return trinket_names[t];
 }
 
 const char *champion_name(ChampionType c) {
@@ -8628,16 +10871,24 @@ void enemy_drop_champion_reward(Game *g, Enemy *e) {
     if (!r) return;
     switch (e->champion) {
         case CHAMP_RED:
-            spawn_heart(r, e->x, e->y, HEART_RED_FULL);
+            if (!challenge_has_flag(g, CHALLENGE_FLAG_NO_HEART_DROPS)) {
+                spawn_heart(r, e->x, e->y, HEART_RED_FULL);
+            } else {
+                spawn_consumable(r, e->x, e->y, PICKUP_COIN);
+            }
             break;
         case CHAMP_BLUE:
-            spawn_heart(r, e->x, e->y, HEART_SOUL);
+            if (!challenge_has_flag(g, CHALLENGE_FLAG_NO_HEART_DROPS)) {
+                spawn_heart(r, e->x, e->y, HEART_SOUL);
+            } else {
+                spawn_consumable(r, e->x, e->y, PICKUP_KEY);
+            }
             break;
         case CHAMP_YELLOW:
-            spawn_consumable(r, e->x, e->y, PICKUP_COIN5);
+            spawn_consumable(r, e->x, e->y, PICKUP_COIN);
             break;
         case CHAMP_BLACK:
-            spawn_consumable(r, e->x, e->y, PICKUP_BOMB2);
+            spawn_consumable(r, e->x, e->y, PICKUP_BOMB);
             break;
         case CHAMP_NONE:
         default:
@@ -8675,24 +10926,15 @@ void creep_update(Game *g) {
             float dx = p->x - g->creep[i].x;
             float dy = p->y - g->creep[i].y;
             float r2 = dx * dx + dy * dy;
-            float lim = g->creep[i].radius + PLAYER_SIZE / 2.0f;
+            float lim = g->creep[i].radius + PLAYER_HURT_RADIUS;
             if (r2 < lim * lim) {
-                if (p->holy_mantle_active) {
-                    p->holy_mantle_active = 0;
-                } else {
-                    p->hp -= g->creep[i].dmg;
-                    p->iframes = PLAYER_IFRAMES;
-                    audio_play(SFX_HURT);
-                    trigger_shake(g, 2.0f, 8);
-                    if (p->hp <= 0) {
-                        if (p->lives > 0) {
-                            p->lives--;
-                            p->hp = p->stats.max_hp;
-                        } else {
-                            g->state = STATE_GAMEOVER;
-                            audio_play(SFX_PLAYER_DEATH);
-                        }
-                    }
+                p->hp -= player_absorb_dmg(p, g->creep[i].dmg);
+                p->iframes = PLAYER_IFRAMES;
+                audio_play(SFX_HURT);
+                trigger_shake(g, 2.0f, 8);
+                if (player_check_death(p)) {
+                    g->state = STATE_GAMEOVER;
+                    audio_play(SFX_PLAYER_DEATH);
                 }
             }
         }
@@ -8710,10 +10952,20 @@ static void do_warp_cleanup(Game *g) {
     nr->visited = 1;
     if (!nr->enemies_spawned) room_spawn_enemies(g, nr);
 
-    /* Clear projectiles, creep and reset Holy Mantle */
+    /* Clear projectiles, creep, any ticking bomb, and reset Holy Mantle */
     for (int i = 0; i < MAX_TEARS; i++)        g->tears[i].active = 0;
     for (int i = 0; i < MAX_ENEMY_SHOTS; i++)  g->enemy_shots[i].active = 0;
     for (int i = 0; i < MAX_CREEP; i++)        g->creep[i].active = 0;
+    g->bomb_timer = 0;
+    g->boss_active = 0;
+    g->boss_intro_timer = 0;
+    g->boss_name = NULL;
+    g->player.brimstone_charge = 0;
+    g->player.brimstone_dir = DIR_NONE;
+    if (g->player.book_belial_dmg_timer > 0) {
+        g->player.book_belial_dmg_timer = 0;
+        recalc_player_stats(&g->player);
+    }
 
     if (g->player.stats.flags & ITEM_FLAG_MANTLE) g->player.holy_mantle_active = 1;
 
@@ -8739,6 +10991,8 @@ static void do_warp_cleanup(Game *g) {
                 break;
             }
         }
+    } else {
+        music_play(music_for_floor(g->current_floor));
     }
     audio_play(SFX_DOOR);
 }
@@ -8746,15 +11000,23 @@ static void do_warp_cleanup(Game *g) {
 /* Apply pill effect to player */
 void apply_pill_effect(Game *g, PillEffect e) {
     Player *p = &g->player;
+    PillEffect identified_effect = e;
+    if (player_has_item(p, ITEM_LUCKY_FOOT)) {
+        if (e == PILL_HEALTH_DOWN) e = PILL_HEALTH_UP;
+        else if (e == PILL_SPEED_DOWN) e = PILL_SPEED_UP;
+        else if (e == PILL_TEARS_DOWN) e = PILL_TEARS_UP;
+    }
     /* Identify the pill */
-    if (e >= 0 && e < PILL_EFFECT_COUNT) g->pill_known[e] = 1;
+    if (identified_effect >= 0 && identified_effect < PILL_EFFECT_COUNT) {
+        g->pill_known[identified_effect] = 1;
+    }
 
     switch (e) {
         case PILL_HEALTH_UP:
             p->pill_max_hp_bonus += 2;
             recalc_player_stats(p);
             p->hp += 2;
-            if (p->hp > p->stats.max_hp) p->hp = p->stats.max_hp;
+            player_clamp_health(p);
             break;
         case PILL_HEALTH_DOWN:
             p->pill_max_hp_bonus -= 2;
@@ -8787,6 +11049,7 @@ void apply_pill_effect(Game *g, PillEffect e) {
             break;
         case PILL_FULL_HEALTH:
             p->hp = p->stats.max_hp;
+            player_clamp_health(p);
             break;
         case PILL_TELEPILLS: {
             /* Teleport to random room */
@@ -8804,8 +11067,43 @@ void apply_pill_effect(Game *g, PillEffect e) {
             }
             break;
         }
+        case PILL_BOMBS:
+            p->bombs += 2;
+            if (p->bombs > 99) p->bombs = 99;
+            break;
+        case PILL_COINS:
+            p->coins += 5;
+            if (p->coins > 99) p->coins = 99;
+            break;
+        case PILL_KEYS:
+            p->keys += 2;
+            if (p->keys > 99) p->keys = 99;
+            break;
+        case PILL_AMNESIA: {
+            /* Forget the floor: un-visit every room except the current one */
+            g->map_revealed = 0;
+            for (int yy = 0; yy < DUNGEON_H; yy++) {
+                for (int xx = 0; xx < DUNGEON_W; xx++) {
+                    if (xx == g->dungeon.cur_x && yy == g->dungeon.cur_y) continue;
+                    g->dungeon.rooms[yy][xx].visited = 0;
+                }
+            }
+            break;
+        }
+        case PILL_HEMATEMESIS: {
+            /* Vomit blood: drop to 1 full heart, but cough up 2 hearts */
+            if (p->hp > 2) p->hp = 2;
+            Room *r = current_room(g);
+            if (r) {
+                spawn_heart(r, p->x + 14, p->y, HEART_RED_FULL);
+                spawn_heart(r, p->x - 14, p->y, HEART_RED_FULL);
+            }
+            spawn_blood_splatter(g, p->x, p->y, 0.0f, 1.0f, 1);
+            break;
+        }
         default: break;
     }
+    apply_challenge_player_limits(g);
 }
 
 /* Apply tarot card effect */
@@ -8824,7 +11122,28 @@ void apply_tarot_card(Game *g, TarotCard c) {
             g->homing_timer = 600;
             break;
         case TAROT_PRIESTESS:
-            if (r) spawn_heart(r, p->x + 12, p->y, HEART_RED_FULL);
+            if (r) {
+                Enemy *target = NULL;
+                float best_distance = 999999.0f;
+                for (int i = 0; i < r->enemy_count; i++) {
+                    Enemy *enemy = &r->enemies[i];
+                    if (!enemy->active) continue;
+                    float dx = enemy->x - p->x;
+                    float dy = enemy->y - p->y;
+                    float distance = dx * dx + dy * dy;
+                    if (distance < best_distance) {
+                        best_distance = distance;
+                        target = enemy;
+                    }
+                }
+                if (target) {
+                    target->hp -= 12;
+                    target->flash = 20;
+                    trigger_shake(g, 7.0f, 24);
+                    spawn_blood_splatter(g, target->x, target->y, 0.0f, 2.0f, 1);
+                    if (target->hp <= 0) handle_enemy_death(g, r, target);
+                }
+            }
             break;
         case TAROT_EMPEROR: {
             /* Warp to boss room */
@@ -8851,12 +11170,12 @@ void apply_tarot_card(Game *g, TarotCard c) {
             }
             break;
         case TAROT_TOWER:
-            /* Spawn 6 troll bombs around player (damages player too) */
+            /* Spawn 6 immediate bomb blasts around player */
             for (int i = 0; i < 6; i++) {
                 float ang = (i / 6.0f) * 2.0f * 3.14159f;
                 float bx = p->x + cosf(ang) * 40.0f;
                 float by = p->y + sinf(ang) * 40.0f;
-                if (r) spawn_consumable(r, bx, by, PICKUP_BOMB);
+                if (r) explode_at(g, bx, by, 1);
             }
             break;
         case TAROT_WORLD:
@@ -8867,6 +11186,64 @@ void apply_tarot_card(Game *g, TarotCard c) {
                     if (g->dungeon.rooms[yy][xx].type != ROOM_NONE) {
                         g->dungeon.rooms[yy][xx].visited = 1;
                     }
+                }
+            }
+            break;
+        case TAROT_STRENGTH:
+            /* +1 damage until the player leaves the room (same buff
+             * mechanism as Book of Belial) */
+            p->book_belial_dmg_timer = 0x3fffffff;
+            recalc_player_stats(p);
+            break;
+        case TAROT_DEATH:
+            /* Reap: heavy damage to everything in the room */
+            if (r) {
+                trigger_shake(g, 8.0f, 30);
+                int n = r->enemy_count;  /* snapshot: don't re-hit chain spawns */
+                for (int i = 0; i < n; i++) {
+                    Enemy *enemy = &r->enemies[i];
+                    if (!enemy->active) continue;
+                    enemy->hp -= 40;
+                    enemy->flash = 20;
+                    spawn_blood_splatter(g, enemy->x, enemy->y, 0.0f, 1.0f, 1);
+                    if (enemy->hp <= 0) handle_enemy_death(g, r, enemy);
+                }
+            }
+            break;
+        case TAROT_STARS: {
+            /* Teleport to the treasure room (if this floor has one) */
+            for (int yy = 0; yy < DUNGEON_H; yy++) {
+                for (int xx = 0; xx < DUNGEON_W; xx++) {
+                    if (g->dungeon.rooms[yy][xx].type == ROOM_TREASURE) {
+                        g->dungeon.cur_x = xx;
+                        g->dungeon.cur_y = yy;
+                        do_warp_cleanup(g);
+                        return;
+                    }
+                }
+            }
+            break;
+        }
+        case TAROT_SUN:
+            /* Full red heal + full map + 20 damage to all enemies */
+            p->hp = p->stats.max_hp;
+            player_clamp_health(p);
+            g->map_revealed = 1;
+            for (int yy = 0; yy < DUNGEON_H; yy++) {
+                for (int xx = 0; xx < DUNGEON_W; xx++) {
+                    if (g->dungeon.rooms[yy][xx].type != ROOM_NONE) {
+                        g->dungeon.rooms[yy][xx].visited = 1;
+                    }
+                }
+            }
+            if (r) {
+                int n = r->enemy_count;  /* snapshot: don't re-hit chain spawns */
+                for (int i = 0; i < n; i++) {
+                    Enemy *enemy = &r->enemies[i];
+                    if (!enemy->active) continue;
+                    enemy->hp -= 20;
+                    enemy->flash = 20;
+                    if (enemy->hp <= 0) handle_enemy_death(g, r, enemy);
                 }
             }
             break;
@@ -8910,6 +11287,24 @@ void spawn_card_pickup(Room *r, float x, float y, int card) {
     }
 }
 
+void spawn_trinket_pickup(Room *r, float x, float y, int trinket) {
+    if (trinket <= TRINKET_NONE) trinket = TRINKET_CANCER;
+    if (trinket >= TRINKET_COUNT) trinket = TRINKET_COUNT - 1;
+    for (int i = 0; i < MAX_CONSUMABLE_PICKUPS; i++) {
+        if (!r->consumables[i].active) {
+            ConsumablePickup *c = &r->consumables[i];
+            c->x = x + randf(-6, 6);
+            c->y = y + randf(-6, 6);
+            c->type = PICKUP_TRINKET;
+            c->sub_type = trinket;
+            c->active = 1;
+            c->anim_timer = randi(0, 60);
+            r->consumable_count++;
+            return;
+        }
+    }
+}
+
 /* ================================================================
  * MAIN
  * ================================================================ */
@@ -8938,7 +11333,9 @@ int main(int argc, char *argv[]) {
     C3D_RenderTarget *topTarget = C2D_CreateScreenTarget(GFX_TOP, GFX_LEFT);
     C3D_RenderTarget *botTarget = C2D_CreateScreenTarget(GFX_BOTTOM, GFX_LEFT);
 
-    C2D_TextBuf textBuf = C2D_TextBufNew(1024);
+    /* 2048 glyphs: text-heavy screens (unlocks list, stats overlay, HUD +
+     * overlays in one frame) can exceed 1024, which silently drops text. */
+    C2D_TextBuf textBuf = C2D_TextBufNew(2048);
 
     srand((unsigned)time(NULL));
 
@@ -8957,6 +11354,7 @@ int main(int argc, char *argv[]) {
         u32 kHeld = hidKeysHeld();
         circlePosition circlePos;
         hidCircleRead(&circlePos);
+        C2D_TextBufClear(textBuf);
 
         /* SELECT places bombs during gameplay; quits only from menus / game-over screens.
          * Without this guard, the in-game "place_bomb" binding (KEY_SELECT) is dead code
@@ -8984,6 +11382,13 @@ int main(int argc, char *argv[]) {
         }
 
         C3D_FrameEnd(0);
+    }
+
+    /* Autosave a live run on exit (HOME quit, SELECT from pause, etc.) */
+    if (game.state == STATE_PLAYING ||
+        game.state == STATE_PAUSED ||
+        game.state == STATE_FLOOR_TRANSITION) {
+        write_run_save(&game);
     }
 
     /* Cleanup */

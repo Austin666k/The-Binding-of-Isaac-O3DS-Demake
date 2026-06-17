@@ -97,6 +97,18 @@ void spr_draw_fliph(C2D_SpriteSheet sheet, int idx, float cx, float cy,
     C2D_DrawImageAt(img, cx + w / 2.0f, cy - h / 2.0f, 0, NULL, -scaleX, scaleY);
 }
 
+void spr_draw_fliph_tinted(C2D_SpriteSheet sheet, int idx, float cx, float cy,
+                           float scaleX, float scaleY, u32 tintColor, float tintBlend) {
+    if (!sheet) return;
+    C2D_Image img = C2D_SpriteSheetGetImage(sheet, idx);
+    float w = img.subtex->width * scaleX;
+    float h = img.subtex->height * scaleY;
+    C2D_ImageTint tint;
+    C2D_PlainImageTint(&tint, tintColor, tintBlend);
+    /* Negative scaleX = horizontal flip; adjust position so it stays centered */
+    C2D_DrawImageAt(img, cx + w / 2.0f, cy - h / 2.0f, 0, &tint, -scaleX, scaleY);
+}
+
 void spr_draw_rotated(C2D_SpriteSheet sheet, int idx, float cx, float cy,
                       float scaleX, float scaleY, float angle) {
     if (!sheet) return;
@@ -231,8 +243,15 @@ int item_sprite_idx(int item_type) {
     case ITEM_POLYPHEMUS:      return ui_items_atlas_item_polyphemus_idx;
     case ITEM_SAD_ONION:       return ui_items_atlas_item_sad_onion_idx;
     case ITEM_HALO:            return ui_items_atlas_item_halo_idx;
+    case ITEM_DEAD_CAT:        return ui_items_atlas_item_dead_cat_idx;
+    case ITEM_BRIMSTONE:       return ui_items_atlas_item_brimstone_idx;
+    case ITEM_TECHNOLOGY:      return ui_items_atlas_item_technology_idx;
+    case ITEM_MOMS_KNIFE:      return ui_items_atlas_item_moms_knife_idx;
+    case ITEM_NUMBER_ONE:      return ui_items_atlas_item_number_one_idx;
     case ITEM_SPOON_BENDER:    return ui_items_atlas_item_spoon_bender_idx;
     case ITEM_INNER_EYE:       return ui_items_atlas_item_inner_eye_idx;
+    case ITEM_YUM_HEART:       return ui_items_atlas_heart_red_full_idx;
+    case ITEM_BOOK_OF_BELIAL:  return ui_items_atlas_item_the_pact_idx;
     /* --- Fixed: each item now has its own unique sprite --- */
     case ITEM_WIRE_COAT:       return ui_items_atlas_item_wire_coat_hanger_idx;
     case ITEM_LUNCH:           return ui_items_atlas_item_lunch_idx;
@@ -245,6 +264,18 @@ int item_sprite_idx(int item_type) {
     case ITEM_WIRE_HANGER:     return ui_items_atlas_item_wire_hanger_idx;
     case ITEM_GROWTH_HORMONES: return ui_items_atlas_item_growth_hormones_idx;
     case ITEM_JESUS_JUICE:     return ui_items_atlas_item_jesus_juice_idx;
+    /* --- New actives / battery / familiars: map to the closest existing art
+     * (no dedicated icons yet; better than everything showing a pentagram) --- */
+    case ITEM_NECRONOMICON:    return ui_items_atlas_item_the_pact_idx;
+    case ITEM_BIBLE:           return ui_items_atlas_item_the_pact_idx;
+    case ITEM_FORGET_ME_NOW:   return ui_items_atlas_item_the_pact_idx;
+    case ITEM_MOMS_BRA:        return ui_items_atlas_item_moms_knife_idx;
+    case ITEM_BATTERY:         return ui_items_atlas_item_technology_idx;
+    case ITEM_BROTHER_BOBBY:   return ui_items_atlas_item_sacred_heart_idx;
+    case ITEM_SISTER_MAGGY:    return ui_items_atlas_heart_red_full_idx;
+    case ITEM_LITTLE_STEVEN:   return ui_items_atlas_item_spoon_bender_idx;
+    case ITEM_DEMON_BABY:      return ui_items_atlas_item_pentagram_idx;
+    case ITEM_D6:              return ui_items_atlas_item_pentagram_idx;
     default:                   return ui_items_atlas_item_pentagram_idx;
     }
 }

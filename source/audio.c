@@ -71,6 +71,12 @@ typedef struct {
 } MusicState;
 
 static MusicState g_music;
+/* The volume the USER configured. Fades use g_music.volume/target_volume as
+ * scratch state; this is the level every fade-in must return to. Without it,
+ * crossfades clobbered the setting back to a hardcoded 0.6. */
+static float      g_music_user_volume = 0.6f;
+static s16       *g_test_tone_buf;
+static u32        g_test_tone_buf_size;
 
 /* Diagnostics - exposed via audio_debug_get() */
 static AudioDebug g_debug;
@@ -162,7 +168,8 @@ static int load_wav_to_linear(const char *path, WavLoad *out) {
             fread(&byte_rate, 4, 1, f);
             fread(&block_align, 2, 1, f);
             fread(&out->bits, 2, 1, f);
-            if (chunk_size > 16) fseek(f, chunk_size - 16, SEEK_CUR);
+            if (chunk_size > 16) fseek(f, (long)(chunk_size - 16 + (chunk_size & 1u)), SEEK_CUR);
+            else if (chunk_size & 1u) fseek(f, 1, SEEK_CUR);
             got_fmt = 1;
         } else if (memcmp(chunk_id, "data", 4) == 0) {
             out->size = chunk_size;
@@ -176,7 +183,7 @@ static int load_wav_to_linear(const char *path, WavLoad *out) {
             }
             got_data = 1;
         } else {
-            fseek(f, chunk_size, SEEK_CUR);
+            fseek(f, (long)(chunk_size + (chunk_size & 1u)), SEEK_CUR);
         }
     }
 
@@ -268,6 +275,11 @@ void audio_exit(void) {
 
     music_stop();
     audio_free_all();
+    if (g_test_tone_buf) {
+        linearFree(g_test_tone_buf);
+        g_test_tone_buf = NULL;
+        g_test_tone_buf_size = 0;
+    }
 
     csndExit();
     g_audio_status = AUDIO_STATUS_NOT_INIT;
@@ -386,6 +398,11 @@ void audio_force_disable(void) {
     if (g_audio_status == AUDIO_STATUS_OK) {
         music_stop();
         audio_free_all();
+        if (g_test_tone_buf) {
+            linearFree(g_test_tone_buf);
+            g_test_tone_buf = NULL;
+            g_test_tone_buf_size = 0;
+        }
         csndExit();
     }
     g_audio_status = AUDIO_STATUS_DISABLED_RUNTIME;
@@ -409,16 +426,20 @@ void audio_test_tone(void) {
     const u32 byte_size   = num_samples * 2;      /* 16-bit mono */
     const u32 period      = sample_rate / freq_hz;
 
-    s16 *buf = (s16 *)linearAlloc(byte_size);
-    if (!buf) { g_debug.test_tone_result = -2; return; }
+    if (!g_test_tone_buf || g_test_tone_buf_size != byte_size) {
+        if (g_test_tone_buf) linearFree(g_test_tone_buf);
+        g_test_tone_buf = (s16 *)linearAlloc(byte_size);
+        g_test_tone_buf_size = g_test_tone_buf ? byte_size : 0;
+    }
+    if (!g_test_tone_buf) { g_debug.test_tone_result = -2; return; }
 
     for (u32 i = 0; i < num_samples; i++) {
-        buf[i] = ((i / (period / 2)) & 1) ? 20000 : -20000;
+        g_test_tone_buf[i] = ((i / (period / 2)) & 1) ? 20000 : -20000;
     }
 
     /* Stop existing music on channel 8 (test tone will use it). */
     CSND_SetPlayState(MUSIC_CHANNEL, 0);
-    GSPGPU_FlushDataCache(buf, byte_size);
+    GSPGPU_FlushDataCache(g_test_tone_buf, byte_size);
 
     Result rc = csndPlaySound(
         MUSIC_CHANNEL,
@@ -426,17 +447,12 @@ void audio_test_tone(void) {
         sample_rate,
         0.8f,
         0.0f,
-        buf,
+        g_test_tone_buf,
         NULL,           /* one-shot: data1 must be NULL */
         byte_size
     );
     g_debug.test_tone_result = rc;
     g_debug.test_tone_played++;
-
-    /* We leak this 44KB buffer on purpose: linearFree would happen before
-     * the hardware finishes playing it.  It only happens when the user
-     * presses the debug-overlay test button, so the leak is bounded. */
-    (void)buf;
 }
 
 /* ================================================================
@@ -520,9 +536,9 @@ void music_play(MusicId id) {
         return;
     }
 
-    if (g_music.target_volume < 0.05f) g_music.target_volume = 0.6f;
-    g_music.volume     = g_music.target_volume;
-    g_music.fade_speed = 0.0f;
+    g_music.target_volume = g_music_user_volume;
+    g_music.volume        = g_music_user_volume;
+    g_music.fade_speed    = 0.0f;
     music_start_track(id);
 }
 
@@ -555,8 +571,8 @@ void music_crossfade(MusicId new_track, int ticks) {
     if (new_track < 0 || new_track >= MUS_COUNT) return;
 
     if (!g_music.active) {
-        if (g_music.target_volume < 0.05f) g_music.target_volume = 0.6f;
-        g_music.volume = g_music.target_volume;
+        g_music.target_volume = g_music_user_volume;
+        g_music.volume        = g_music_user_volume;
         music_start_track(new_track);
         return;
     }
@@ -572,6 +588,7 @@ void music_set_volume(float vol) {
     if (vol < 0.0f) vol = 0.0f;
     if (vol > 1.0f) vol = 1.0f;
 
+    g_music_user_volume = vol;
     g_music.target_volume = vol;
     if (g_audio_status != AUDIO_STATUS_OK) return;
     if (!g_music.active || g_music.fade_speed != 0.0f) return;
@@ -601,10 +618,17 @@ void music_update(void) {
             music_stop();
 
             if (next != MUS_NONE) {
-                /* Fade-in the new track */
-                g_music.volume        = 0.01f;
-                g_music.target_volume = 0.6f;
-                g_music.fade_speed    = 0.6f / 30.0f;
+                /* Fade the new track in toward the user's configured volume */
+                if (g_music_user_volume > 0.05f) {
+                    g_music.volume        = 0.01f;
+                    g_music.target_volume = g_music_user_volume;
+                    g_music.fade_speed    = g_music_user_volume / 30.0f;
+                } else {
+                    /* Volume set to (near) zero: start silent, no fade */
+                    g_music.volume        = g_music_user_volume;
+                    g_music.target_volume = g_music_user_volume;
+                    g_music.fade_speed    = 0.0f;
+                }
                 music_start_track(next);
             }
             return;
