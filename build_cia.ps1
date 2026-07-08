@@ -15,7 +15,9 @@ if (-not (Test-Path $Makerom)) {
 
 Write-Host "Building .elf via devkitPro MSYS2..."
 $bash = "C:\devkitPro\msys2\usr\bin\bash.exe"
-& $bash -lc "export DEVKITPRO=/c/devkitPro && export DEVKITARM=/c/devkitPro/devkitARM && export CTRULIB=/c/devkitPro/libctru && cd /c/Users/Admin/The-Binding-of-Isaac-O3DS-Demake && make"
+$MsysProjectDir = '/' + $ProjectDir.Substring(0, 1).ToLower() + ($ProjectDir.Substring(2) -replace '\\', '/')
+& $bash -lc "export DEVKITPRO=/opt/devkitpro && export DEVKITARM=/opt/devkitpro/devkitARM && cd '$MsysProjectDir' && make"
+if ($LASTEXITCODE -ne 0) { throw "make failed (exit $LASTEXITCODE)" }
 
 Write-Host "Generating banner and icon..."
 & $Bannertool makebanner -i (Join-Path $Assets "banner.png") -a (Join-Path $Assets "audio.wav") -o (Join-Path $Assets "banner.bnr")
@@ -29,7 +31,8 @@ Write-Host "Packing CIA..."
     -elf (Join-Path $ProjectDir "$Target.elf") `
     -icon (Join-Path $Assets "icon.icn") `
     -banner (Join-Path $Assets "banner.bnr") `
-    -DAPP_ROMFS=(Join-Path $ProjectDir "romfs")
+    "-DAPP_ROMFS=$(Join-Path $ProjectDir 'romfs')"
+if ($LASTEXITCODE -ne 0) { throw "makerom failed (exit $LASTEXITCODE)" }
 
 Get-Item (Join-Path $ProjectDir "$Target.cia") | Format-List Name, Length, LastWriteTime
 Write-Host "CIA build complete."
