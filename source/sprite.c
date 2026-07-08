@@ -345,6 +345,10 @@ int item_sprite_idx(int item_type) {
     /* R8 (M7) Krampus drops — documented reuses (no dedicated art) */
     case ITEM_LUMP_OF_COAL:    return ui_items_atlas_item_bomb_idx;          /* round black lump */
     case ITEM_HEAD_OF_KRAMPUS: return ui_items_atlas_item_brimstone_idx;     /* demonic head/beam */
+    /* R8 (M8) Guppy set — documented reuses (no dedicated art) */
+    case ITEM_GUPPYS_PAW:      return ui_items_atlas_item_dead_cat_idx;      /* cat paw */
+    case ITEM_GUPPYS_HEAD:     return ui_items_atlas_item_crickets_head_idx; /* severed head */
+    case ITEM_GUPPYS_TAIL:     return ui_items_atlas_item_the_belt_idx;      /* curling tail */
     default:                   return ui_items_atlas_item_pentagram_idx;
     }
 }

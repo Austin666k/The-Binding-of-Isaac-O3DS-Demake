@@ -50,6 +50,8 @@ void config_init(GameConfig *cfg) {
     cfg->characters_completed = 0;
     cfg->floors_reached       = 0;
     cfg->total_runs_started   = 0;
+    cfg->devil_deals_taken    = 0;
+    cfg->total_deaths         = 0;
 }
 
 int config_load(GameConfig *cfg) {
@@ -91,6 +93,10 @@ int config_load(GameConfig *cfg) {
             cfg->floors_reached = atoi(val);
         } else if (strcmp(key, "total_runs_started") == 0) {
             cfg->total_runs_started = atoi(val);
+        } else if (strcmp(key, "devil_deals_taken") == 0) {
+            cfg->devil_deals_taken = atoi(val);
+        } else if (strcmp(key, "total_deaths") == 0) {
+            cfg->total_deaths = atoi(val);
         }
         /* unknown keys are silently ignored for forward-compatibility */
     }
@@ -106,6 +112,8 @@ int config_load(GameConfig *cfg) {
     if (cfg->characters_completed < 0) cfg->characters_completed = 0;
     if (cfg->floors_reached       < 0) cfg->floors_reached       = 0;
     if (cfg->total_runs_started   < 0) cfg->total_runs_started   = 0;
+    if (cfg->devil_deals_taken    < 0) cfg->devil_deals_taken    = 0;
+    if (cfg->total_deaths         < 0) cfg->total_deaths         = 0;
     if (cfg->floors_reached > CONFIG_FLOORS_MAX_INDEX)
         cfg->floors_reached = CONFIG_FLOORS_MAX_INDEX;
 
@@ -140,6 +148,8 @@ int config_save(const GameConfig *cfg) {
     fprintf(f, "total_wins=%d\n", cfg->total_wins);
     fprintf(f, "total_runs_started=%d\n", cfg->total_runs_started);
     fprintf(f, "floors_reached=%d\n", cfg->floors_reached);
+    fprintf(f, "devil_deals_taken=%d\n", cfg->devil_deals_taken);
+    fprintf(f, "total_deaths=%d\n", cfg->total_deaths);
 
     if (fclose(f) != 0) {
         remove(CONFIG_TMP_PATH);

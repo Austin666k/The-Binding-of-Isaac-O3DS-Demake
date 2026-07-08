@@ -136,6 +136,14 @@ typedef enum {
     CHAR_EVE,
     CHAR_SAMSON,
     CHAR_BLUE_BABY,
+    /* --- R10 (C4) characters. PARALLEL TABLES: every new entry needs
+       character_name / character_blurb / character_tint cases, recalc +
+       apply_character_start blocks, select-card portrait + heart row,
+       unlocks-screen chars[] entry, character_unlock_name case,
+       apply_unlock_gates bit and a config unlock bit (7-9). --- */
+    CHAR_AZAZEL,     /* flight + innate short-range Brimstone */
+    CHAR_LAZARUS,    /* 1 extra life; respawns stronger (Lazarus' Rags) */
+    CHAR_LOST,       /* no health at all; flight + mantle + free devil deals */
     CHAR_COUNT
 } CharacterType;
 
@@ -171,6 +179,19 @@ typedef enum {
     TAROT_STAR,             /* full map reveal + spawn a heart */
     TAROT_SUN,              /* full heal + full map reveal */
     TAROT_HANGED_MAN,       /* spawn two soul hearts */
+    /* --- R8 (M6): the 10 missing major arcana (deck complete at 22).
+       Every entry here needs BOTH a tarot_names[] string (main.c) and an
+       apply_tarot_card case — the table is sized by TAROT_COUNT. --- */
+    TAROT_EMPRESS,          /* +0.3 dmg +0.2 spd temp buff (~10s) */
+    TAROT_CHARIOT,          /* 6s invincibility (big iframes) + speed */
+    TAROT_JUSTICE,          /* spawn 1 coin + bomb + key + half heart */
+    TAROT_HERMIT,           /* warp to the shop (no shop: 3 coins) */
+    TAROT_WHEEL_OF_FORTUNE, /* spawn a usable slot machine in-room */
+    TAROT_STRENGTH,         /* heal half heart + 0.3 dmg temp buff */
+    TAROT_DEVIL,            /* +2.0 dmg temp buff (~10s) */
+    TAROT_TEMPERANCE,       /* heal 1 full heart */
+    TAROT_MOON,             /* warp to the secret room */
+    TAROT_JUDGEMENT,        /* pickup shower: 3-5 mixed drops */
     TAROT_COUNT
 } TarotCard;
 
@@ -370,6 +391,8 @@ typedef enum {
     PICKUP_TRINKET,   /* trinket (sub_type = TrinketType); swaps with held */
     PICKUP_KEY5,      /* 5-key pickup (charged key ring) */
     PICKUP_BATTERY,   /* refills active item charge to full */
+    PICKUP_CHEST_RED, /* R8 (M5): free to open, weighted risk/reward roll;
+                         sub_type 1 = already opened (husk stays visible) */
     PICKUP_TYPE_COUNT
 } PickupType;
 
@@ -480,6 +503,11 @@ typedef enum {
     /* --- Round 8 (M7) Krampus-only drops (EXCLUDED from random pools) --- */
     ITEM_LUMP_OF_COAL,    /* passive: tear damage grows with tear flight time */
     ITEM_HEAD_OF_KRAMPUS, /* active (4): 4-way brimstone burst from the player */
+    /* --- R8 (M8) Guppy set (normal pool, NOT excluded). Each pickup of a
+       Guppy piece (these 3 + Dead Cat) advances the Guppy transformation. */
+    ITEM_GUPPYS_PAW,      /* passive: +2 soul hearts, Guppy piece */
+    ITEM_GUPPYS_HEAD,     /* active (2): summons 2 friendly blue flies */
+    ITEM_GUPPYS_TAIL,     /* passive: +1 luck, Guppy piece */
     ITEM_COUNT
 } ItemType;
 
@@ -506,6 +534,7 @@ typedef struct {
 #define ITEM_FLAG_ACTIVE       (1 << 11)  /* Active item: usable with charge bar (KEY_X) */
 #define ITEM_FLAG_DOUBLE       (1 << 12)  /* 20/20: two parallel tears */
 #define ITEM_FLAG_COAL         (1 << 13)  /* Lump of Coal: damage grows with tear age */
+#define ITEM_FLAG_FLIGHT       (1 << 14)  /* R8 (M8) Guppy: fly over rocks/poop */
 
 /* ---------- Item Definition ---------- */
 typedef struct {
@@ -696,7 +725,36 @@ typedef struct {
        Per-run (Player lives inside Game; start_new_game memsets Game). */
     int   has_key_piece_1;
     int   has_key_piece_2;
+    /* R8 (M8) transformations — per-run counters (memset by start_new_game).
+       Guppy pieces: Dead Cat / Guppy's Paw / Head / Tail; at 3+ -> GUPPY!
+       (flight + tears spawn friendly blue flies). Mushrooms: Magic Mush /
+       Odd Mushroom / Blue Cap; all 3 -> FUN GUY! (+1 heart container). */
+    int   guppy_count;
+    int   guppy_active;
+    int   funguy_count;
+    int   funguy_active;
+    /* R8 (M6) tarot temp buffs (Empress/Strength/Devil dmg, Empress/Chariot
+       speed). While the timer runs, recalc adds the bonus; expiry zeroes the
+       bonus and recalcs (same pattern as book_belial_dmg_timer). */
+    int   card_dmg_timer;
+    float card_dmg_bonus;
+    int   card_spd_timer;
+    float card_spd_bonus;
+    /* R10 (C4) Samson Bloody Lust: hits taken THIS room (+0.15 dmg each,
+       capped at +1.0 in recalc); reset on every room change. */
+    int   samson_hits;
+    /* R10 (C4) Lazarus' Rags: permanent +0.5 dmg per death-respawn this
+       run (applied in recalc; accumulates if he gains more lives). */
+    float lazarus_dmg_bonus;
 } Player;
+
+/* ---------- R8 (M8) friendly blue flies (Guppy / Guppy's Head) ---------- */
+#define MAX_BLUE_FLIES 6
+typedef struct {
+    float x, y;
+    int   active;
+    int   anim;       /* wobble/orbit phase counter */
+} BlueFly;
 
 /* ---------- Blood Decal (permanent floor stain, persists per room) ---------- */
 #define MAX_BLOOD_DECALS 24
@@ -988,6 +1046,18 @@ typedef struct {
        out (key pieces are consumed on first open). */
     int   mega_created;
     int   mega_gx, mega_gy;
+    /* R8 (M8): friendly blue fly pool (Guppy tears / Guppy's Head active).
+       Zero-state valid; persists across rooms (flies chase the player until
+       they find a target); memset by start_new_game. */
+    BlueFly blue_flies[MAX_BLUE_FLIES];
+    /* R10 (C4): last-seen total HP pool (red+soul+black). Eve's Whore of
+       Babylon and Samson's Bloody Lust are hp-conditional stats computed in
+       recalc_player_stats; the STATE_PLAYING update compares this cache each
+       frame and recalcs on any change (a decrease = a hit for Samson). */
+    int   prev_hp_total;
+    /* R10 (C4): latch so a game over increments the lifetime death counter
+       exactly once (zeroed by start_new_game's memset). */
+    int   death_counted;
 } Game;
 
 /* ---------- Function Declarations ---------- */

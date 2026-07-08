@@ -61,11 +61,20 @@ static void familiars_reset_trail(Game *g);
 static void familiar_pos(Game *g, int slot, float *fx, float *fy);
 /* Warp path (E7 Teleport! uses it from the active-item switch) */
 static void do_warp_cleanup(Game *g);
+/* R10 (C4): devil-deal purchases feed the Azazel unlock counter */
+static int apply_unlock_gates(void);
 /* R8 (M3): golden-door Mega Satan room (defined after drain_black_burst) */
 static void open_mega_satan_room(Game *g);
 /* Parameterized explosion core (bombs, Epic Fetus, Ipecac tears) */
 static void bomb_explode_ex(Game *g, float bx, float by, float blast,
                             float enemy_dmg, float boss_dmg, int player_dmg);
+/* R8 (M5): red chest opens from the pickup switch inside player_update,
+ * which sits before these definitions */
+static Enemy *alloc_dynamic_enemy(Room *r);
+static int  spawn_troll_bomb(Game *g, float x, float y);
+static void drain_black_burst(Game *g);
+/* R8 (M8): blue flies are summoned from the pickup/active paths too */
+static void spawn_blue_fly(Game *g, float x, float y);
 
 /* Global config (loaded from SD card on startup) */
 static GameConfig g_config;
@@ -387,6 +396,13 @@ void init_item_pool(void) {
         "My X-mas present");
     DEF(ITEM_HEAD_OF_KRAMPUS, "Head of Krampus", 0.0f,  0.0f,  0.0f,  0.0f,  0, ITEM_FLAG_ACTIVE,
         "Active: 4-way brimstone");
+    /* --- R8 (M8) Guppy set — normal pool (NOT excluded) --- */
+    DEF(ITEM_GUPPYS_PAW,      "Guppy's Paw",     0.0f,  0.0f,  0.0f,  0.0f,  0, 0,
+        "Soul hearts... and whiskers?");
+    DEF(ITEM_GUPPYS_HEAD,     "Guppy's Head",    0.0f,  0.0f,  0.0f,  0.0f,  0, ITEM_FLAG_ACTIVE,
+        "Active: summon blue flies");
+    DEF(ITEM_GUPPYS_TAIL,     "Guppy's Tail",    0.0f,  0.0f,  0.0f,  0.0f,  0, 0,
+        "Luck up... and a tail?");
     #undef DEF
 }
 
@@ -812,6 +828,20 @@ void recalc_player_stats(Player *p) {
             p->stats.max_hp = 4;          /* 2 red heart containers (safe option) */
             p->stats.damage *= 1.1f;
             break;
+        /* --- R10 (C4) characters --- */
+        case CHAR_AZAZEL:
+            p->stats.max_hp = 4;          /* 2 red containers (+1 black heart at start) */
+            p->stats.damage *= 1.3f;      /* +0.3 dmg */
+            p->stats.speed  *= 1.05f;     /* +0.1 speed-ish */
+            break;
+        case CHAR_LAZARUS:
+            /* Normal Isaac stats, 3 red containers; his edge is the extra
+               life + the permanent rags bonus added below. */
+            break;
+        case CHAR_LOST:
+            /* No health at all — max_hp forced to 0 after the clamps below.
+               Flight/spectral/mantle granted as innate flags. */
+            break;
         case CHAR_ISAAC:
         default:
             break;
@@ -828,6 +858,7 @@ void recalc_player_stats(Player *p) {
         p->stats.max_hp    += def->hp_bonus;
         p->stats.flags     |= def->flags;
         if (def->type == ITEM_LUCKY_FOOT) p->stats.luck += 1.0f;
+        if (def->type == ITEM_GUPPYS_TAIL) p->stats.luck += 1.0f;  /* R8 (M8) */
         if (def->type == ITEM_DEAD_CAT)   p->stats.max_hp = 2;  /* Dead Cat: max HP = 1 heart */
     }
 
@@ -879,6 +910,50 @@ void recalc_player_stats(Player *p) {
     /* Book of Belial active damage buff */
     if (p->book_belial_dmg_timer > 0) p->stats.damage += 1.5f;
 
+    /* R8 (M6): tarot temp buffs (Empress/Strength/Devil dmg; Empress/Chariot
+       speed). Bonus amounts are zeroed when their timer expires. */
+    if (p->card_dmg_timer > 0) p->stats.damage += p->card_dmg_bonus;
+    if (p->card_spd_timer > 0) p->stats.speed  += p->card_spd_bonus;
+
+    /* R8 (M8) transformations */
+    if (p->guppy_active)  p->stats.flags |= ITEM_FLAG_FLIGHT;
+    if (p->funguy_active) p->stats.max_hp += 2;   /* FUN GUY: +1 container */
+
+    /* --- R10 (C4) innate character abilities (flags can't be lost) --- */
+    if (p->character == CHAR_AZAZEL) {
+        /* Flight + short-range Brimstone (beam clamped in laser_update
+           unless the real Brimstone item is also held). The item carries
+           a -2.0 fire-rate penalty Azazel doesn't get; without any brake
+           his beam cadence would be absurd — apply a milder -1.0 innate
+           penalty (his beam is short, so he recharges faster than the
+           real item but slower than tears). */
+        p->stats.flags |= ITEM_FLAG_FLIGHT | ITEM_FLAG_BRIMSTONE;
+        if (!player_has_item(p, ITEM_BRIMSTONE))
+            p->stats.fire_rate -= 1.0f;
+    }
+    if (p->character == CHAR_LOST) {
+        /* Flight, spectral tears, and an unlosable Holy Mantle (the
+           per-room re-arm keys off ITEM_FLAG_MANTLE). */
+        p->stats.flags |= ITEM_FLAG_FLIGHT | ITEM_FLAG_SPECTRAL
+                        | ITEM_FLAG_MANTLE;
+    }
+    /* Eve — Whore of Babylon: at <= 1 full red heart (hp is in half-heart
+       units) she turns on. Recalc is re-run on any HP-pool change by the
+       STATE_PLAYING update (prev_hp_total watcher). */
+    if (p->character == CHAR_EVE && p->hp <= 2) {
+        p->stats.damage += 1.2f;
+        p->stats.speed  += 0.2f;
+    }
+    /* Samson — Bloody Lust: +0.15 dmg per hit taken this room, cap +1.0.
+       samson_hits resets on every room change. */
+    if (p->character == CHAR_SAMSON && p->samson_hits > 0) {
+        float bl = p->samson_hits * 0.15f;
+        if (bl > 1.0f) bl = 1.0f;
+        p->stats.damage += bl;
+    }
+    /* Lazarus' Rags: permanent per-run bonus from death-respawns */
+    p->stats.damage += p->lazarus_dmg_bonus;
+
     /* Persistent pill stat bonuses (preserved across item pickups) */
     p->stats.speed     += p->pill_speed_bonus;
     p->stats.fire_rate += p->pill_fire_rate_bonus;
@@ -916,6 +991,12 @@ void recalc_player_stats(Player *p) {
         p->stats.speed *= 1.4f;
         if (p->stats.speed > 4.5f) p->stats.speed = 4.5f;
     }
+
+    /* R10 (C4) The Lost: NO health, ever — overrides the min-2 clamp,
+       every hp_bonus item, pills and challenges. Death path is safe: the
+       game only checks player_check_death after a damage event, and the
+       Holy Mantle flag above absorbs the first hit of each room. */
+    if (p->character == CHAR_LOST) p->stats.max_hp = 0;
 }
 
 /* E5: number of fully-depleted black hearts awaiting their room-wide 40dmg
@@ -959,9 +1040,52 @@ static int player_check_death(Player *p) {
     if (p->lives > 0) {
         p->lives--;
         p->hp = p->stats.max_hp;
+        /* R10 (C4) Lazarus: each death-respawn leaves him angrier —
+           permanent +0.5 dmg for the rest of the run (Lazarus' Rags). */
+        if (p->character == CHAR_LAZARUS) {
+            p->lazarus_dmg_bonus += 0.5f;
+            recalc_player_stats(p);
+        }
         return 0;
     }
     return 1;
+}
+
+/* R8 (M8) transformations: called on every SUCCESSFUL item grant (both the
+ * active-slot and passive paths). Counts set pieces and fires the banner +
+ * stat recalc when a transformation completes. Per-run counters on Player.
+ *  - GUPPY: 3+ of {Dead Cat, Guppy's Paw, Guppy's Head, Guppy's Tail} ->
+ *    flight (ITEM_FLAG_FLIGHT via recalc) + tears spawn friendly blue flies.
+ *  - FUN GUY: all 3 mushrooms {Magic Mushroom, Odd Mushroom, Blue Cap} ->
+ *    +1 heart container (recalc adds it while funguy_active), healed full. */
+static void check_transformations(Game *g, ItemType item) {
+    Player *p = &g->player;
+    if (item == ITEM_DEAD_CAT || item == ITEM_GUPPYS_PAW ||
+        item == ITEM_GUPPYS_HEAD || item == ITEM_GUPPYS_TAIL) {
+        p->guppy_count++;
+        if (p->guppy_count >= 3 && !p->guppy_active) {
+            p->guppy_active = 1;
+            recalc_player_stats(p);
+            snprintf(g->pickup_msg_text, sizeof(g->pickup_msg_text),
+                     "GUPPY! You are what you eat");
+            g->pickup_msg_timer = 240;
+            audio_play(SFX_PICKUP);
+        }
+    }
+    if (item == ITEM_MAGIC_MUSH || item == ITEM_ODD_MUSHROOM ||
+        item == ITEM_BLUE_CAP) {
+        p->funguy_count++;
+        if (p->funguy_count >= 3 && !p->funguy_active) {
+            p->funguy_active = 1;
+            recalc_player_stats(p);   /* +2 max HP while funguy_active */
+            p->hp += 2;
+            if (p->hp > p->stats.max_hp) p->hp = p->stats.max_hp;
+            snprintf(g->pickup_msg_text, sizeof(g->pickup_msg_text),
+                     "FUN GUY! +1 heart container");
+            g->pickup_msg_timer = 240;
+            audio_play(SFX_PICKUP);
+        }
+    }
 }
 
 /* Returns 1 if the item was actually granted, 0 if refused (passive-item
@@ -986,6 +1110,8 @@ int collect_item(Game *g, ItemType item) {
         case ITEM_BIBLE:          p->active_max_charge = 6; break;
         /* R8 (M7) */
         case ITEM_HEAD_OF_KRAMPUS: p->active_max_charge = 4; break;
+        /* R8 (M8) */
+        case ITEM_GUPPYS_HEAD:    p->active_max_charge = 2; break;
         default:                  p->active_max_charge = 2; break;
         }
         p->active_charge = p->active_max_charge;  /* start fully charged */
@@ -997,6 +1123,8 @@ int collect_item(Game *g, ItemType item) {
                      def->description ? def->description : "");
             g->pickup_msg_timer = 180;
         }
+        /* R8 (M8): actives count toward transformations too (Guppy's Head) */
+        check_transformations(g, item);
         return 1;
     }
 
@@ -1033,6 +1161,11 @@ int collect_item(Game *g, ItemType item) {
         p->soul_hp += 4;
         if (p->soul_hp > 12) p->soul_hp = 12;
     }
+    /* R8 (M8) Guppy's Paw: +2 soul hearts on pickup (Squeezy-style) */
+    if (item == ITEM_GUPPYS_PAW) {
+        p->soul_hp += 4;
+        if (p->soul_hp > 12) p->soul_hp = 12;
+    }
     /* E6 familiars: occupy the first free follower slot. A 3rd familiar
        with both slots full converts into +2 soul hearts (like Squeezy)
        so the pickup is never a silent no-op; the item stays recorded. */
@@ -1045,6 +1178,9 @@ int collect_item(Game *g, ItemType item) {
             if (p->soul_hp > 12) p->soul_hp = 12;
         }
     }
+    /* R8 (M8): transformation progress (may overwrite the pickup message
+       with the GUPPY!/FUN GUY! banner — intentional, the banner wins) */
+    check_transformations(g, item);
     return 1;
 }
 
@@ -1610,6 +1746,8 @@ void spawn_consumable(Room *r, float x, float y, PickupType type) {
             c->type = type;
             c->active = 1;
             c->anim_timer = randi(0, 60);
+            c->sub_type = 0;   /* R8 (M5): stale sub_type from a reused slot
+                                  must not mark a fresh red chest "opened" */
             r->consumable_count++;
             return;
         }
@@ -2069,8 +2207,12 @@ void room_spawn_enemies(Game *g, Room *r) {
         r->pedestal.y = (ROOM_TOP + ROOM_BOTTOM) / 2.0f;
         r->pedestal.item = pick_random_item(g);
         r->pedestal.active = (g->challenge != 6);
-        /* Also spawn some pickups */
-        spawn_consumable(r, ROOM_LEFT + 60, ROOM_TOP + 60, PICKUP_COIN5);
+        /* R8 (M5): curse rooms stock 1-2 red chests (replacing the old
+           coin nickel — risk room, risk loot) plus the key. */
+        spawn_consumable(r, ROOM_LEFT + 60, ROOM_TOP + 60, PICKUP_CHEST_RED);
+        if (randi(0, 1))
+            spawn_consumable(r, ROOM_LEFT + 60, ROOM_BOTTOM - 50,
+                             PICKUP_CHEST_RED);
         spawn_consumable(r, ROOM_RIGHT - 60, ROOM_TOP + 60, PICKUP_KEY);
         return;
     }
@@ -2551,11 +2693,15 @@ void start_new_game(Game *g) {
 
     /* Set HP to max for character */
     g->player.hp = g->player.stats.max_hp;
-    if (g->difficulty == DIFF_EASY) {
+    /* R10 (C4): The Lost never gains health — easy mode must not smuggle
+       him 2 hp (that would break his whole identity). */
+    if (g->difficulty == DIFF_EASY && g->player.character != CHAR_LOST) {
         g->player.hp += 2;
         if (g->player.hp > PLAYER_MAX_HP_CAP) g->player.hp = PLAYER_MAX_HP_CAP;
         if (g->player.hp > g->player.stats.max_hp) g->player.stats.max_hp = g->player.hp;
     }
+    /* R10 (C4): seed the hp-conditional stat watcher (Eve/Samson) */
+    g->prev_hp_total = g->player.hp + g->player.soul_hp + g->player.black_hp;
 
     /* Randomize pill color->effect mapping for this run */
     for (int i = 0; i < PILL_EFFECT_COUNT; i++) g->pill_color_map[i] = i;
@@ -2635,6 +2781,21 @@ void apply_character_start(Game *g) {
              * 0-red-heart edge cases in HUD/heal code) */
             p->soul_hp = 8;   /* soul_hp is in half-heart units: 4 hearts = 8 */
             break;
+        /* --- R10 (C4) characters --- */
+        case CHAR_AZAZEL:
+            /* 2 red containers (recalc) + 1 black heart. Isaac-authentic is
+               3 black / 0 red, but this demake's healing economy is red-
+               heart-centric — 0 red containers would be Lost-tier brutal. */
+            p->black_hp = 2;  /* black_hp is in half-heart units */
+            break;
+        case CHAR_LAZARUS:
+            p->lives = 1;     /* one free resurrection (Lazarus rises) */
+            break;
+        case CHAR_LOST:
+            /* Arm the innate Holy Mantle for the starting room (recalc's
+               ITEM_FLAG_MANTLE handles every later room entry). */
+            p->holy_mantle_active = 1;
+            break;
         case CHAR_ISAAC:
         default:
             break;
@@ -2682,6 +2843,12 @@ void advance_floor(Game *g) {
 
 static void finish_floor_transition(Game *g) {
     g->state = STATE_PLAYING;
+
+    /* R10 (C4) Samson: new floor = new room — Bloody Lust stacks reset */
+    if (g->player.samson_hits) {
+        g->player.samson_hits = 0;
+        recalc_player_stats(&g->player);
+    }
 
     /* Roll a possible curse for this floor (30% chance). Rolled before
      * dungeon_generate so Curse of the Labyrinth can influence layout size. */
@@ -2756,7 +2923,10 @@ static void finish_floor_transition(Game *g) {
  * ================================================================ */
 
 /* Check if a circle at (x,y) with given radius overlaps any obstacle in the room */
-static int player_blocked_at(Room *r, float x, float y) {
+/* R8 (M8): flight (Guppy) skips rocks/poop — walls always block, and the
+ * interactive props (slot machine, angel statue) stay solid so they can't
+ * be flown through and forgotten. */
+static int player_blocked_at(Room *r, float x, float y, int flight) {
     if (x < ROOM_LEFT + PLAYER_SIZE) return 1;
     if (x > ROOM_RIGHT - PLAYER_SIZE) return 1;
     if (y < ROOM_TOP + PLAYER_SIZE) return 1;
@@ -2765,6 +2935,8 @@ static int player_blocked_at(Room *r, float x, float y) {
         Obstacle *o = &r->obstacles[i];
         if (!o->active) continue;
         if (o->type == OBST_SPIKES) continue;   /* spikes never block movement */
+        if (flight && (o->type == OBST_ROCK || o->type == OBST_POOP))
+            continue;                           /* Guppy flies over these */
         float ox = x - o->x, oy = y - o->y;
         float md = PLAYER_SIZE + OBSTACLE_SIZE * 0.5f;
         if (ox * ox + oy * oy < md * md) return 1;
@@ -2877,9 +3049,12 @@ void player_update(Game *g, u32 kHeld, circlePosition circlePos) {
      * ══════════════════════════════════════════════════════════ */
     Room *r = current_room(g);
 
+    /* R8 (M8): Guppy flight passes over rocks/poop */
+    int flight = (p->stats.flags & ITEM_FLAG_FLIGHT) != 0;
+
     /* Try X movement */
     float nx = p->x + p->vx;
-    if (!player_blocked_at(r, nx, p->y)) {
+    if (!player_blocked_at(r, nx, p->y, flight)) {
         p->x = nx;
     } else {
         /* Slide along wall: zero only the blocked axis */
@@ -2888,7 +3063,7 @@ void player_update(Game *g, u32 kHeld, circlePosition circlePos) {
 
     /* Try Y movement */
     float ny = p->y + p->vy;
-    if (!player_blocked_at(r, p->x, ny)) {
+    if (!player_blocked_at(r, p->x, ny, flight)) {
         p->y = ny;
     } else {
         p->vy = 0.0f;
@@ -2950,8 +3125,9 @@ void player_update(Game *g, u32 kHeld, circlePosition circlePos) {
         if (hdx * hdx + hdy * hdy < (PLAYER_SIZE + 8) * (PLAYER_SIZE + 8)) {
             if (h->type == HEART_SOUL) {
                 /* Soul heart: bonus HP consumed before red hearts.
-                   (Gain path was missing — soul hearts previously healed 0.) */
-                if (p->soul_hp < 12) {   /* cap at 6 blue hearts */
+                   (Gain path was missing — soul hearts previously healed 0.)
+                   R10 (C4): The Lost can hold NO health of any color. */
+                if (p->character != CHAR_LOST && p->soul_hp < 12) {   /* cap at 6 blue hearts */
                     p->soul_hp += 2;
                     if (p->soul_hp > 12) p->soul_hp = 12;
                     h->active = 0;
@@ -2960,8 +3136,9 @@ void player_update(Game *g, u32 kHeld, circlePosition circlePos) {
                 }
             } else if (h->type == HEART_BLACK) {
                 /* E5 black heart: absorbs like a soul heart but BEFORE soul
-                   hearts; depleting one nukes the room. Refused at cap. */
-                if (p->black_hp < 12) {  /* cap at 6 black hearts */
+                   hearts; depleting one nukes the room. Refused at cap
+                   (and by The Lost, who can hold no health — R10 C4). */
+                if (p->character != CHAR_LOST && p->black_hp < 12) {  /* cap at 6 black hearts */
                     p->black_hp += 2;
                     if (p->black_hp > 12) p->black_hp = 12;
                     h->active = 0;
@@ -2991,6 +3168,7 @@ void player_update(Game *g, u32 kHeld, circlePosition circlePos) {
         float cdy = p->y - c->y;
         if (cdx * cdx + cdy * cdy < CONSUMABLE_PICKUP_DIST * CONSUMABLE_PICKUP_DIST) {
             int picked_up = 1;
+            int warped = 0;   /* R8 (M5): red chest devil warp mid-loop */
             switch (c->type) {
             case PICKUP_BOMB:   p->bombs += 1; break;
             case PICKUP_BOMB2:  p->bombs += 2; break;
@@ -3085,6 +3263,85 @@ void player_update(Game *g, u32 kHeld, circlePosition circlePos) {
                     }
                 }
                 break;
+            case PICKUP_CHEST_RED: {
+                /* R8 (M5): free to open (walk over). Weighted risk/reward
+                   roll; the opened husk stays visible (sub_type = 1). */
+                if (c->sub_type == 1) { picked_up = 0; break; }
+                c->sub_type = 1;
+                picked_up = 0;   /* husk persists — skip despawn bookkeeping */
+                audio_play(SFX_PICKUP);
+                spawn_tear_pop(g, c->x, c->y, 0);
+                int rroll = randi(0, 99);
+                if (rroll < 35) {
+                    /* 35%: 1-3 spider ambush (dynamic spawn with grace) */
+                    const FloorInfo *cfi = get_floor_info(g->current_floor);
+                    int sn = randi(1, 3);
+                    for (int si3 = 0; si3 < sn; si3++) {
+                        Enemy *se = alloc_dynamic_enemy(r);
+                        if (!se) break;
+                        se->type = ENEMY_SPIDER;
+                        se->x = c->x + randf(-16, 16);
+                        se->y = c->y + randf(-12, 12);
+                        se->hp = 3 + cfi->enemy_hp_bonus;
+                        se->max_hp = se->hp;
+                        se->timer = randi(10, 30);
+                        se->dx = randf(-2.0f, 2.0f) * cfi->enemy_speed_mult;
+                        se->dy = randf(-2.0f, 2.0f) * cfi->enemy_speed_mult;
+                    }
+                    r->cleared = 0;   /* a real ambush — fight it out */
+                    trigger_shake(g, 2.0f, 10);
+                } else if (rroll < 55) {
+                    /* 20%: troll bomb */
+                    spawn_troll_bomb(g, c->x + randf(-8, 8),
+                                     c->y + randf(-6, 6));
+                } else if (rroll < 70) {
+                    /* 15%: black heart */
+                    spawn_heart(r, c->x, c->y - 18, HEART_BLACK);
+                } else if (rroll < 85) {
+                    /* 15%: 2-4 coins */
+                    int cn2 = randi(2, 4);
+                    for (int ci3 = 0; ci3 < cn2; ci3++)
+                        spawn_consumable(r, c->x + randf(-22, 22),
+                                         c->y + randf(-16, 16), PICKUP_COIN);
+                } else if (rroll < 95) {
+                    /* 10%: devil-pool item pedestal (rooms own ONE pedestal
+                       slot — if it's taken, pay out a nickel instead) */
+                    if (!r->pedestal.active) {
+                        r->pedestal.x = c->x;
+                        r->pedestal.y = clampf(c->y - 26,
+                                               ROOM_TOP + 24, ROOM_BOTTOM - 24);
+                        r->pedestal.item =
+                            (!player_has_item(p, ITEM_THE_PACT) &&
+                             randi(0, 99) < 40)
+                                ? ITEM_THE_PACT : pick_random_item(g);
+                        r->pedestal.active = (g->challenge != 6); /* Purist */
+                    } else {
+                        spawn_consumable(r, c->x, c->y - 16, PICKUP_COIN5);
+                    }
+                } else {
+                    /* 5%: teleport to this floor's devil room. Devil rooms
+                       are created lazily post-boss, so one may not exist —
+                       fallback is a black heart (flagged design choice;
+                       creating a devil room from here would need a free
+                       adjacent grid cell + door surgery). */
+                    int dfound = 0;
+                    for (int dy2 = 0; dy2 < DUNGEON_H && !dfound; dy2++) {
+                        for (int dx2 = 0; dx2 < DUNGEON_W && !dfound; dx2++) {
+                            if (g->dungeon.rooms[dy2][dx2].type == ROOM_DEVIL) {
+                                drain_black_burst(g);
+                                g->dungeon.cur_x = dx2;
+                                g->dungeon.cur_y = dy2;
+                                do_warp_cleanup(g);
+                                dfound = 1;
+                                warped = 1;
+                            }
+                        }
+                    }
+                    if (!dfound)
+                        spawn_heart(r, c->x, c->y - 18, HEART_BLACK);
+                }
+                break;
+            }
             default: break;
             }
             if (p->coins > 99) p->coins = 99;
@@ -3095,6 +3352,10 @@ void player_update(Game *g, u32 kHeld, circlePosition circlePos) {
                 r->consumable_count--;
                 audio_play(SFX_PICKUP);
             }
+            /* R8 (M5): the red chest warped us to another room — every
+               pointer into the old room is stale; stop this frame's
+               collision pass here. */
+            if (warped) return;
         }
     }
 
@@ -3114,13 +3375,35 @@ void player_update(Game *g, u32 kHeld, circlePosition circlePos) {
                 if (r->type == ROOM_DEVIL) {
                     /* Devil deal: pay with heart containers (permanent) */
                     int hpCost = si->cost * 2;
-                    if (player_has_item(p, ITEM_DEAD_CAT)) {
+                    if (p->character == CHAR_LOST) {
+                        /* R10 (C4) The Lost: devil deals are FREE — he has
+                           no health to pay with. Covers both the heart-
+                           container and Dead-Cat-lives payment branches. */
+                        if (collect_item(g, si->item)) {
+                            g->took_devil_deal = 1;
+                            g_config.devil_deals_taken++;
+                            apply_unlock_gates();
+                            config_save(&g_config);
+                            g->last_pickup = si->item;
+                            g->pickup_flash = PICKUP_FLASH_FRAMES;
+                            p->pickup_anim = 40;
+                            si->active = 0;
+                            g->score += 66;
+                            audio_play(SFX_PICKUP);
+                        } else if (g->shop_deny_timer <= 0) {
+                            audio_play(SFX_HURT);
+                            g->shop_deny_timer = 30;
+                        }
+                    } else if (player_has_item(p, ITEM_DEAD_CAT)) {
                         /* Dead Cat floors max_hp to 2, so heart-container payment
                            is impossible. Pay a spare life per heart of cost. */
                         int lifeCost = si->cost;
                         if (p->lives >= lifeCost && collect_item(g, si->item)) {
                             p->lives -= lifeCost;
                             g->took_devil_deal = 1;  /* R8: angels stop appearing */
+                            g_config.devil_deals_taken++;   /* R10 (C4) Azazel gate */
+                            apply_unlock_gates();
+                            config_save(&g_config);
                             g->last_pickup = si->item;
                             g->pickup_flash = PICKUP_FLASH_FRAMES;
                             p->pickup_anim = 40;
@@ -3149,6 +3432,9 @@ void player_update(Game *g, u32 kHeld, circlePosition circlePos) {
                         recalc_player_stats(p);
                         if (p->hp > p->stats.max_hp) p->hp = p->stats.max_hp;
                         g->took_devil_deal = 1;  /* R8: angels stop appearing */
+                        g_config.devil_deals_taken++;   /* R10 (C4) Azazel gate */
+                        apply_unlock_gates();
+                        config_save(&g_config);
                         g->last_pickup = si->item;
                         g->pickup_flash = PICKUP_FLASH_FRAMES;
                         p->pickup_anim = 40;
@@ -3593,6 +3879,104 @@ static void familiars_try_fire(Game *g, Direction dir) {
         spawn_familiar_tear(g, fx, fy, dx, dy,
                             p->familiar[i] == ITEM_GHOST_BABY);
         g->fam_cd[i] = get_tear_cooldown(p) * 2;
+    }
+}
+
+/* ================================================================
+ * R8 (M8): friendly blue flies (Guppy transformation / Guppy's Head)
+ *
+ * Implementation choice: a small dedicated pool on Game rather than
+ * friendly-flagged entries in the room's Enemy array — the enemy array
+ * is room-owned and every tear/contact/AI path assumes hostility, so a
+ * separate 6-slot pool is the least invasive robust option. Flies seek
+ * the nearest enemy, deal 2 contact damage and die on the hit (classic
+ * Isaac blue-fly behaviour); with no target they orbit the player.
+ * ================================================================ */
+static int kill_enemy(Game *g, Room *r, Enemy *e);   /* defined below */
+
+static void spawn_blue_fly(Game *g, float x, float y) {
+    for (int i = 0; i < MAX_BLUE_FLIES; i++) {
+        BlueFly *f = &g->blue_flies[i];
+        if (f->active) continue;
+        f->x = x;
+        f->y = y;
+        f->anim = i * 17;    /* deterministic phase offset per slot */
+        f->active = 1;
+        return;
+    }
+}
+
+static void blue_flies_update(Game *g) {
+    Room *r = current_room(g);
+    if (!r) return;
+    Player *p = &g->player;
+    for (int i = 0; i < MAX_BLUE_FLIES; i++) {
+        BlueFly *f = &g->blue_flies[i];
+        if (!f->active) continue;
+        f->anim++;
+
+        /* Nearest live, targetable enemy in the current room */
+        Enemy *best = NULL;
+        float bestD2 = 1e12f;
+        for (int j = 0; j < r->enemy_count; j++) {
+            Enemy *e = &r->enemies[j];
+            if (!e->active || e->hidden) continue;
+            float dx = e->x - f->x, dy = e->y - f->y;
+            float d2 = dx * dx + dy * dy;
+            if (d2 < bestD2) { bestD2 = d2; best = e; }
+        }
+
+        if (best) {
+            float dx = best->x - f->x, dy = best->y - f->y;
+            float dm = sqrtf(dx * dx + dy * dy);
+            float esz = is_boss_type(best->type) ? ENEMY_SIZE * 2 : ENEMY_SIZE;
+            if (dm < esz + 4.0f) {
+                /* Bite: 2 damage, then the fly is spent */
+                best->hp -= 2.0f;
+                best->flash = 14;
+                audio_play(SFX_HIT);
+                spawn_blood_splatter(g, f->x, f->y, dx, dy, 0);
+                if (best->hp <= 0) kill_enemy(g, r, best);
+                f->active = 0;
+                continue;
+            }
+            /* Seek with a light deterministic wobble */
+            float spd = 1.7f;
+            f->x += (dx / dm) * spd + sinf((float)f->anim * 0.31f) * 0.4f;
+            f->y += (dy / dm) * spd + cosf((float)f->anim * 0.27f) * 0.4f;
+        } else {
+            /* No target: lazy orbit around the player */
+            float ang = (float)f->anim * 0.05f + (float)i * 1.047f;
+            float tx = p->x + cosf(ang) * 26.0f;
+            float ty = p->y + sinf(ang) * 18.0f;
+            f->x += (tx - f->x) * 0.12f;
+            f->y += (ty - f->y) * 0.12f;
+        }
+        /* Keep inside the room */
+        f->x = clampf(f->x, ROOM_LEFT + 4, ROOM_RIGHT - 4);
+        f->y = clampf(f->y, ROOM_TOP + 4, ROOM_BOTTOM - 4);
+    }
+}
+
+/* Procedural blue fly: shadow, dark body with a blue sheen, wing flicker */
+static void render_blue_flies(Game *g) {
+    for (int i = 0; i < MAX_BLUE_FLIES; i++) {
+        BlueFly *f = &g->blue_flies[i];
+        if (!f->active) continue;
+        float bobf = sinf((float)f->anim * 0.2f) * 1.5f;
+        float fy = f->y + bobf;
+        /* grounding shadow */
+        C2D_DrawEllipseSolid(f->x - 3, f->y + 5, 0, 6, 2,
+                             C2D_Color32(0, 0, 0, 60));
+        /* wings (deterministic flicker from the anim counter) */
+        int wing = (f->anim / 3) % 2;
+        u32 wcol = C2D_Color32(220, 230, 245, 160);
+        C2D_DrawEllipseSolid(f->x - 6, fy - 4 - wing, 0, 5, 3, wcol);
+        C2D_DrawEllipseSolid(f->x + 1, fy - 4 + wing, 0, 5, 3, wcol);
+        /* body: dark with a blue sheen */
+        C2D_DrawCircleSolid(f->x, fy, 0, 3.5f, C2D_Color32(30, 34, 60, 255));
+        C2D_DrawCircleSolid(f->x - 1, fy - 1, 0, 1.5f,
+                            C2D_Color32(90, 130, 230, 255));
     }
 }
 
@@ -4481,6 +4865,9 @@ const char *character_unlock_name(int char_idx) {
         case 4: return "EVE";
         case 5: return "SAMSON";
         case 6: return "???";      /* Blue Baby */
+        case 7: return "AZAZEL";
+        case 8: return "LAZARUS";
+        case 9: return "THE LOST";
         default: return "?";
     }
 }
@@ -4497,6 +4884,13 @@ static int apply_unlock_gates(void) {
     if (g_config.characters_completed & 0x08) g_config.unlocked_chars |= 0x10; /* Eve */
     if (g_config.characters_completed & 0x10) g_config.unlocked_chars |= 0x20; /* Samson */
     if (g_config.characters_completed & 0x20) g_config.unlocked_chars |= 0x40; /* Blue Baby */
+    /* R10 (C4) gates: Azazel = 3 lifetime devil deals; Lazarus = die 10
+       times lifetime; The Lost = Mega Satan defeated once (bit 16 of
+       bosses_defeated: ENEMY_BOSS_MEGA_SATAN - ENEMY_BOSS_DUKE == 16).
+       All retroactive via the load-time call in main(). */
+    if (g_config.devil_deals_taken >= 3)      g_config.unlocked_chars |= 0x80;  /* Azazel */
+    if (g_config.total_deaths >= 10)          g_config.unlocked_chars |= 0x100; /* Lazarus */
+    if (g_config.bosses_defeated & (1 << 16)) g_config.unlocked_chars |= 0x200; /* The Lost */
     return g_config.unlocked_chars != before;
 }
 
@@ -5149,6 +5543,15 @@ static void laser_update(Game *g) {
     else if (g->laser_dx < 0) ex = ROOM_LEFT;
     else if (g->laser_dy > 0) ey = ROOM_BOTTOM;
     else                      ey = ROOM_TOP;
+
+    /* R10 (C4) Azazel: his innate Brimstone is SHORT-RANGE — clamp the
+       beam to ~55% of the wall distance unless the real Brimstone item
+       was picked up (which restores the full-length beam). */
+    if (!g->laser_is_tech && p->character == CHAR_AZAZEL &&
+        !player_has_item(p, ITEM_BRIMSTONE)) {
+        ex = ox + (ex - ox) * 0.55f;
+        ey = oy + (ey - oy) * 0.55f;
+    }
 
     /* D7 Brimstone + Spoon Bender/Sacred Heart (synergy grants HOMING in
        recalc_player_stats): bend the far endpoint toward the closest enemy
@@ -8759,6 +9162,11 @@ void collisions_update(Game *g) {
                 e->flash = 14;
                 audio_play(SFX_HIT);
 
+                /* R8 (M8) GUPPY: 33% of player tear hits birth a friendly
+                   blue fly at the impact point (spawn_blue_fly caps at 6) */
+                if (!t->is_enemy && p->guppy_active && randi(0, 99) < 33)
+                    spawn_blue_fly(g, t->x, t->y);
+
                 /* Spawn blood splatter at impact point */
                 spawn_blood_splatter(g, t->x, t->y, t->dx, t->dy, 1);
                 /* Game-feel: also play the blue tear splash on impact */
@@ -8908,9 +9316,19 @@ void collisions_update(Game *g) {
        roll a reward (heart / consumable / small chance at a pedestal item).
        Bounded to a single use per room (arcade_slot_used persists across
        re-entries), mirroring the shop's shop_deny_timer cooldown for the
-       "can't afford" feedback. */
-    if (r->type == ROOM_ARCADE && g->state == STATE_PLAYING) {
-        if (g->shop_deny_timer > 0) g->shop_deny_timer--;
+       "can't afford" feedback.
+       R8 (M6): un-gated from ROOM_ARCADE — Wheel of Fortune can spawn a
+       slot machine in ANY room, so the interaction keys off the obstacle
+       itself (the loop below only touches OBST_SLOT_MACHINE). */
+    {
+        int room_has_slot = (r->type == ROOM_ARCADE);
+        for (int i = 0; i < r->obstacle_count && !room_has_slot; i++)
+            if (r->obstacles[i].active &&
+                r->obstacles[i].type == OBST_SLOT_MACHINE)
+                room_has_slot = 1;
+    if (room_has_slot && g->state == STATE_PLAYING) {
+        if (r->type == ROOM_ARCADE && g->shop_deny_timer > 0)
+            g->shop_deny_timer--;
         for (int i = 0; i < r->obstacle_count; i++) {
             Obstacle *o = &r->obstacles[i];
             if (!o->active || o->type != OBST_SLOT_MACHINE) continue;
@@ -8943,6 +9361,7 @@ void collisions_update(Game *g) {
             break;
         }
     }
+    }   /* end R8 (M6) room_has_slot scope */
 
     /* Check room cleared. Boss Rush is excluded: its own wave controller
        (in enemies_update) owns clearing it, else it self-clears on frame 1
@@ -9126,6 +9545,12 @@ void collisions_update(Game *g) {
                             /* E5: devil rooms offer a free black heart */
                             spawn_heart(dr, (ROOM_LEFT + ROOM_RIGHT) / 2.0f,
                                         ROOM_BOTTOM - 40, HEART_BLACK);
+                            /* R8 (M5): ~8% of devil rooms also hold a red
+                               chest in the corner */
+                            if (randi(0, 99) < 8)
+                                spawn_consumable(dr, ROOM_LEFT + 50,
+                                                 ROOM_BOTTOM - 44,
+                                                 PICKUP_CHEST_RED);
                         }
                         dd2->room_count++;
                         audio_play(SFX_DOOR);   /* something opened... */
@@ -9439,6 +9864,11 @@ void do_room_transition(Game *g, Direction dir) {
 
     /* Re-activate Holy Mantle shield on every new room entry */
     if (g->player.stats.flags & ITEM_FLAG_MANTLE) g->player.holy_mantle_active = 1;
+    /* R10 (C4) Samson: Bloody Lust stacks reset on room change */
+    if (g->player.samson_hits) {
+        g->player.samson_hits = 0;
+        recalc_player_stats(&g->player);
+    }
     /* Clear any active screen creep when leaving the previous room */
     for (int i = 0; i < MAX_CREEP; i++) g->creep[i].active = 0;
     /* A live beam/knife/bomb must not persist across rooms (Phase D):
@@ -9756,6 +10186,28 @@ void game_update(Game *g, u32 kDown, u32 kHeld, circlePosition circlePos) {
             break;
         }
 
+        /* R10 (C4): health-conditional character stats. Eve's Whore of
+           Babylon and Samson's Bloody Lust live inside recalc_player_stats
+           but depend on current HP — watch the total pool and recalc once
+           on any change. A DECREASE is a hit taken: Samson gains a Bloody
+           Lust stack (capped in recalc). The Lost's soul/black pools are
+           also force-zeroed here so no pickup can ever grant him health. */
+        {
+            Player *pp = &g->player;
+            if (pp->character == CHAR_LOST) {
+                pp->soul_hp = 0;
+                pp->black_hp = 0;
+            }
+            int hp_tot = pp->hp + pp->soul_hp + pp->black_hp;
+            if (hp_tot != g->prev_hp_total) {
+                if (hp_tot < g->prev_hp_total &&
+                    pp->character == CHAR_SAMSON && pp->samson_hits < 7)
+                    pp->samson_hits++;
+                g->prev_hp_total = hp_tot;
+                recalc_player_stats(pp);
+            }
+        }
+
         /* Challenge: Time Attack / Speed! — 20 minutes to win, or it's over.
            F13: route through player_check_death so Dead Cat lives aren't
            skipped — each remaining life buys a minute of overtime instead
@@ -9810,6 +10262,22 @@ void game_update(Game *g, u32 kDown, u32 kHeld, circlePosition circlePos) {
         if (g->player.book_belial_dmg_timer > 0) {
             g->player.book_belial_dmg_timer--;
             if (g->player.book_belial_dmg_timer == 0) recalc_player_stats(&g->player);
+        }
+        /* R8 (M6): tarot temp-buff expiry (zero the amount so the next
+           card starts from a clean slate) */
+        if (g->player.card_dmg_timer > 0) {
+            g->player.card_dmg_timer--;
+            if (g->player.card_dmg_timer == 0) {
+                g->player.card_dmg_bonus = 0.0f;
+                recalc_player_stats(&g->player);
+            }
+        }
+        if (g->player.card_spd_timer > 0) {
+            g->player.card_spd_timer--;
+            if (g->player.card_spd_timer == 0) {
+                g->player.card_spd_bonus = 0.0f;
+                recalc_player_stats(&g->player);
+            }
         }
         if (g->homing_timer > 0) g->homing_timer--;
         if (g->curse_display_timer > 0) g->curse_display_timer--;
@@ -10032,6 +10500,13 @@ void game_update(Game *g, u32 kDown, u32 kHeld, circlePosition circlePos) {
                 }
                 break;
             }
+            /* --- R8 (M8) --- */
+            case ITEM_GUPPYS_HEAD:
+                /* Summon 2 friendly blue flies (pool-capped at 6) */
+                spawn_blue_fly(g, p->x - 12, p->y - 10);
+                spawn_blue_fly(g, p->x + 12, p->y - 10);
+                audio_play(SFX_PICKUP);
+                break;
             default:
                 used = 0;
                 break;
@@ -10040,6 +10515,7 @@ void game_update(Game *g, u32 kDown, u32 kHeld, circlePosition circlePos) {
         }
 
         familiars_update(g);  /* E6: trail history + fire cooldowns */
+        blue_flies_update(g); /* R8 (M8): friendly blue flies seek enemies */
         tears_update(g);
         enemies_update(g);
         enemy_shots_update(g);
@@ -10087,6 +10563,14 @@ void game_update(Game *g, u32 kDown, u32 kHeld, circlePosition circlePos) {
         break;
 
     case STATE_GAMEOVER:
+        /* R10 (C4): count the death exactly once (Lazarus unlock gate).
+           death_counted is zeroed by start_new_game's memset. */
+        if (!g->death_counted) {
+            g->death_counted = 1;
+            g_config.total_deaths++;
+            apply_unlock_gates();
+            config_save(&g_config);
+        }
         if (g->player.hp == -999) return;
         if (kDown & KEY_START) {
             g->state = STATE_MENU;
@@ -10802,6 +11286,9 @@ const char *character_name(CharacterType c) {
         case CHAR_EVE:       return "Eve";
         case CHAR_SAMSON:    return "Samson";
         case CHAR_BLUE_BABY: return "???";
+        case CHAR_AZAZEL:    return "Azazel";
+        case CHAR_LAZARUS:   return "Lazarus";
+        case CHAR_LOST:      return "The Lost";
         default:             return "?";
     }
 }
@@ -10812,9 +11299,12 @@ static const char *character_blurb(CharacterType c) {
         case CHAR_MAGDALENE: return "4 hearts, slower. Yum Heart heals.";
         case CHAR_CAIN:      return "2 hearts, +damage, +speed, +luck.";
         case CHAR_JUDAS:     return "1 heart, glass cannon. Book of Belial.";
-        case CHAR_EVE:       return "3 hearts, 1 soul heart, +damage, slower.";
-        case CHAR_SAMSON:    return "3 hearts, +damage, +speed.";
+        case CHAR_EVE:       return "3 hearts. Rages when down to 1 heart.";
+        case CHAR_SAMSON:    return "3 hearts. Damage grows as he's hit.";
         case CHAR_BLUE_BABY: return "2 hearts, 4 soul hearts, +damage.";
+        case CHAR_AZAZEL:    return "Flight. Short demon beam. 2+1 hearts.";
+        case CHAR_LAZARUS:   return "3 hearts. Rises once, stronger.";
+        case CHAR_LOST:      return "NO health. Flight, mantle, free deals.";
         default:             return "";
     }
 }
@@ -10827,6 +11317,9 @@ static u32 character_tint(CharacterType c) {
         case CHAR_EVE:       return C2D_Color32(180, 60,  120, 255); /* magenta */
         case CHAR_SAMSON:    return C2D_Color32(150, 90,  50,  255); /* brown */
         case CHAR_BLUE_BABY: return C2D_Color32(140, 200, 255, 255); /* pale blue */
+        case CHAR_AZAZEL:    return C2D_Color32(75,  60,  95,  255); /* dark violet */
+        case CHAR_LAZARUS:   return C2D_Color32(165, 205, 155, 255); /* pale green */
+        case CHAR_LOST:      return C2D_Color32(238, 238, 238, 255); /* ghost white */
         case CHAR_ISAAC:
         default:             return C2D_Color32(255, 220, 180, 255); /* default */
     }
@@ -10838,16 +11331,23 @@ void render_character_select(Game *g, C2D_TextBuf textBuf) {
     /* Title */
     draw_menu_title(textBuf, "SELECT CHARACTER");
 
-    /* CHAR_COUNT character cards side-by-side (scales to fit screen width) */
+    /* R10 (C4): 10 characters no longer fit one row (10*52 + 9*4 = 556px
+       > 400). Scrolling window instead: 7 cards visible, the selection
+       kept roughly centered, chevrons hinting at off-screen cards. */
     const float card_w = 52.0f;
     const float card_h = 100.0f;
     const float spacing = 4.0f;
-    const float total_w = card_w * CHAR_COUNT + spacing * (CHAR_COUNT - 1);
+    const int   visible = (CHAR_COUNT < 7) ? CHAR_COUNT : 7;
+    int first = g->char_sel - visible / 2;
+    if (first < 0) first = 0;
+    if (first > CHAR_COUNT - visible) first = CHAR_COUNT - visible;
+    const float total_w = card_w * visible + spacing * (visible - 1);
     const float start_x = (TOP_SCREEN_WIDTH - total_w) / 2.0f;
     const float card_y = 55.0f;
 
-    for (int i = 0; i < CHAR_COUNT; i++) {
-        float cx = start_x + i * (card_w + spacing);
+    for (int vi = 0; vi < visible; vi++) {
+        int i = first + vi;
+        float cx = start_x + vi * (card_w + spacing);
         int selected = (i == g->char_sel);
         int unlocked_bit = (g_config.unlocked_chars & (1 << i)) ? 1 : 0;
         u32 tint = character_tint((CharacterType)i);
@@ -10873,16 +11373,46 @@ void render_character_select(Game *g, C2D_TextBuf textBuf) {
             C2D_DrawRectSolid(cx + 5, card_y + 8, 0, card_w - 10, 34,
                               PAPER_DARK);
 
-            /* Character icon - placeholder circle */
-            C2D_DrawCircleSolid(cx + card_w / 2, card_y + 25, 0, 11, C2D_Color32(255, 240, 220, 255));
-            /* Eye dots */
-            C2D_DrawCircleSolid(cx + card_w / 2 - 3, card_y + 23, 0, 1.5f, C2D_Color32(0, 0, 0, 255));
+            /* Procedural portrait: paper-palette face circle with small
+               per-character identity touches (R10 C4), deterministic. */
+            float fx = cx + card_w / 2, fy = card_y + 25;
+            u32 faceCol = C2D_Color32(255, 240, 220, 255);
+            if (i == CHAR_AZAZEL)       faceCol = C2D_Color32(70, 58, 85, 255);
+            else if (i == CHAR_LOST)    faceCol = C2D_Color32(246, 246, 242, 255);
+            else if (i == CHAR_LAZARUS) faceCol = C2D_Color32(228, 238, 216, 255);
+            else if (i == CHAR_JUDAS)   faceCol = C2D_Color32(240, 220, 200, 255);
+            /* Azazel: little demon horns behind the head */
+            if (i == CHAR_AZAZEL) {
+                u32 hornCol = C2D_Color32(45, 35, 55, 255);
+                C2D_DrawTriangle(fx - 10, fy - 4, hornCol, fx - 4, fy - 8,
+                                 hornCol, fx - 12, fy - 14, hornCol, 0);
+                C2D_DrawTriangle(fx + 10, fy - 4, hornCol, fx + 4, fy - 8,
+                                 hornCol, fx + 12, fy - 14, hornCol, 0);
+            }
+            C2D_DrawCircleSolid(fx, fy, 0, 11, faceCol);
+            /* Judas: fez band */
+            if (i == CHAR_JUDAS)
+                C2D_DrawRectSolid(fx - 7, fy - 12, 0, 14, 4,
+                                  C2D_Color32(140, 40, 60, 255));
+            /* Lazarus: pale stitch across the brow (he's been dead) */
+            if (i == CHAR_LAZARUS)
+                C2D_DrawRectSolid(fx - 7, fy - 6, 0, 14, 1,
+                                  C2D_Color32(120, 90, 90, 255));
+            /* Eye dots (Azazel glows red; The Lost has hollow sockets) */
+            u32 eyeCol = C2D_Color32(0, 0, 0, 255);
+            float eyeR = 1.5f;
+            if (i == CHAR_AZAZEL) eyeCol = C2D_Color32(215, 45, 45, 255);
+            if (i == CHAR_LOST)   { eyeCol = C2D_Color32(30, 30, 30, 255); eyeR = 2.4f; }
+            C2D_DrawCircleSolid(fx - 3, fy - 2, 0, eyeR, eyeCol);
             if (i != CHAR_CAIN) {  /* Cain has only one eye */
-                C2D_DrawCircleSolid(cx + card_w / 2 + 3, card_y + 23, 0, 1.5f, C2D_Color32(0, 0, 0, 255));
+                C2D_DrawCircleSolid(fx + 3, fy - 2, 0, eyeR, eyeCol);
             } else {
                 /* eye-patch */
-                C2D_DrawRectSolid(cx + card_w / 2, card_y + 21, 0, 6, 3, C2D_Color32(40, 40, 40, 255));
+                C2D_DrawRectSolid(fx, fy - 4, 0, 6, 3, C2D_Color32(40, 40, 40, 255));
             }
+            /* The Lost: tiny open mouth — the classic ghost face */
+            if (i == CHAR_LOST)
+                C2D_DrawCircleSolid(fx, fy + 4, 0, 1.8f, C2D_Color32(30, 30, 30, 255));
 
             /* Character name */
             C2D_Text nm;
@@ -10899,6 +11429,9 @@ void render_character_select(Game *g, C2D_TextBuf textBuf) {
             else if (i == CHAR_EVE) hp_disp = 3;
             else if (i == CHAR_SAMSON) hp_disp = 3;
             else if (i == CHAR_BLUE_BABY) hp_disp = 2;
+            else if (i == CHAR_AZAZEL) hp_disp = 2;   /* + black heart below */
+            else if (i == CHAR_LAZARUS) hp_disp = 3;
+            else if (i == CHAR_LOST) hp_disp = 0;     /* NO health */
             int hearts_shown = hp_disp > 4 ? 4 : hp_disp;  /* cap 4 per card */
             for (int h = 0; h < hearts_shown; h++) {
                 float hhx = cx + 10 + h * 10;
@@ -10916,6 +11449,14 @@ void render_character_select(Game *g, C2D_TextBuf textBuf) {
                                    : BLOOD);
                 }
             }
+            /* Azazel: his 1 starting black heart, drawn as a dark heart */
+            if (i == CHAR_AZAZEL)
+                draw_heart(cx + 10 + hearts_shown * 10, card_y + 74, 8,
+                           C2D_Color32(40, 35, 50, 255));
+            /* The Lost: a faint dash where hearts would be — nothing to lose */
+            if (i == CHAR_LOST)
+                C2D_DrawRectSolid(cx + 12, card_y + 78, 0, card_w - 24, 2,
+                                  INK_DISABLED);
         } else {
             /* === Locked: dimmed paper + big inked "?" === */
             C2D_DrawRectSolid(cx, card_y, 0, card_w, card_h,
@@ -10927,6 +11468,22 @@ void render_character_select(Game *g, C2D_TextBuf textBuf) {
             C2D_TextGetDimensions(&qm, 0.7f, 0.7f, &qw, &qh);
             C2D_DrawText(&qm, C2D_WithColor, cx + (card_w - qw) / 2,
                          card_y + (card_h - qh) / 2, 0, 0.7f, 0.7f, INK);
+        }
+    }
+
+    /* R10 (C4): scroll chevrons when cards sit off-screen either side */
+    {
+        float ay = card_y + card_h / 2;
+        if (first > 0) {
+            C2D_DrawTriangle(start_x - 14, ay, INK,
+                             start_x - 6,  ay - 6, INK,
+                             start_x - 6,  ay + 6, INK, 0);
+        }
+        if (first + visible < CHAR_COUNT) {
+            float rx = start_x + total_w;
+            C2D_DrawTriangle(rx + 14, ay, INK,
+                             rx + 6,  ay - 6, INK,
+                             rx + 6,  ay + 6, INK, 0);
         }
     }
 
@@ -11252,16 +11809,16 @@ void render_unlocks_screen(Game *g, C2D_TextBuf textBuf) {
     draw_menu_background(g);
     draw_menu_title(textBuf, "UNLOCKS & STATS");
 
-    /* Build all the lines. Sized to hold the character list + stats + the
-       full 27-boss roster (headers/stats 14 + 27 bosses = 41 < 44; sized
-       with headroom on purpose — resize when the roster grows again). buf
-       is static to keep the ~2.75KB scratch off the per-frame render stack.
-       is_header/marker are presentation-only parallel flags — the
-       line-count/window/scroll math below is untouched. */
-    static char buf[44][64];
-    const char *lines_text[44];
-    u8 is_header[44] = {0};
-    u8 marker[44] = {0};   /* 0 none, 1 = defeated X, 2 = pending dash */
+    /* Build all the lines. Sized to hold the character list (10 as of R10
+       C4) + stats + the full 27-boss roster (headers/stats 17 + 27 bosses
+       = 44 < 48; sized with headroom on purpose — resize when either
+       roster grows again). buf is static to keep the ~3KB scratch off the
+       per-frame render stack. is_header/marker are presentation-only
+       parallel flags — the line-count/window/scroll math is untouched. */
+    static char buf[48][64];
+    const char *lines_text[48];
+    u8 is_header[48] = {0};
+    u8 marker[48] = {0};   /* 0 none, 1 = defeated X, 2 = pending dash */
     int line_count = 0;
 
     /* Header section: characters */
@@ -11270,7 +11827,8 @@ void render_unlocks_screen(Game *g, C2D_TextBuf textBuf) {
     lines_text[line_count] = buf[line_count]; line_count++;
 
     /* Character unlocks */
-    const char *chars[] = { "ISAAC", "MAGDALENE", "CAIN", "JUDAS", "EVE", "SAMSON", "???" };
+    const char *chars[] = { "ISAAC", "MAGDALENE", "CAIN", "JUDAS", "EVE",
+                            "SAMSON", "???", "AZAZEL", "LAZARUS", "THE LOST" };
     for (int i = 0; i < CHAR_COUNT; i++) {
         int unlocked = (g_config.unlocked_chars & (1 << i)) != 0;
         int completed = (g_config.characters_completed & (1 << i)) != 0;
@@ -11320,7 +11878,7 @@ void render_unlocks_screen(Game *g, C2D_TextBuf textBuf) {
         "Uriel", "Gabriel", "Krampus", "Blue Baby"
     };
     /* Pack two columns - we'll show ones we have seen vs ???  */
-    for (int b = 0; b < 27 && line_count < 44; b++) {
+    for (int b = 0; b < 27 && line_count < 48; b++) {
         int defeated = (g_config.bosses_defeated & (1 << b)) != 0;
         snprintf(buf[line_count], 64, "    %s",
                 defeated ? boss_names[b] : "???");
@@ -12238,6 +12796,35 @@ static void render_room_at(Game *g, int room_gx, int room_gy) {
         env_wall_draw(environment_atlas_env_corner_br_idx,
                       ROOM_RIGHT, ROOM_BOTTOM, 1.0f, 1.0f, fl, 1.0f);
 
+        /* R10 (C4) leftover #45: deterministic wall decor — 0-2 subtle
+           sprites on the top wall, seeded from the room's grid coords so
+           each room always dresses the same. Graffiti in Basement/Caves,
+           blood smears in Depths/Womb/Sheol/Dark Room, carved stone in
+           Cathedral/Chest. Drawn through the chapter tint at soft blend;
+           the door gap in the wall center is kept clear. */
+        {
+            int decorIdx;
+            if (fl <= 3)
+                decorIdx = environment_atlas_env_wall_graffiti_idx;
+            else if ((fl == 6 && g_floor_route == 1) ||
+                     (fl == 7 && g_floor_route != 2))
+                decorIdx = environment_atlas_env_stone_wall_idx; /* Cathedral/Chest */
+            else
+                decorIdx = environment_atlas_env_wall_blood_idx; /* Depths/Womb/Sheol/Dark */
+            unsigned dseed = (unsigned)(room_gx * 73 + room_gy * 31 + fl * 7 + 5);
+            int dcount = (int)(dseed % 3);   /* 0-2 per room */
+            for (int di = 0; di < dcount; di++) {
+                unsigned dh = (dseed + 17u * (unsigned)di) * 2654435761u;
+                float span = 120.0f;
+                float off  = (float)(dh % 997u) / 997.0f * span;
+                float ddx  = (dh & 1u)
+                           ? (WALL_THICKNESS + off)                       /* left half */
+                           : (TOP_SCREEN_WIDTH / 2.0f + 22.0f + off);     /* right half */
+                env_wall_draw(decorIdx, ddx, ROOM_TOP - WALL_THICKNESS,
+                              0.75f, 0.75f, fl, 0.7f);
+            }
+        }
+
         /* (d) Wall bevel: 2px darker inner lip along the inside edge of the
            four walls to fake a recessed stone frame. */
         {
@@ -12587,6 +13174,42 @@ static void render_room_at(Game *g, int room_gx, int room_gy) {
                 spr_draw(sheet_environment, chIdx, c->x, c->y, 1.2f, 1.2f);
                 continue;
             }
+            /* R8 (M5): red chest — procedural, dark red with gold trim.
+               Deterministic per-slot jitter; closed vs opened-husk states. */
+            if (c->type == PICKUP_CHEST_RED) {
+                float jx = (float)((i * 7) % 3) - 1.0f;   /* -1..1 wiggle */
+                float rx = c->x + jx, ry = c->y;
+                int opened = (c->sub_type == 1);
+                u32 body  = C2D_Color32(122, 24, 28, 255);
+                u32 shade = C2D_Color32(84, 14, 20, 255);
+                u32 trim  = C2D_Color32(212, 168, 64, 255);
+                if (opened) {
+                    /* lid flipped up behind the box, dark open interior */
+                    C2D_DrawRectSolid(rx - 9, ry - 14, 0, 18, 5, shade);
+                    C2D_DrawRectSolid(rx - 8, ry - 13, 0, 16, 3,
+                                      C2D_Color32(150, 40, 40, 255));
+                    C2D_DrawRectSolid(rx - 9, ry - 6, 0, 18, 11, body);
+                    C2D_DrawRectSolid(rx - 7, ry - 6, 0, 14, 4,
+                                      C2D_Color32(20, 8, 10, 255));
+                    /* gold trim band */
+                    C2D_DrawRectSolid(rx - 9, ry + 1, 0, 18, 2, trim);
+                } else {
+                    /* closed: domed lid + body + trim + lock */
+                    C2D_DrawRectSolid(rx - 9, ry - 9, 0, 18, 5, shade);
+                    C2D_DrawRectSolid(rx - 8, ry - 10, 0, 16, 2,
+                                      C2D_Color32(150, 40, 40, 255));
+                    C2D_DrawRectSolid(rx - 9, ry - 4, 0, 18, 9, body);
+                    C2D_DrawRectSolid(rx - 9, ry - 5, 0, 18, 2, trim);
+                    C2D_DrawRectSolid(rx - 2, ry - 6, 0, 4, 5, trim);
+                    C2D_DrawRectSolid(rx - 1, ry - 4, 0, 2, 2, shade);
+                    /* faint pulsing evil glow */
+                    float rg = 0.5f + 0.5f * sinf((float)c->anim_timer * 0.07f);
+                    C2D_DrawCircleSolid(rx, ry, 0, 13,
+                                        C2D_Color32(200, 30, 30,
+                                                    (int)(22 + 18 * rg)));
+                }
+                continue;
+            }
             if (c->type == PICKUP_TRINKET) {
                 /* grounding shadow + bobbing charm */
                 C2D_DrawEllipseSolid(c->x - 5, c->y + 6, 0, 10, 3,
@@ -12895,6 +13518,14 @@ static void render_room_at(Game *g, int room_gx, int room_gy) {
                 C2D_DrawRectSolid(c->x - 2, c->y + bob_off - 8, 0, 4, 2, 0xFF60E060);
                 continue;
             }
+            if (c->type == PICKUP_CHEST_RED) {
+                /* R8 (M5) fallback: compact red chest w/ gold band */
+                C2D_DrawRectSolid(c->x - 7, c->y - 6, 0, 14, 11,
+                                  C2D_Color32(122, 24, 28, 255));
+                C2D_DrawRectSolid(c->x - 7, c->y - 2, 0, 14, 2,
+                                  C2D_Color32(212, 168, 64, 255));
+                continue;
+            }
             u32 ccol;
             switch (c->type) {
                 case PICKUP_BOMB:  case PICKUP_BOMB2: ccol = C2D_Color32(80, 80, 80, 255); break;
@@ -13121,10 +13752,21 @@ static void render_player(Game *g) {
             spr_draw_tinted(sheet_sprites, idx, p->x, draw_y, scale, scale,
                            C2D_Color32(255, 60, 60, 255), 0.4f + intensity * 0.4f);
         } else if (p->character != CHAR_ISAAC) {
-            /* Character identity tint (??? reads paler blue, stronger) */
-            float ti = (p->character == CHAR_BLUE_BABY) ? 0.45f : 0.30f;
+            /* Character identity tint (???/The Lost read paler, stronger) */
+            float ti = (p->character == CHAR_BLUE_BABY ||
+                        p->character == CHAR_LOST) ? 0.45f : 0.30f;
+            u32 ctint = character_tint(p->character);
+            /* R10 (C4) Samson Bloody Lust: subtle red shift as stacks grow */
+            if (p->character == CHAR_SAMSON && p->samson_hits > 0) {
+                float bl = (float)p->samson_hits / 7.0f;
+                if (bl > 1.0f) bl = 1.0f;
+                ctint = C2D_Color32(150 + (int)(60.0f * bl),
+                                    90  - (int)(45.0f * bl),
+                                    50  - (int)(25.0f * bl), 255);
+                ti = 0.30f + 0.12f * bl;
+            }
             spr_draw_tinted(sheet_sprites, idx, p->x, draw_y, scale, scale,
-                           character_tint(p->character), ti);
+                           ctint, ti);
         } else {
             spr_draw(sheet_sprites, idx, p->x, draw_y, scale, scale);
         }
@@ -14476,6 +15118,7 @@ void game_render_top(Game *g, C2D_TextBuf textBuf) {
             render_blood_particles(g);
             render_enemies(g);
             render_familiars(g);  /* E6: followers under the player */
+            render_blue_flies(g); /* R8 (M8): friendly blue flies */
             render_player(g);
             render_knife(g);   /* D3: knife rides above the player sprite */
             render_laser(g);   /* D1/D2: beam over everything in the room */
@@ -14820,6 +15463,7 @@ void game_render_top(Game *g, C2D_TextBuf textBuf) {
         render_blood_particles(g);
         render_enemies(g);
         render_familiars(g);
+        render_blue_flies(g);   /* R8 (M8) */
         render_player(g);
         render_knife(g);
         render_laser(g);
@@ -15298,7 +15942,11 @@ const char *pill_name(PillEffect e, int known) {
 static const char *tarot_names[TAROT_COUNT] = {
     "The Fool", "The Magician", "The High Priestess", "The Emperor",
     "The Hierophant", "The Lovers", "The Tower", "The World",
-    "Death", "The Star", "The Sun", "The Hanged Man"
+    "Death", "The Star", "The Sun", "The Hanged Man",
+    /* R8 (M6): the 10 missing major arcana — order MUST match the enum */
+    "The Empress", "The Chariot", "Justice", "The Hermit",
+    "Wheel of Fortune", "Strength", "The Devil", "Temperance",
+    "The Moon", "Judgement"
 };
 const char *tarot_name(TarotCard c) {
     if (c < 0 || c >= TAROT_COUNT) return "?";
@@ -15415,6 +16063,11 @@ static void do_warp_cleanup(Game *g) {
     g->knife_hit_cd = 0;
 
     if (g->player.stats.flags & ITEM_FLAG_MANTLE) g->player.holy_mantle_active = 1;
+    /* R10 (C4) Samson: Bloody Lust stacks reset on room change (warps too) */
+    if (g->player.samson_hits) {
+        g->player.samson_hits = 0;
+        recalc_player_stats(&g->player);
+    }
 
     /* Warping out mid-Boss-Rush (or mid-boss-fight) must not leave stale
        boss/wave state behind — same reset as the door re-entry path.
@@ -15674,6 +16327,133 @@ void apply_tarot_card(Game *g, TarotCard c) {
                 spawn_heart(r, p->x - 12, p->y, HEART_SOUL);
             }
             break;
+        /* --- R8 (M6): the 10 new arcana --- */
+        case TAROT_EMPRESS:
+            /* Mother's blessing: +0.3 dmg +0.2 spd for ~10s (Belial-style
+               timed buff via the card_* fields recalc reads). */
+            p->card_dmg_bonus += 0.3f;
+            p->card_dmg_timer = 600;
+            p->card_spd_bonus += 0.2f;
+            p->card_spd_timer = 600;
+            recalc_player_stats(p);
+            break;
+        case TAROT_CHARIOT:
+            /* 6 seconds of invincibility (the iframes machinery already
+               gates contact, shots, creep and blasts) + a speed burst. */
+            if (p->iframes < 360) p->iframes = 360;
+            p->card_spd_bonus += 0.3f;
+            if (p->card_spd_timer < 360) p->card_spd_timer = 360;
+            recalc_player_stats(p);
+            break;
+        case TAROT_JUSTICE:
+            /* One of each: coin + bomb + key + half heart */
+            if (r) {
+                spawn_consumable(r, p->x - 18, p->y - 12, PICKUP_COIN);
+                spawn_consumable(r, p->x + 18, p->y - 12, PICKUP_BOMB);
+                spawn_consumable(r, p->x - 18, p->y + 14, PICKUP_KEY);
+                spawn_heart(r, p->x + 18, p->y + 14, HEART_RED_HALF);
+            }
+            break;
+        case TAROT_HERMIT: {
+            /* Warp to the shop. Floors can generate without one — then the
+               substitute payout is 3 coins (flagged design choice). */
+            int done = 0;
+            for (int hy = 0; hy < DUNGEON_H && !done; hy++) {
+                for (int hx = 0; hx < DUNGEON_W && !done; hx++) {
+                    if (g->dungeon.rooms[hy][hx].type == ROOM_SHOP) {
+                        drain_black_burst(g);
+                        g->dungeon.cur_x = hx;
+                        g->dungeon.cur_y = hy;
+                        do_warp_cleanup(g);
+                        done = 1;
+                    }
+                }
+            }
+            if (!done && r) {
+                for (int hc = 0; hc < 3; hc++)
+                    spawn_consumable(r, p->x - 20 + hc * 20, p->y + 16,
+                                     PICKUP_COIN);
+            }
+            break;
+        }
+        case TAROT_WHEEL_OF_FORTUNE:
+            /* Spawn a usable slot machine near the room centre (the slot
+               interaction was un-gated from ROOM_ARCADE for this). Fresh
+               spin allowance; falls back to 2 coins if the obstacle pool
+               is full. */
+            if (r && r->obstacle_count < MAX_OBSTACLES) {
+                Obstacle *ws = &r->obstacles[r->obstacle_count++];
+                float wx = p->x + ((p->x < (ROOM_LEFT + ROOM_RIGHT) / 2.0f)
+                                   ? 40.0f : -40.0f);
+                ws->x = clampf(wx, ROOM_LEFT + 24, ROOM_RIGHT - 24);
+                ws->y = clampf(p->y, ROOM_TOP + 24, ROOM_BOTTOM - 24);
+                ws->type = OBST_SLOT_MACHINE;
+                ws->hp = 1;
+                ws->active = 1;
+                r->arcade_slot_used = 0;
+                audio_play(SFX_DOOR);
+            } else if (r) {
+                spawn_consumable(r, p->x - 12, p->y + 16, PICKUP_COIN);
+                spawn_consumable(r, p->x + 12, p->y + 16, PICKUP_COIN);
+            }
+            break;
+        case TAROT_STRENGTH:
+            /* Isaac's +1 container-for-the-room is out of reach of this
+               stat system — substituted with a permanent half-heart heal
+               + 0.3 dmg for ~10s (flagged design choice). */
+            if (p->hp < p->stats.max_hp) p->hp += 1;
+            p->card_dmg_bonus += 0.3f;
+            p->card_dmg_timer = 600;
+            recalc_player_stats(p);
+            break;
+        case TAROT_DEVIL:
+            /* +2.0 damage for ~10s */
+            p->card_dmg_bonus += 2.0f;
+            p->card_dmg_timer = 600;
+            recalc_player_stats(p);
+            break;
+        case TAROT_TEMPERANCE:
+            /* Heal one full heart */
+            p->hp += 2;
+            if (p->hp > p->stats.max_hp) p->hp = p->stats.max_hp;
+            break;
+        case TAROT_MOON: {
+            /* Warp to the secret room (do_warp_cleanup reveals its doors).
+               No secret room: 2 coins consolation (flagged design choice). */
+            int mdone = 0;
+            for (int my = 0; my < DUNGEON_H && !mdone; my++) {
+                for (int mx = 0; mx < DUNGEON_W && !mdone; mx++) {
+                    if (g->dungeon.rooms[my][mx].type == ROOM_SECRET) {
+                        drain_black_burst(g);
+                        g->dungeon.cur_x = mx;
+                        g->dungeon.cur_y = my;
+                        do_warp_cleanup(g);
+                        mdone = 1;
+                    }
+                }
+            }
+            if (!mdone && r) {
+                spawn_consumable(r, p->x - 12, p->y + 16, PICKUP_COIN);
+                spawn_consumable(r, p->x + 12, p->y + 16, PICKUP_COIN);
+            }
+            break;
+        }
+        case TAROT_JUDGEMENT: {
+            /* Beggars don't exist in this demake — substituted with a
+               pickup shower: 3-5 mixed random drops around the player. */
+            if (r) {
+                int jn = randi(3, 5);
+                for (int ji = 0; ji < jn; ji++) {
+                    float ja = randf(0.0f, 6.28f);
+                    float jd = randf(18.0f, 40.0f);
+                    spawn_random_consumable(r, p->x + cosf(ja) * jd,
+                                            p->y + sinf(ja) * jd);
+                }
+                if (randi(0, 99) < 40)
+                    spawn_heart(r, p->x, p->y + 20, HEART_RED_HALF);
+            }
+            break;
+        }
         default: break;
     }
 }
