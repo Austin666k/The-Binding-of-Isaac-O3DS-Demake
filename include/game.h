@@ -306,6 +306,21 @@ typedef enum {
     ENEMY_BOSS_MOM,       /* Mom - fixed Depths boss (stomping foot + door hands) */
     ENEMY_BOSS_MOMS_HEART,/* Mom's Heart - fixed Womb boss (stationary + waves) */
     ENEMY_BOSS_SATAN,     /* Satan - fixed Sheol boss, 3 phases */
+    /* --- Round 9 (Phase C1) route-arc fixed bosses ---
+       MUST stay inside the boss block (is_boss_type / bosses_defeated bit
+       index / boss_names[] on the unlocks screen are all enum-order based:
+       Isaac=20, The Lamb=21, It Lives=22). */
+    ENEMY_BOSS_ISAAC,     /* Isaac - Cathedral (light route), holy 3 phases */
+    ENEMY_BOSS_THE_LAMB,  /* The Lamb - Dark Room (dark route), demonic mirror */
+    ENEMY_BOSS_IT_LIVES,  /* It Lives - Womb capstone after 1+ total wins */
+    /* --- Round 8 (M3/M7) bosses ---
+       MUST stay inside the boss block (is_boss_type / bosses_defeated bit
+       index / boss_names[] on the unlocks screen are all enum-order based:
+       Uriel=23, Gabriel=24, Krampus=25, ??? (Blue Baby)=26). */
+    ENEMY_BOSS_URIEL,     /* Uriel - first angel-statue miniboss of a run */
+    ENEMY_BOSS_GABRIEL,   /* Gabriel - second angel miniboss, faster/denser */
+    ENEMY_BOSS_KRAMPUS,   /* Krampus - devil-room ambush miniboss */
+    ENEMY_BOSS_BLUE_BABY, /* ??? (Blue Baby) - The Chest floor-7 boss */
     /* --- Phase 2 minor enemies (boss minions) --- */
     ENEMY_EYE,            /* Peep's detached eyes */
     ENEMY_LIL_HAUNT,      /* Haunt's minions */
@@ -462,6 +477,9 @@ typedef enum {
     ITEM_BROTHER_BOBBY,   /* familiar: plain tears in aim direction */
     ITEM_GHOST_BABY,      /* familiar: spectral tears in aim direction */
     ITEM_DEMON_BABY,      /* familiar: auto-aims the nearest enemy */
+    /* --- Round 8 (M7) Krampus-only drops (EXCLUDED from random pools) --- */
+    ITEM_LUMP_OF_COAL,    /* passive: tear damage grows with tear flight time */
+    ITEM_HEAD_OF_KRAMPUS, /* active (4): 4-way brimstone burst from the player */
     ITEM_COUNT
 } ItemType;
 
@@ -487,6 +505,7 @@ typedef struct {
 #define ITEM_FLAG_FIRE_IMMUNE  (1 << 10)  /* Pyromaniac: immune+heal from blasts */
 #define ITEM_FLAG_ACTIVE       (1 << 11)  /* Active item: usable with charge bar (KEY_X) */
 #define ITEM_FLAG_DOUBLE       (1 << 12)  /* 20/20: two parallel tears */
+#define ITEM_FLAG_COAL         (1 << 13)  /* Lump of Coal: damage grows with tear age */
 
 /* ---------- Item Definition ---------- */
 typedef struct {
@@ -599,7 +618,8 @@ typedef enum {
     OBST_ROCK = 0,
     OBST_POOP,        /* destructible by tears; may drop a pickup */
     OBST_SPIKES,      /* blocks nothing; damages the player on contact */
-    OBST_SLOT_MACHINE /* Arcade room: pay a coin, roll a reward */
+    OBST_SLOT_MACHINE,/* Arcade room: pay a coin, roll a reward */
+    OBST_ANGEL_STATUE /* Angel room: bombing it awakens Uriel/Gabriel */
 } ObstacleType;
 
 typedef struct {
@@ -672,6 +692,10 @@ typedef struct {
     ItemType active_item;      /* ITEM_NONE = no active item held */
     int   active_charge;       /* current charge */
     int   active_max_charge;   /* charge required to use */
+    /* R8 (M3): Mega Satan key halves — Uriel drops 1, Gabriel drops 2.
+       Per-run (Player lives inside Game; start_new_game memsets Game). */
+    int   has_key_piece_1;
+    int   has_key_piece_2;
 } Player;
 
 /* ---------- Blood Decal (permanent floor stain, persists per room) ---------- */
@@ -748,6 +772,10 @@ typedef struct {
        and back never refights waves already cleared (the Game-side
        bossrush_active/spawn_timer are still reset on exit/entry). */
     int      bossrush_wave;
+    /* R8 (M7): Krampus ambush state for devil rooms.
+       0 = normal devil room, 1 = armed (ambush fires ~45f after entry),
+       2 = Krampus spawned (never re-arms). */
+    int      krampus_state;
 } Room;
 
 /* ---------- Dungeon / Floor ---------- */
@@ -910,6 +938,18 @@ typedef struct {
     float ebeam_x, ebeam_y;      /* beam origin (boss muzzle) */
     float ebeam_dx, ebeam_dy;    /* unit aim direction (frozen at telegraph) */
     float ebeam_ex, ebeam_ey;    /* wall-clipped endpoint */
+    /* R9 (C1 - The Lamb): when set, the enemy beam is a 4-way brimstone
+       CROSS centered on (ebeam_x, ebeam_y) — the dx/dy/ex/ey fields are
+       ignored and 4 axis-aligned arms run to the room walls instead. */
+    int   ebeam_cross;
+    /* R9 (C1 - Isaac): Cathedral light columns. Up to 3 vertical beams:
+       ground-marker telegraph (~40f) then a full-height damage column
+       (~20f). 0 = off, 1 = telegraph, 2 = firing. Driven by Isaac's AI
+       case only; reset on every room/floor change alongside ebeam_*. */
+    int   vbeam_state;
+    int   vbeam_timer;
+    int   vbeam_count;
+    float vbeam_x[3];
     /* Familiar system (Phase E6): player position history ring buffer the
        followers trail behind, plus per-slot fire cooldowns. Static sizes,
        zero-state valid (head 0 / cds 0; trail refilled on room entry). */
@@ -917,9 +957,37 @@ typedef struct {
     float fam_hist_y[FAM_TRAIL_LEN];
     int   fam_hist_head;
     int   fam_cd[MAX_FAMILIARS];
-    /* Phase E2: which ending the win screen shows (0 = full escape,
-       1 = "Ending 1" chosen at the Mom's Heart light beam) */
+    /* Which ending the win screen shows:
+       0 = full escape (The Chest / Mega Satan, light route)
+       1 = legacy "Ending 1" (pre-R9 Mom's Heart beam; no longer set)
+       2 = light ending (Isaac defeated in the Cathedral — ascension)
+       3 = dark ending (The Lamb defeated in the Dark Room — crowned) */
     int   win_ending;
+    /* R9 (C1): run route, chosen at the Mom's Heart / It Lives kill.
+       0 = undecided (floors 0-5), 1 = LIGHT (beam -> Cathedral -> Chest),
+       2 = DARK (trapdoor -> Sheol -> Dark Room). Floors 6/7 change
+       identity, palette and boss based on this (see get_floor_info). */
+    int   route;
+    /* --- R8 (M3/M7) additions (all per-run; zeroed by start_new_game) --- */
+    /* Set the first time a devil-room purchase completes this run; from
+       then on the post-boss deal flip ALWAYS chooses the devil room. */
+    int   took_devil_deal;
+    /* Angel statues awakened this run: 0 -> next fight is Uriel,
+       1+ -> Gabriel. Incremented at awaken time. */
+    int   angels_fought;
+    /* Krampus ambush countdown (armed on entering a krampus_state==1 devil
+       room; spawns Krampus at 0) + brief lights-dim overlay timer. */
+    int   krampus_timer;
+    int   krampus_dim;
+    /* Head of Krampus player burst: 4-way beam render timer + origin.
+       Damage is applied instantly at use; this is presentation only. */
+    int   pbeam_timer;
+    float pbeam_x, pbeam_y;
+    /* Mega Satan golden-door room (floor 7): created lazily in a free grid
+       cell the first time the door opens; re-enterable if the player warps
+       out (key pieces are consumed on first open). */
+    int   mega_created;
+    int   mega_gx, mega_gy;
 } Game;
 
 /* ---------- Function Declarations ---------- */

@@ -61,6 +61,8 @@ static void familiars_reset_trail(Game *g);
 static void familiar_pos(Game *g, int slot, float *fx, float *fy);
 /* Warp path (E7 Teleport! uses it from the active-item switch) */
 static void do_warp_cleanup(Game *g);
+/* R8 (M3): golden-door Mega Satan room (defined after drain_black_burst) */
+static void open_mega_satan_room(Game *g);
 /* Parameterized explosion core (bombs, Epic Fetus, Ipecac tears) */
 static void bomb_explode_ex(Game *g, float bx, float by, float blast,
                             float enemy_dmg, float boss_dmg, int player_dmg);
@@ -377,6 +379,14 @@ void init_item_pool(void) {
         "Spectral familiar");
     DEF(ITEM_DEMON_BABY,      "Demon Baby",      0.0f,  0.0f,  0.0f,  0.0f,  0, 0,
         "Auto-targeting familiar");
+    /* --- R8 (M7) Krampus-only drops. Devil-pool flavored, but they NEVER
+       appear in pick_random_item / pick_random_active_item rolls (see the
+       item_excluded_from_pool filter) — Krampus's pedestal is the only
+       source. --- */
+    DEF(ITEM_LUMP_OF_COAL,    "Lump of Coal",    0.0f,  0.0f,  0.0f,  0.5f,  0, ITEM_FLAG_COAL,
+        "My X-mas present");
+    DEF(ITEM_HEAD_OF_KRAMPUS, "Head of Krampus", 0.0f,  0.0f,  0.0f,  0.0f,  0, ITEM_FLAG_ACTIVE,
+        "Active: 4-way brimstone");
     #undef DEF
 }
 
@@ -401,9 +411,33 @@ static const FloorInfo floors[MAX_FLOORS] = {
     { "The Chest",     12,      105,      1.7f,      2.5f,       1.65f,   BOSS_TIER_SHEOL    },
 };
 
+/* R9 (C1) route system: floors 6/7 get route-dependent identity.
+ * LIGHT (route 1): 6 = Cathedral (pale stone/gold), 7 = The Chest.
+ * DARK  (route 2): 6 = Sheol (as before),           7 = Dark Room.
+ * g_floor_route mirrors Game.route (get_floor_info's signature is used
+ * from ~15 call sites that don't carry the Game pointer); every write to
+ * Game.route goes through set_route below so the two can never diverge. */
+static int g_floor_route = 0;
+
+/* Cathedral mirrors Sheol's tuning (same chapter depth); Dark Room mirrors
+ * The Chest's — balance stays consistent with the neighboring floors. */
+static const FloorInfo floor_cathedral = {
+    "Cathedral",   9,  85,  1.6f, 2.2f, 1.5f,  BOSS_TIER_SHEOL
+};
+static const FloorInfo floor_dark_room = {
+    "Dark Room",   12, 105, 1.7f, 2.5f, 1.65f, BOSS_TIER_SHEOL
+};
+
+static void set_route(Game *g, int route) {
+    g->route = route;
+    g_floor_route = route;
+}
+
 const FloorInfo *get_floor_info(int floor_num) {
     if (floor_num < 0) floor_num = 0;
     if (floor_num >= MAX_FLOORS) floor_num = MAX_FLOORS - 1;
+    if (floor_num == 6 && g_floor_route == 1) return &floor_cathedral;
+    if (floor_num == 7 && g_floor_route == 2) return &floor_dark_room;
     return &floors[floor_num];
 }
 
@@ -517,6 +551,17 @@ static int boss_innate_hp(EnemyType boss) {
     case ENEMY_BOSS_MOM:        return 80;  /* Depths capstone */
     case ENEMY_BOSS_MOMS_HEART: return 100; /* Womb capstone, tanky + waves */
     case ENEMY_BOSS_SATAN:      return 120; /* Sheol capstone, 3 phases */
+    /* R9 (C1) route-arc fixed bosses */
+    case ENEMY_BOSS_ISAAC:      return 100; /* Cathedral: Mom's Heart tier */
+    case ENEMY_BOSS_THE_LAMB:   return 110; /* Dark Room: Mega Satan minus a notch */
+    case ENEMY_BOSS_IT_LIVES:   return 130; /* Mom's Heart +30% */
+    /* R8 (M3/M7) — Uriel/Gabriel/Krampus are minibosses spawned with FLAT
+       innate HP (their spawn paths bypass get_boss_base_hp on purpose;
+       floor scaling would balloon a floor-5 angel to ~160 HP). */
+    case ENEMY_BOSS_URIEL:      return 55;  /* first angel of the run */
+    case ENEMY_BOSS_GABRIEL:    return 70;  /* second angel: faster + denser */
+    case ENEMY_BOSS_KRAMPUS:    return 70;  /* devil-room ambush */
+    case ENEMY_BOSS_BLUE_BABY:  return 105; /* ??? — The Chest floor-7 boss */
     default:                    return 40;
     }
 }
@@ -623,9 +668,23 @@ EnemyType select_boss_for_floor(Game *g, int floor_num) {
        floor (Boss Rush waves) call select_pool_boss_for_floor directly. */
     switch (floor_num) {
     case 4: return ENEMY_BOSS_MOM;        /* Depths */
-    case 5: return ENEMY_BOSS_MOMS_HEART; /* The Womb */
-    case 6: return ENEMY_BOSS_SATAN;      /* Sheol */
-    case 7: return ENEMY_BOSS_MEGA_SATAN; /* The Chest */
+    case 5:
+        /* R9 M2: after the first completed run the Womb capstone becomes
+           IT LIVES (Mom's Heart skeleton, +30% HP, faster waves, radial
+           rings in its last quarter). Its death offers the same
+           beam/trapdoor route choice. */
+        return (g_config.total_wins >= 1) ? ENEMY_BOSS_IT_LIVES
+                                          : ENEMY_BOSS_MOMS_HEART;
+    case 6:
+        /* Route split: LIGHT = Cathedral (Isaac), DARK = Sheol (Satan).
+           Route 0 can't normally reach floor 6; fall back to dark. */
+        return (g->route == 1) ? ENEMY_BOSS_ISAAC : ENEMY_BOSS_SATAN;
+    case 7:
+        /* R8 (M3): golden doors landed — Mega Satan now lives ONLY behind
+           the golden door (both routes; see open_mega_satan_room). The
+           regular floor-7 boss is ??? (Blue Baby) in The Chest and The
+           Lamb in the Dark Room. */
+        return (g->route == 2) ? ENEMY_BOSS_THE_LAMB : ENEMY_BOSS_BLUE_BABY;
     default: break;
     }
     return select_pool_boss_for_floor(g, floor_num);
@@ -925,6 +984,8 @@ int collect_item(Game *g, ItemType item) {
         case ITEM_TELEPORT:       p->active_max_charge = 2; break;
         case ITEM_DECK_OF_CARDS:  p->active_max_charge = 6; break;
         case ITEM_BIBLE:          p->active_max_charge = 6; break;
+        /* R8 (M7) */
+        case ITEM_HEAD_OF_KRAMPUS: p->active_max_charge = 4; break;
         default:                  p->active_max_charge = 2; break;
         }
         p->active_charge = p->active_max_charge;  /* start fully charged */
@@ -1119,6 +1180,12 @@ static int is_on_critical_path(Dungeon *d, int rx, int ry) {
     return !connected; /* if removing it breaks connectivity, it's critical */
 }
 
+/* R8 (M7): fixed-drop items that must NEVER come up in random pedestal /
+ * shop / pool rolls — Krampus's death pedestal is their only source. */
+static int item_excluded_from_pool(ItemType t) {
+    return t == ITEM_LUMP_OF_COAL || t == ITEM_HEAD_OF_KRAMPUS;
+}
+
 /* Pick a random item that the player doesn't already have */
 static ItemType pick_random_item(Game *g) {
     /* Build pool of items not yet collected (the held active item counts
@@ -1126,6 +1193,7 @@ static ItemType pick_random_item(Game *g) {
     ItemType available[ITEM_COUNT];
     int avail_count = 0;
     for (int t = 1; t < ITEM_COUNT; t++) {
+        if (item_excluded_from_pool((ItemType)t)) continue;
         int has = (g->player.active_item == (ItemType)t);
         for (int j = 0; j < g->player.item_count; j++) {
             if (g->player.items[j] == (ItemType)t) { has = 1; break; }
@@ -1144,6 +1212,7 @@ static ItemType pick_random_active_item(Game *g) {
     ItemType active_available[ITEM_COUNT];
     int active_count = 0;
     for (int t = 1; t < ITEM_COUNT; t++) {
+        if (item_excluded_from_pool((ItemType)t)) continue;
         int has = (g->player.active_item == (ItemType)t);
         for (int j = 0; j < g->player.item_count; j++) {
             if (g->player.items[j] == (ItemType)t) { has = 1; break; }
@@ -1760,6 +1829,73 @@ static void init_boss_enemy(Game *g, const FloorInfo *fi, Enemy *e, EnemyType se
         e->timer = 90;
         e->shoot_timer = 60;
         break;
+    case ENEMY_BOSS_ISAAC:
+        /* Isaac (R9 C1): 3 HP-driven phases in e->phase. e->state is the
+           pray/hop sub-state: 1 = praying (floats, NO contact damage),
+           0 = active dodge-hop. Light columns run on g->vbeam_*. */
+        e->phase = 0;
+        e->state = 1;            /* opens praying */
+        e->attack_pattern = 0;   /* deterministic ring-angle counter */
+        e->dx = 0; e->dy = 0;
+        e->timer = 70;
+        e->shoot_timer = 90;
+        break;
+    case ENEMY_BOSS_THE_LAMB:
+        /* The Lamb (R9 C1): demonic mirror of Isaac. P1 slow chase +
+           brimstone crosses (g->ebeam_* with ebeam_cross set); P2 detaches
+           the Lamb Body (Gemini companion fields: body chases, head goes
+           stationary turret); P3 enrage below 25%. Body HP is granted at
+           the detach, so gemini_chp starts 0 (no body target yet). */
+        e->phase = 0;
+        e->gemini_split = 0;
+        e->gemini_chp = 0;
+        e->gemini_cx = e->x;
+        e->gemini_cy = e->y + 20;
+        e->gemini_cdx = 0;
+        e->gemini_cdy = 0;
+        e->timer = 80;
+        e->shoot_timer = 70;
+        e->attack_pattern = 0;
+        break;
+    case ENEMY_BOSS_IT_LIVES:
+        /* It Lives (R9 M2): Mom's Heart AI skeleton, hotter timers.
+           famine_shoot_cd doubles as the last-quarter radial-ring timer. */
+        e->phase = 0;
+        e->dx = 0; e->dy = 0;
+        e->timer = 60;
+        e->shoot_timer = 50;
+        e->attack_pattern = 0;
+        e->famine_shoot_cd = 60;
+        break;
+    case ENEMY_BOSS_URIEL:
+    case ENEMY_BOSS_GABRIEL:
+        /* R8 (M3): angel minibosses. Shared AI, two tuning sets (Gabriel
+           faster + denser; see the AI case). e->state 0 = hover-chase. */
+        e->phase = 0;
+        e->state = 0;
+        e->dx = 0; e->dy = 0;
+        e->timer = 90;                       /* light-column cooldown */
+        e->shoot_timer = (selected_boss == ENEMY_BOSS_GABRIEL) ? 55 : 80;
+        e->attack_pattern = 0;
+        break;
+    case ENEMY_BOSS_KRAMPUS:
+        /* R8 (M7): chase + 4-way brimstone cross + coal-lob volleys. */
+        e->phase = 0;
+        e->dx = 0; e->dy = 0;
+        e->timer = 100;                      /* cross cooldown */
+        e->shoot_timer = 70;                 /* coal-lob cooldown */
+        e->attack_pattern = 0;
+        break;
+    case ENEMY_BOSS_BLUE_BABY:
+        /* R8 (M3): ??? — Isaac's hop/ring skeleton, dark mirror: no light
+           columns, denser tear rings, extra aimed volleys at low HP. */
+        e->phase = 0;
+        e->state = 1;            /* opens hovering (contact ON — no prayer) */
+        e->attack_pattern = 0;
+        e->dx = 0; e->dy = 0;
+        e->timer = 60;
+        e->shoot_timer = 80;
+        break;
     default: break;
     }
 }
@@ -1949,6 +2085,16 @@ void room_spawn_enemies(Game *g, Room *r) {
         r->pedestal.active = (g->challenge != 6);
         spawn_heart(r, ROOM_LEFT + 60, ROOM_TOP + 60, HEART_SOUL);
         spawn_heart(r, ROOM_RIGHT - 60, ROOM_TOP + 60, HEART_SOUL);
+        /* R8 (M3): central angel statue above the pedestal. Bombing it (or
+           room-wide damage) awakens Uriel/Gabriel — see awaken_angel. */
+        if (r->obstacle_count < MAX_OBSTACLES) {
+            Obstacle *st = &r->obstacles[r->obstacle_count++];
+            st->x = (ROOM_LEFT + ROOM_RIGHT) / 2.0f;
+            st->y = ROOM_TOP + 44.0f;
+            st->type = OBST_ANGEL_STATUE;
+            st->hp = 1;
+            st->active = 1;
+        }
         return;
     }
 
@@ -2076,6 +2222,14 @@ void room_spawn_enemies(Game *g, Room *r) {
                 t = randi(0, 8);   /* + tier 1 (Attack Fly, Pooter, Hopper, Baby) */
             } else {
                 t = randi(0, 4);   /* base: Fly, Gaper, Pacer, Spider, Clotty */
+            }
+
+            /* R9: Cathedral (floor 6, light route) reads angelic — bias
+               about half the spawns toward flies / hosts / babies. */
+            if (g->current_floor == 6 && g->route == 1 && randi(0, 99) < 50) {
+                const int holy[4] = { 0 /*Fly*/, 5 /*Attack Fly*/,
+                                      8 /*Baby*/, 13 /*Host*/ };
+                t = holy[randi(0, 3)];
             }
 
             switch (t) {
@@ -2313,6 +2467,7 @@ void enemy_make_champion(Enemy *e, ChampionType c) {
 
 void game_init(Game *g) {
     memset(g, 0, sizeof(Game));
+    g_floor_route = 0;   /* R9: keep the get_floor_info mirror in sync */
     g->state = STATE_MENU;
     g->menu_sel = 0;
     g->player.hp = PLAYER_BASE_HP;
@@ -2350,6 +2505,7 @@ void start_new_game(Game *g) {
     g->state = STATE_PLAYING;
     g->score = 0;
     g->current_floor = 0;
+    set_route(g, 0);   /* R9: fresh run — route undecided until Mom's Heart */
     g->infinite_loop = 0;
     g->best_floor = 0;
     g->rooms_cleared = 0;
@@ -2496,11 +2652,18 @@ void advance_floor(Game *g) {
 
     if (g->current_floor >= MAX_FLOORS) {
         if (g->game_mode == MODE_INFINITE) {
-            /* Infinite mode: loop back to floor 0 with increased scaling */
+            /* Infinite mode: loop back to floor 0 with increased scaling.
+               R9: the route resets too so each loop re-chooses at Mom's
+               Heart / It Lives. */
             g->current_floor = 0;
             g->infinite_loop++;
+            set_route(g, 0);
         } else {
-            /* Story mode: game won - beat all floors! */
+            /* Story mode: game won — the ending depends on the route.
+               LIGHT (or legacy no-route): The Chest / Mega Satan escape
+               (ending 0, unchanged). DARK: The Lamb was defeated in the
+               Dark Room (ending 3, crowned in darkness). */
+            g->win_ending = (g->route == 2) ? 3 : 0;
             g->state = STATE_WIN;
             unlock_check_after_win(g);
             return;
@@ -2560,9 +2723,14 @@ static void finish_floor_transition(Game *g) {
     g->boss_death_anim = 0;
     g->boss_intro_timer = 0;
 
-    /* E3: no enemy beam survives a floor change */
+    /* E3: no enemy beam survives a floor change (R9: nor the Lamb's cross
+       flag or Isaac's light columns) */
     g->ebeam_state = 0;
     g->ebeam_timer = 0;
+    g->ebeam_cross = 0;
+    g->vbeam_state = 0;
+    g->vbeam_timer = 0;
+    g->vbeam_count = 0;
 
     /* Place player in center */
     g->player.x = (ROOM_LEFT + ROOM_RIGHT) / 2.0f;
@@ -2952,6 +3120,7 @@ void player_update(Game *g, u32 kHeld, circlePosition circlePos) {
                         int lifeCost = si->cost;
                         if (p->lives >= lifeCost && collect_item(g, si->item)) {
                             p->lives -= lifeCost;
+                            g->took_devil_deal = 1;  /* R8: angels stop appearing */
                             g->last_pickup = si->item;
                             g->pickup_flash = PICKUP_FLASH_FRAMES;
                             p->pickup_anim = 40;
@@ -2979,6 +3148,7 @@ void player_update(Game *g, u32 kHeld, circlePosition circlePos) {
                         p->pill_max_hp_bonus -= hpCost;  /* persistent debit */
                         recalc_player_stats(p);
                         if (p->hp > p->stats.max_hp) p->hp = p->stats.max_hp;
+                        g->took_devil_deal = 1;  /* R8: angels stop appearing */
                         g->last_pickup = si->item;
                         g->pickup_flash = PICKUP_FLASH_FRAMES;
                         p->pickup_anim = 40;
@@ -3008,29 +3178,69 @@ void player_update(Game *g, u32 kHeld, circlePosition circlePos) {
         }
     }
 
-    /* Trapdoor check */
+    /* Trapdoor check. R9: taking the trapdoor out of the Womb (floor 5,
+       right after Mom's Heart / It Lives) locks in the DARK route —
+       floor 6 becomes Sheol, floor 7 the Dark Room. */
     if (r->has_trapdoor) {
         float cx = (ROOM_LEFT + ROOM_RIGHT) / 2.0f;
         float cy = (ROOM_TOP + ROOM_BOTTOM) / 2.0f;
         float tdx = p->x - cx;
         float tdy = p->y - cy;
         if (tdx * tdx + tdy * tdy < 20.0f * 20.0f) {
+            if (g->current_floor == 5 && g->route == 0)
+                set_route(g, 2);
             advance_floor(g);
             return;
         }
     }
 
-    /* E2: Mom's Heart end-run choice — the "beam of light" next to the
-       trapdoor ends the run immediately with Ending 1.
-       R8 #24: only once the room is actually cleared — leftover wave
-       minions must not be skippable by dashing into the beam mid-combat. */
+    /* R8 (M3): floor-7 golden door — top wall of the starting room (both
+       routes). Opens ONLY with both key pieces (consumed); once opened it
+       stays walkable so warping out never strands the fight. If the room
+       already has a real top door, the golden door sits offset left. */
+    if (g->current_floor == 7 && r->type == ROOM_START &&
+        g->state == STATE_PLAYING) {
+        /* deny-cooldown normally only ticks inside shop rooms */
+        if (g->shop_deny_timer > 0) g->shop_deny_timer--;
+        float gdx = (ROOM_LEFT + ROOM_RIGHT) / 2.0f -
+                    (r->doors[0] ? 80.0f : 0.0f);
+        if (p->y <= ROOM_TOP + DOOR_TRIGGER + 2.0f &&
+            fabsf(p->x - gdx) < DOOR_WIDTH * 0.5f + 4.0f) {
+            if (g->mega_created ||
+                (p->has_key_piece_1 && p->has_key_piece_2)) {
+                open_mega_satan_room(g);
+                return;
+            } else if (g->shop_deny_timer <= 0) {
+                snprintf(g->pickup_msg_text, sizeof(g->pickup_msg_text),
+                         "A golden door... it demands both key halves.");
+                g->pickup_msg_timer = 90;
+                g->shop_deny_timer = 45;
+                audio_play(SFX_HURT);
+            }
+        }
+    }
+
+    /* R9 route choice: the "beam of light" beside the Womb trapdoor no
+       longer ends the run — it locks in the LIGHT route and ascends to
+       the Cathedral (floor 6). The SAME beam object, spawned again by
+       Isaac's death in the Cathedral, IS the run-ending light exit
+       (ending 2). R8 #24 still applies: only once the room is cleared. */
     if (r->has_ending_beam && r->cleared && g->state == STATE_PLAYING) {
         float bx = (ROOM_LEFT + ROOM_RIGHT) / 2.0f + 60.0f;
         float by = (ROOM_TOP + ROOM_BOTTOM) / 2.0f;
         float bdx = p->x - bx;
         float bdy = p->y - by;
         if (bdx * bdx + bdy * bdy < 18.0f * 18.0f) {
-            g->win_ending = 1;
+            if (g->current_floor == 5) {
+                /* LIGHT route: ascend to the Cathedral */
+                set_route(g, 1);
+                r->has_ending_beam = 0;
+                audio_play(SFX_ROOM_CLEAR);
+                advance_floor(g);
+                return;
+            }
+            /* Cathedral (floor 6, light): Isaac defeated — light ending */
+            g->win_ending = 2;
             g->state = STATE_WIN;
             audio_play(SFX_ROOM_CLEAR);
             unlock_check_after_win(g);
@@ -3726,6 +3936,13 @@ static const char *boss_name_str(EnemyType t) {
     case ENEMY_BOSS_MOM:        return "MOM";
     case ENEMY_BOSS_MOMS_HEART: return "MOM'S HEART";
     case ENEMY_BOSS_SATAN:      return "SATAN";
+    case ENEMY_BOSS_ISAAC:      return "ISAAC";
+    case ENEMY_BOSS_THE_LAMB:   return "THE LAMB";
+    case ENEMY_BOSS_IT_LIVES:   return "IT LIVES";
+    case ENEMY_BOSS_URIEL:      return "URIEL";
+    case ENEMY_BOSS_GABRIEL:    return "GABRIEL";
+    case ENEMY_BOSS_KRAMPUS:    return "KRAMPUS";
+    case ENEMY_BOSS_BLUE_BABY:  return "???";
     default: return "BOSS";
     }
 }
@@ -3897,6 +4114,12 @@ static int boss_airborne(const Enemy *e, float *progress) {
     if (air && progress)
         *progress = clampf(1.0f - (float)e->timer / dur, 0.0f, 1.0f);
     return air;
+}
+
+/* R9 (C1 - Isaac): praying = floating in the light, dealing NO contact
+ * damage (still fully damageable by tears — unlike e->hidden). */
+static int boss_praying(const Enemy *e) {
+    return e->type == ENEMY_BOSS_ISAAC && e->state == 1;
 }
 
 /* R8 #44: landing thump — standing at ground zero of a boss landing still
@@ -4400,29 +4623,82 @@ static int kill_enemy(Game *g, Room *r, Enemy *e) {
         g->boss_death_x = e->x;  /* anchor the death anim on the corpse */
         g->boss_death_y = e->y;
         /* Track in persistent unlocks (bosses_defeated bitmask).
-           20 bosses: Duke..Mega Satan (17) + Mom, Mom's Heart, Satan.
+           27 bosses: Duke..Mega Satan (17) + Mom, Mom's Heart, Satan +
+           R9: Isaac (20), The Lamb (21), It Lives (22) +
+           R8: Uriel (23), Gabriel (24), Krampus (25), ??? (26).
            B4: only pay the blocking config_save on FIRST-time defeat. */
         {
             int boss_idx = (int)e->type - (int)ENEMY_BOSS_DUKE;
-            if (boss_idx >= 0 && boss_idx < 20 &&
+            if (boss_idx >= 0 && boss_idx < 27 &&
                 !(g_config.bosses_defeated & (1u << boss_idx))) {
                 g_config.bosses_defeated |= (1u << boss_idx);
                 config_save(&g_config);
             }
         }
-        /* E2: Mom's Heart offers the run-ending choice — the boss-room clear
-           sweep drops the usual trapdoor (to Sheol); we add the "beam of
-           light" end-run object beside it (Ending 1). */
-        if (e->type == ENEMY_BOSS_MOMS_HEART) {
+        /* E2/R9: Mom's Heart — and its post-win form It Lives — offer the
+           route choice: the boss-room clear sweep drops the usual trapdoor
+           (DARK -> Sheol); the "beam of light" beside it is the LIGHT
+           ascent to the Cathedral. */
+        if (e->type == ENEMY_BOSS_MOMS_HEART ||
+            e->type == ENEMY_BOSS_IT_LIVES) {
             r->has_ending_beam = 1;
         }
+        /* R9: Isaac's death spawns the same beam object in the Cathedral —
+           there it IS the run-ending light exit (ending 2). The trapdoor
+           from the clear sweep continues to The Chest (Mega Satan). Any
+           light columns die with him. */
+        if (e->type == ENEMY_BOSS_ISAAC) {
+            r->has_ending_beam = 1;
+            g->vbeam_state = 0;
+            g->vbeam_timer = 0;
+            g->vbeam_count = 0;
+        }
         /* E5: Satan showers black hearts on defeat. Also kill any beam the
-           corpse was charging — its state machine lives in his AI case. */
-        if (e->type == ENEMY_BOSS_SATAN) {
+           corpse was charging — its state machine lives in his AI case.
+           R9: The Lamb shares the beam cleanup (cross flag included). */
+        if (e->type == ENEMY_BOSS_SATAN || e->type == ENEMY_BOSS_THE_LAMB) {
             spawn_heart(r, e->x - 20, e->y + 10, HEART_BLACK);
             spawn_heart(r, e->x + 20, e->y + 10, HEART_BLACK);
             g->ebeam_state = 0;
             g->ebeam_timer = 0;
+            g->ebeam_cross = 0;
+        }
+        /* R8 (M3): angel defeats drop the Mega Satan key halves. Any light
+           column the angel was charging dies with it (same shared-state
+           cleanup discipline as Isaac). */
+        if (e->type == ENEMY_BOSS_URIEL || e->type == ENEMY_BOSS_GABRIEL) {
+            if (e->type == ENEMY_BOSS_URIEL) g->player.has_key_piece_1 = 1;
+            else                             g->player.has_key_piece_2 = 1;
+            snprintf(g->pickup_msg_text, sizeof(g->pickup_msg_text),
+                     (e->type == ENEMY_BOSS_URIEL)
+                         ? "Key Piece 1 - half of the golden key"
+                         : "Key Piece 2 - half of the golden key");
+            g->pickup_msg_timer = 180;
+            g->vbeam_state = 0;
+            g->vbeam_timer = 0;
+            g->vbeam_count = 0;
+        }
+        /* R8 (M7): Krampus leaves his signature pedestal — 50/50 Lump of
+           Coal / Head of Krampus (the ONLY source of both). His brimstone
+           cross dies with him (shared ebeam machine). */
+        if (e->type == ENEMY_BOSS_KRAMPUS) {
+            r->pedestal.x = (ROOM_LEFT + ROOM_RIGHT) / 2.0f;
+            r->pedestal.y = (ROOM_TOP + ROOM_BOTTOM) / 2.0f;
+            r->pedestal.item = randi(0, 1) ? ITEM_HEAD_OF_KRAMPUS
+                                           : ITEM_LUMP_OF_COAL;
+            r->pedestal.active = (g->challenge != 6);
+            g->ebeam_state = 0;
+            g->ebeam_timer = 0;
+            g->ebeam_cross = 0;
+        }
+        /* R8 (M3): Mega Satan is now ONLY fought behind the golden door,
+           and his defeat ends the run directly with the classic escape
+           ending (his room has no exits — no trapdoor epilogue). */
+        if (e->type == ENEMY_BOSS_MEGA_SATAN) {
+            g->win_ending = 0;
+            g->state = STATE_WIN;
+            audio_play(SFX_ROOM_CLEAR);
+            unlock_check_after_win(g);
         }
         /* B3: the boss-defeat epilogue (clear boss_active + floor music)
            only fires when NO other boss-grade enemy is still alive — a
@@ -4476,6 +4752,54 @@ static int kill_enemy(Game *g, Room *r, Enemy *e) {
     return 1;
 }
 
+/* R8 (M3): wake the angel statue in an angel room. Removes the statue and
+ * every remaining freebie (pedestal / hearts / pickups), locks the room,
+ * and spawns URIEL (first angel awakened this run) or GABRIEL (second+).
+ * Triggered by bombing the statue or by room-wide damage (Necronomicon /
+ * Death card / black-heart burst) landing in the room. Minibosses spawn
+ * with FLAT innate HP — no floor scaling (see boss_innate_hp note).
+ * alloc_dynamic_enemy's spawn_grace(10) shields the fresh angel from the
+ * very blast that woke it. Angels never spawn in boss rooms, so the vbeam
+ * machine is free here — their AI still guards vbeam_state anyway. */
+static void awaken_angel(Game *g, Room *r) {
+    if (!r || r->type != ROOM_ANGEL) return;
+    Obstacle *st = NULL;
+    for (int i = 0; i < r->obstacle_count; i++) {
+        if (r->obstacles[i].active &&
+            r->obstacles[i].type == OBST_ANGEL_STATUE) {
+            st = &r->obstacles[i];
+            break;
+        }
+    }
+    if (!st) return;   /* no intact statue = nothing to awaken */
+    st->active = 0;
+
+    /* The fight replaces the room's remaining pickups */
+    r->pedestal.active = 0;
+    for (int i = 0; i < MAX_HEART_PICKUPS; i++)      r->hearts[i].active = 0;
+    for (int i = 0; i < MAX_CONSUMABLE_PICKUPS; i++) r->consumables[i].active = 0;
+
+    EnemyType at = (g->angels_fought == 0) ? ENEMY_BOSS_URIEL
+                                           : ENEMY_BOSS_GABRIEL;
+    g->angels_fought++;
+
+    Enemy *e = alloc_dynamic_enemy(r);
+    if (!e) return;    /* can't happen in practice: angel rooms are empty */
+    const FloorInfo *afi = get_floor_info(g->current_floor);
+    init_boss_enemy(g, afi, e, at, st->x);
+    e->hp = e->max_hp = (float)boss_innate_hp(at);   /* flat miniboss HP */
+    e->x = st->x;
+    e->y = st->y + 14.0f;
+
+    r->cleared = 0;    /* doors slam shut until the angel falls */
+    g->boss_active = 1;
+    g->boss_name = boss_name_str(at);
+    music_play(MUS_BOSS);
+    audio_play(SFX_BOSS);
+    trigger_shake(g, 5.0f, 24);
+    if (g->player.iframes < 45) g->player.iframes = 45;
+}
+
 /* Deal flat damage to every enemy in the room, routing deaths through the
  * shared kill_enemy path (drops, champion splits, boss tracking). Captures
  * the initial count so death-spawned splits aren't hit by the same burst.
@@ -4483,6 +4807,8 @@ static int kill_enemy(Game *g, Room *r, Enemy *e) {
 static void damage_all_enemies(Game *g, float dmg) {
     Room *r = current_room(g);
     if (!r) return;
+    /* R8 (M3): room-wide damage counts as desecrating the angel statue */
+    awaken_angel(g, r);
     int initial = r->enemy_count;
     for (int i = 0; i < initial; i++) {
         Enemy *e = &r->enemies[i];
@@ -4511,6 +4837,56 @@ static void drain_black_burst(Game *g) {
     g_black_burst_pending = 0;
     trigger_shake(g, 6.0f, 24);
     audio_play(SFX_ENEMY_DEATH);
+}
+
+/* R8 (M3): golden-door capstone. Lazily creates a dedicated Mega Satan
+ * boss room in a free grid cell — no doors in or out — and warps the
+ * player in (do_warp_cleanup triggers the boss intro/music/name). Both
+ * key pieces are consumed on the FIRST open; the door then stays open
+ * (mega_created) so a Teleport! escape can never lock the fight away.
+ * Mega Satan keeps his full floor-scaled HP, arena, AI and ending. */
+static void open_mega_satan_room(Game *g) {
+    Dungeon *d = &g->dungeon;
+    if (!g->mega_created) {
+        int fx = -1, fy = -1;
+        for (int yy = 0; yy < DUNGEON_H && fx < 0; yy++) {
+            for (int xx = 0; xx < DUNGEON_W; xx++) {
+                if (d->rooms[yy][xx].type == ROOM_NONE) {
+                    fx = xx; fy = yy;
+                    break;
+                }
+            }
+        }
+        if (fx < 0) return;  /* no free cell — floors cap at 15 of 25 rooms,
+                                so this is unreachable; door just refuses */
+        Room *mr = &d->rooms[fy][fx];
+        memset(mr, 0, sizeof(Room));
+        mr->gx = fx;
+        mr->gy = fy;
+        mr->type = ROOM_BOSS;
+        mr->cleared = 0;
+        mr->enemies_spawned = 1;   /* hand-stocked below */
+        mr->enemy_count = 1;
+        Enemy *me = &mr->enemies[0];
+        memset(me, 0, sizeof(Enemy));
+        me->active = 1;
+        init_boss_enemy(g, get_floor_info(g->current_floor), me,
+                        ENEMY_BOSS_MEGA_SATAN,
+                        (ROOM_LEFT + ROOM_RIGHT) / 2.0f);
+        d->room_count++;
+        g->mega_created = 1;
+        g->mega_gx = fx;
+        g->mega_gy = fy;
+        /* The golden key is spent opening the seal */
+        g->player.has_key_piece_1 = 0;
+        g->player.has_key_piece_2 = 0;
+    }
+    g->current_boss_type = ENEMY_BOSS_MEGA_SATAN;
+    drain_black_burst(g);       /* burst detonates in the room being left */
+    d->cur_x = g->mega_gx;
+    d->cur_y = g->mega_gy;
+    audio_play(SFX_DOOR);
+    do_warp_cleanup(g);
 }
 
 void place_bomb(Game *g) {
@@ -4567,11 +4943,18 @@ static void bomb_explode_ex(Game *g, float bx, float by, float blast,
     audio_play(SFX_ENEMY_DEATH);  /* reuse for explosion sound */
 
     /* Destroy obstacles (rocks/poop) in blast radius. Slot machines and
-       spikes are blast-proof. */
+       spikes are blast-proof. R8 (M3): the angel statue is not destroyed —
+       a blast that reaches it AWAKENS the angel instead. */
     for (int i = 0; i < r->obstacle_count; i++) {
         Obstacle *o = &r->obstacles[i];
         if (!o->active) continue;
         if (o->type == OBST_SLOT_MACHINE || o->type == OBST_SPIKES) continue;
+        if (o->type == OBST_ANGEL_STATUE) {
+            float sdx = o->x - bx, sdy = o->y - by;
+            if (sdx * sdx + sdy * sdy < (blast + 14.0f) * (blast + 14.0f))
+                awaken_angel(g, r);
+            continue;
+        }
         float dx = o->x - bx, dy = o->y - by;
         if (dx * dx + dy * dy < blast * blast) {
             o->active = 0;
@@ -4967,6 +5350,35 @@ void enemies_update(Game *g) {
         fi_speed.enemy_speed_mult *= 1.4f;
         fi_speed.boss_speed_scale *= 1.4f;
         fi = &fi_speed;
+    }
+
+    /* R8 (M7): cosmetic timers (Head of Krampus burst render, lights-dim
+       pulse) + the Krampus ambush countdown for armed devil rooms. */
+    if (g->pbeam_timer > 0) g->pbeam_timer--;
+    if (g->krampus_dim > 0) g->krampus_dim--;
+    if (r->type == ROOM_DEVIL && r->krampus_state == 1 &&
+        g->krampus_timer > 0) {
+        g->krampus_timer--;
+        if (g->krampus_timer == 0) {
+            Enemy *ke = alloc_dynamic_enemy(r);
+            if (ke) {
+                r->krampus_state = 2;   /* never re-arms */
+                init_boss_enemy(g, fi, ke, ENEMY_BOSS_KRAMPUS,
+                                (ROOM_LEFT + ROOM_RIGHT) / 2.0f);
+                /* Minibosses use FLAT innate HP (no floor scaling) */
+                ke->hp = ke->max_hp =
+                    (float)boss_innate_hp(ENEMY_BOSS_KRAMPUS);
+                ke->y = ROOM_TOP + 60.0f;
+                r->cleared = 0;
+                g->boss_active = 1;
+                g->boss_name = boss_name_str(ENEMY_BOSS_KRAMPUS);
+                music_play(MUS_BOSS);
+                audio_play(SFX_BOSS);
+                trigger_shake(g, 6.0f, 24);
+                g->krampus_dim = 40;    /* brief lights-down pulse */
+                if (g->player.iframes < 45) g->player.iframes = 45;
+            }
+        }
     }
 
     /* Pause AI during boss intro */
@@ -6846,9 +7258,13 @@ void enemies_update(Game *g) {
             break;
         }
 
-        case ENEMY_BOSS_MOMS_HEART: {
+        case ENEMY_BOSS_MOMS_HEART:
+        case ENEMY_BOSS_IT_LIVES: {
             /* Mom's Heart (E2): fixed Womb boss. Stationary tank on the
-               Gurdy AI base + periodic enemy waves. */
+               Gurdy AI base + periodic enemy waves.
+               R9 M2: IT LIVES reuses the exact skeleton with hotter
+               timers, bigger waves, and radial shot rings below 25% HP. */
+            int is_il = (e->type == ENEMY_BOSS_IT_LIVES);
             e->timer--;
 
             float hxDiff = p->x - e->x;
@@ -6862,16 +7278,16 @@ void enemies_update(Game *g) {
             if (e->timer <= 0) {
                 e->phase = (e->phase + 1) % 3;
                 if (e->phase == 0) {
-                    e->timer = 55;
+                    e->timer = is_il ? 45 : 55;
                 } else if (e->phase == 1) {
-                    /* Wave spawn: 2-3 minions, capped at 6 alive */
+                    /* Wave spawn: 2-3 minions (It Lives: 3-4), capped at 6 alive */
                     int alive_minions = 0;
                     for (int mi = 0; mi < r->enemy_count; mi++) {
                         if (r->enemies[mi].active &&
                             !is_boss_type(r->enemies[mi].type)) alive_minions++;
                     }
                     if (alive_minions < 6) {
-                        int wave = 2 + randi(0, 1);
+                        int wave = 2 + randi(0, 1) + (is_il ? 1 : 0);
                         for (int s = 0; s < wave; s++) {
                             int kind = randi(0, 2);
                             if (kind == 0) boss_spawn_fly(g, r, e->x, e->y);
@@ -6879,7 +7295,7 @@ void enemies_update(Game *g) {
                             else boss_spawn_pooter(r, e->x, e->y);
                         }
                     }
-                    e->timer = 95;
+                    e->timer = is_il ? 70 : 95;
                 } else {
                     /* Shot spread + aimed shot */
                     boss_spread_8way(g, e->x, e->y, BOSS_SHOT_SPEED * 0.85f);
@@ -6890,7 +7306,26 @@ void enemies_update(Game *g) {
                         boss_shoot_tear(g, e->x, e->y,
                                         (hfdx / hfm) * spd, (hfdy / hfm) * spd);
                     }
-                    e->timer = 70;
+                    e->timer = is_il ? 60 : 70;
+                }
+            }
+
+            /* It Lives final-25% desperation: rotating radial shot rings
+               on their own cooldown (famine_shoot_cd is unused by this AI
+               base). Deterministic ring angles from attack_pattern. */
+            if (is_il && e->hp < e->max_hp * 0.25f) {
+                e->famine_shoot_cd--;
+                if (e->famine_shoot_cd <= 0) {
+                    e->famine_shoot_cd = 85;
+                    e->attack_pattern++;
+                    float roff = (float)e->attack_pattern * 0.31f;
+                    for (int ri = 0; ri < 10; ri++) {
+                        float ra = roff + ri * (2.0f * (float)M_PI / 10.0f);
+                        boss_shoot_tear(g, e->x, e->y,
+                                        cosf(ra) * BOSS_SHOT_SPEED * 0.9f,
+                                        sinf(ra) * BOSS_SHOT_SPEED * 0.9f);
+                    }
+                    trigger_shake(g, 3.0f, 10);
                 }
             }
             break;
@@ -7064,6 +7499,612 @@ void enemies_update(Game *g) {
                         e->dy = 0;
                     }
                 }
+            }
+            break;
+        }
+
+        case ENEMY_BOSS_ISAAC: {
+            /* Isaac (R9 C1): Cathedral fixed boss, holy theme, 3 HP-driven
+               phases in e->phase. e->state: 1 = praying (floats, NO contact
+               damage — see boss_praying), 0 = dodge-hop dash.
+               p0 (> 2/3): tear-ring bursts (8-11 radial) + dodge hops
+               p1 (1/3..2/3): light-beam barrage — g->vbeam_* columns with a
+                              ~40f ground-marker telegraph, ~20f of damage
+               p2 (< 1/3):    desperation — faster rings + 3-beam volleys +
+                              2 angelic flies kept alive. */
+            e->timer--;
+
+            {
+                int hp_phase = (e->hp > e->max_hp * 0.66f) ? 0
+                             : (e->hp > e->max_hp * 0.33f) ? 1 : 2;
+                if (hp_phase != e->phase) {
+                    e->phase = hp_phase;
+                    e->state = 1;        /* re-enter prayer on phase shift */
+                    e->timer = 45;
+                    e->shoot_timer = 60;
+                    e->dx = 0; e->dy = 0;
+                    trigger_shake(g, 5.0f, 20);
+                    boss_phase_juice(g, e);
+                }
+            }
+
+            /* Praying float: drift gently toward the altar spot up top */
+            if (!suppressAI && e->state == 1) {
+                float icx = (ROOM_LEFT + ROOM_RIGHT) / 2.0f;
+                float icy = ROOM_TOP + 70.0f;
+                e->x += (icx - e->x) * 0.012f;
+                e->y += (icy - e->y) * 0.012f;
+            }
+
+            if (e->phase == 0) {
+                /* P1: pray -> quick dodge-hop -> radial tear ring -> pray */
+                if (e->timer <= 0) {
+                    if (e->state == 1) {
+                        /* Hop: short dash toward the player (contact ON) */
+                        e->state = 0;
+                        e->timer = 24;
+                        float hdx = p->x - e->x, hdy = p->y - e->y;
+                        float hm = sqrtf(hdx * hdx + hdy * hdy);
+                        if (hm < 1.0f) hm = 1.0f;
+                        float hspd = 2.2f * fi->boss_speed_scale;
+                        e->dx = (hdx / hm) * hspd;
+                        e->dy = (hdy / hm) * hspd;
+                    } else {
+                        /* Land: ring burst, back to prayer */
+                        e->state = 1;
+                        e->timer = randi(55, 85);
+                        e->attack_pattern++;
+                        int ring = 8 + (e->attack_pattern & 3);   /* 8-11 */
+                        float roff = (float)e->attack_pattern * 0.39f;
+                        for (int ri = 0; ri < ring; ri++) {
+                            float ra = roff + ri * (2.0f * (float)M_PI / ring);
+                            boss_shoot_tear(g, e->x, e->y,
+                                            cosf(ra) * BOSS_SHOT_SPEED,
+                                            sinf(ra) * BOSS_SHOT_SPEED);
+                        }
+                        trigger_shake(g, 3.0f, 10);
+                        e->dx = 0; e->dy = 0;
+                    }
+                }
+                if (e->state == 0 && !suppressAI) {
+                    e->x += e->dx; e->y += e->dy;
+                    e->dx *= 0.94f; e->dy *= 0.94f;
+                }
+            } else if (e->phase == 1) {
+                /* P2: stays praying; single light column on the player */
+                e->state = 1;
+                if (g->vbeam_state == 0 && e->timer <= 0) {
+                    g->vbeam_count = 1;
+                    g->vbeam_x[0] = clampf(p->x, ROOM_LEFT + 12.0f,
+                                           ROOM_RIGHT - 12.0f);
+                    g->vbeam_state = 1;      /* ground-marker telegraph */
+                    g->vbeam_timer = 40;
+                    audio_play(SFX_BOSS);
+                    e->timer = 110;
+                }
+                /* Occasional small ring so P2 isn't beam-only */
+                e->shoot_timer--;
+                if (e->shoot_timer <= 0) {
+                    e->shoot_timer = 120;
+                    e->attack_pattern++;
+                    float roff = (float)e->attack_pattern * 0.52f;
+                    for (int ri = 0; ri < 6; ri++) {
+                        float ra = roff + ri * (2.0f * (float)M_PI / 6.0f);
+                        boss_shoot_tear(g, e->x, e->y,
+                                        cosf(ra) * BOSS_SHOT_SPEED * 0.9f,
+                                        sinf(ra) * BOSS_SHOT_SPEED * 0.9f);
+                    }
+                }
+            } else {
+                /* P3 desperation: faster rings + 3-column volleys + flies */
+                e->state = 1;
+                e->shoot_timer--;
+                if (e->shoot_timer <= 0) {
+                    e->shoot_timer = 55;
+                    e->attack_pattern++;
+                    int ring = 10 + (e->attack_pattern & 1);
+                    float roff = (float)e->attack_pattern * 0.47f;
+                    for (int ri = 0; ri < ring; ri++) {
+                        float ra = roff + ri * (2.0f * (float)M_PI / ring);
+                        boss_shoot_tear(g, e->x, e->y,
+                                        cosf(ra) * BOSS_SHOT_SPEED,
+                                        sinf(ra) * BOSS_SHOT_SPEED);
+                    }
+                }
+                if (g->vbeam_state == 0 && e->timer <= 0) {
+                    float bxc = clampf(p->x, ROOM_LEFT + 72.0f,
+                                       ROOM_RIGHT - 72.0f);
+                    g->vbeam_count = 3;
+                    g->vbeam_x[0] = bxc;
+                    g->vbeam_x[1] = bxc - 60.0f;
+                    g->vbeam_x[2] = bxc + 60.0f;
+                    g->vbeam_state = 1;
+                    g->vbeam_timer = 40;
+                    audio_play(SFX_BOSS);
+                    e->timer = 140;
+                }
+                /* Keep 2 angelic flies in the fight */
+                if (count_alive_flies(r) < 2 && (g->frame % 150) == 0) {
+                    boss_spawn_fly(g, r, e->x, e->y);
+                    boss_spawn_fly(g, r, e->x, e->y);
+                }
+            }
+
+            /* Light-column state machine + damage (driven here, mirroring
+               how Satan's case owns the ebeam machine) */
+            if (g->vbeam_state == 1) {
+                g->vbeam_timer--;
+                if (g->vbeam_timer <= 0) {
+                    g->vbeam_state = 2;
+                    g->vbeam_timer = 20;
+                    trigger_shake(g, 4.0f, 12);
+                    audio_play(SFX_BOSS);
+                }
+            } else if (g->vbeam_state == 2) {
+                g->vbeam_timer--;
+                if (p->iframes == 0) {
+                    for (int vi = 0; vi < g->vbeam_count; vi++) {
+                        if (fabsf(p->x - g->vbeam_x[vi]) <
+                            PLAYER_SIZE + 9.0f) {
+                            p->hp -= player_absorb_dmg(p, 2);
+                            p->iframes = PLAYER_IFRAMES;
+                            g->hitstop = 3;
+                            audio_play(SFX_HURT_GRUNT);
+                            trigger_shake(g, 5.0f, 18);
+                            if (player_check_death(p)) {
+                                audio_play(SFX_PLAYER_DEATH);
+                                g->state = STATE_GAMEOVER;
+                            }
+                            break;
+                        }
+                    }
+                }
+                if (g->vbeam_timer <= 0) {
+                    g->vbeam_state = 0;
+                    g->vbeam_count = 0;
+                }
+            }
+            break;
+        }
+
+        case ENEMY_BOSS_THE_LAMB: {
+            /* The Lamb (R9 C1): Dark Room fixed boss, demonic mirror of
+               Isaac. HP phases in e->phase:
+               p0 (> 60%): slow chase + 4-way brimstone crosses (the shared
+                           g->ebeam_* machine with ebeam_cross set)
+               p1 (25-60%): detaches the Lamb Body (Gemini companion
+                            fields: body chases with contact damage and is
+                            killable via gemini_chp; head goes stationary
+                            turret with rotating radial bursts)
+               p2 (< 25%):  enrage — every timer runs at ~60%. */
+            e->timer--;
+
+            {
+                int lphase = (e->hp > e->max_hp * 0.60f) ? 0
+                           : (e->hp > e->max_hp * 0.25f) ? 1 : 2;
+                if (lphase != e->phase) {
+                    e->phase = lphase;
+                    e->timer = 45;
+                    trigger_shake(g, 5.0f, 20);
+                    boss_phase_juice(g, e);
+                    if (lphase >= 1 && !e->gemini_split) {
+                        /* Detach the Lamb Body: killable chaser */
+                        e->gemini_split = 1;
+                        e->gemini_chp = (int)(e->max_hp * 0.25f);
+                        if (e->gemini_chp < 8) e->gemini_chp = 8;
+                        e->gemini_cx = e->x;
+                        e->gemini_cy = e->y + 22;
+                        audio_play(SFX_BOSS);
+                    }
+                }
+            }
+
+            float enr = (e->phase == 2) ? 0.6f : 1.0f;   /* enrage scale */
+
+            if (!e->gemini_split) {
+                /* P1: slow chase while whole */
+                if (!suppressAI) {
+                    float ldx = p->x - e->x, ldy = p->y - e->y;
+                    float lm = sqrtf(ldx * ldx + ldy * ldy);
+                    if (lm > 60.0f) {
+                        float lspd = 0.5f * fi->boss_speed_scale;
+                        e->x += (ldx / lm) * lspd;
+                        e->y += (ldy / lm) * lspd;
+                    }
+                }
+                if (g->ebeam_state == 0 && e->timer <= 0) {
+                    g->ebeam_x = e->x;
+                    g->ebeam_y = e->y;
+                    g->ebeam_dx = 1.0f; g->ebeam_dy = 0.0f; /* unused (cross) */
+                    ebeam_clip_endpoint(g);
+                    g->ebeam_cross = 1;
+                    g->ebeam_state = 1;    /* telegraph */
+                    g->ebeam_timer = 35;
+                    audio_play(SFX_BOSS);
+                    e->timer = (int)(150 * enr);
+                }
+            } else {
+                /* Head: stationary turret with rotating bursts */
+                e->dx *= 0.85f;
+                e->dy *= 0.85f;
+                e->shoot_timer--;
+                if (e->shoot_timer <= 0) {
+                    e->shoot_timer = (int)(80 * enr);
+                    e->attack_pattern++;
+                    float roff = (float)e->attack_pattern * 0.39f;
+                    for (int ri = 0; ri < 8; ri++) {
+                        float ra = roff + ri * (2.0f * (float)M_PI / 8.0f);
+                        boss_shoot_tear(g, e->x, e->y,
+                                        cosf(ra) * BOSS_SHOT_SPEED,
+                                        sinf(ra) * BOSS_SHOT_SPEED);
+                    }
+                    /* plus one aimed shot */
+                    float afdx = p->x - e->x, afdy = p->y - e->y;
+                    float afm = sqrtf(afdx * afdx + afdy * afdy);
+                    if (afm > 1.0f) {
+                        float aspd = BOSS_SHOT_SPEED * 1.2f;
+                        boss_shoot_tear(g, e->x, e->y,
+                                        (afdx / afm) * aspd,
+                                        (afdy / afm) * aspd);
+                    }
+                }
+                /* Crosses keep coming, slower than P1's cadence */
+                if (g->ebeam_state == 0 && e->timer <= 0) {
+                    g->ebeam_x = e->x;
+                    g->ebeam_y = e->y;
+                    g->ebeam_dx = 1.0f; g->ebeam_dy = 0.0f;
+                    ebeam_clip_endpoint(g);
+                    g->ebeam_cross = 1;
+                    g->ebeam_state = 1;
+                    g->ebeam_timer = 35;
+                    audio_play(SFX_BOSS);
+                    e->timer = (int)(190 * enr);
+                }
+                /* Lamb Body: chases the player (killable, contact dmg) */
+                if (e->gemini_chp > 0 && !suppressAI) {
+                    float bdx2 = p->x - e->gemini_cx;
+                    float bdy2 = p->y - e->gemini_cy;
+                    float bm2 = sqrtf(bdx2 * bdx2 + bdy2 * bdy2);
+                    if (bm2 > 1.0f) {
+                        float bspd = 1.3f * fi->boss_speed_scale *
+                                     (e->phase == 2 ? 1.35f : 1.0f);
+                        e->gemini_cx += (bdx2 / bm2) * bspd;
+                        e->gemini_cy += (bdy2 / bm2) * bspd;
+                    }
+                    e->gemini_cx = clampf(e->gemini_cx,
+                                          ROOM_LEFT + ENEMY_SIZE,
+                                          ROOM_RIGHT - ENEMY_SIZE);
+                    e->gemini_cy = clampf(e->gemini_cy,
+                                          ROOM_TOP + ENEMY_SIZE,
+                                          ROOM_BOTTOM - ENEMY_SIZE);
+                }
+            }
+
+            /* Cross-beam state machine + damage (this case owns the ebeam
+               while The Lamb is alive; Satan never runs in this room) */
+            if (g->ebeam_state == 1) {
+                g->ebeam_timer--;
+                if (g->ebeam_timer <= 0) {
+                    g->ebeam_state = 2;
+                    g->ebeam_timer = 12;
+                    trigger_shake(g, 5.0f, 12);
+                }
+            } else if (g->ebeam_state == 2) {
+                g->ebeam_timer--;
+                if (p->iframes == 0) {
+                    float rr = PLAYER_SIZE + 5.0f;
+                    if (fabsf(p->y - g->ebeam_y) < rr ||
+                        fabsf(p->x - g->ebeam_x) < rr) {
+                        p->hp -= player_absorb_dmg(p, 2);
+                        p->iframes = PLAYER_IFRAMES;
+                        g->hitstop = 3;
+                        audio_play(SFX_HURT_GRUNT);
+                        trigger_shake(g, 5.0f, 18);
+                        if (player_check_death(p)) {
+                            audio_play(SFX_PLAYER_DEATH);
+                            g->state = STATE_GAMEOVER;
+                        }
+                    }
+                }
+                if (g->ebeam_timer <= 0) {
+                    g->ebeam_state = 0;
+                    g->ebeam_cross = 0;
+                }
+            }
+
+            /* Lamb Body contact damage (mirrors Gemini's companion hit) */
+            if (e->gemini_split && e->gemini_chp > 0 && p->iframes == 0) {
+                float cdx2 = p->x - e->gemini_cx;
+                float cdy2 = p->y - e->gemini_cy;
+                float cds2 = cdx2 * cdx2 + cdy2 * cdy2;
+                float crad2 = PLAYER_SIZE + ENEMY_SIZE;
+                if (cds2 < crad2 * crad2) {
+                    p->hp -= player_absorb_dmg(p, 2);
+                    p->iframes = PLAYER_IFRAMES;
+                    g->hitstop = 3;
+                    float cm2 = sqrtf(cds2);
+                    if (cm2 > 0.1f) {
+                        p->vx = (cdx2 / cm2) * PLAYER_KB_FORCE;
+                        p->vy = (cdy2 / cm2) * PLAYER_KB_FORCE;
+                    }
+                    audio_play(SFX_HURT_GRUNT);
+                    trigger_shake(g, 4.0f, 12);
+                    if (player_check_death(p)) {
+                        audio_play(SFX_PLAYER_DEATH);
+                        g->state = STATE_GAMEOVER;
+                    }
+                }
+            }
+            break;
+        }
+
+        case ENEMY_BOSS_URIEL:
+        case ENEMY_BOSS_GABRIEL: {
+            /* R8 (M3): angel minibosses, shared AI with two tuning sets.
+               Uriel: slow hover-chase, 3-shot volleys, single light column.
+               Gabriel: faster hover, 4-5 shot volleys, tighter cooldowns,
+               twin columns. The g->vbeam_* machine is Game-level SHARED
+               state: every use is gated on vbeam_state == 0, and this case
+               drives the telegraph->fire->damage machine exactly like
+               Isaac's (an angel and Isaac can never share a room — angels
+               only wake in angel rooms — but the guard stands anyway). */
+            int gab = (e->type == ENEMY_BOSS_GABRIEL);
+            e->timer--;
+
+            /* Hover-chase: approach to ~60px, deterministic bob */
+            if (!suppressAI) {
+                float adx = p->x - e->x, ady = p->y - e->y;
+                float am = sqrtf(adx * adx + ady * ady);
+                if (am > 1.0f) {
+                    float aspd = (gab ? 0.85f : 0.55f) * fi->boss_speed_scale;
+                    if (am < 60.0f) aspd = -aspd * 0.6f;  /* keep distance */
+                    e->x += (adx / am) * aspd;
+                    e->y += (ady / am) * aspd;
+                }
+                e->y += sinf((float)g->frame * 0.07f) * 0.35f;
+            }
+
+            /* Light-shot volleys: 3 (Uriel) / 4-5 (Gabriel) aimed shots
+               fanned around the player direction */
+            e->shoot_timer--;
+            if (e->shoot_timer <= 0) {
+                e->shoot_timer = gab ? randi(50, 70) : randi(75, 100);
+                e->attack_pattern++;
+                int vol = gab ? (4 + (e->attack_pattern & 1)) : 3;
+                float vdx = p->x - e->x, vdy = p->y - e->y;
+                float vm = sqrtf(vdx * vdx + vdy * vdy);
+                if (vm > 1.0f) {
+                    float vbase = atan2f(vdy, vdx);
+                    float spread = gab ? 0.5f : 0.35f;
+                    for (int vi = 0; vi < vol; vi++) {
+                        float fr = (vol > 1)
+                                 ? ((float)vi / (float)(vol - 1) - 0.5f)
+                                 : 0.0f;
+                        float va = vbase + fr * spread;
+                        boss_shoot_tear(g, e->x, e->y,
+                                        cosf(va) * BOSS_SHOT_SPEED,
+                                        sinf(va) * BOSS_SHOT_SPEED);
+                    }
+                }
+            }
+
+            /* Occasional light column on the player — ONLY if the shared
+               machine is idle. Gabriel drops a second offset column. */
+            if (g->vbeam_state == 0 && e->timer <= 0) {
+                float bxc = clampf(p->x,
+                                   ROOM_LEFT + (gab ? 72.0f : 12.0f),
+                                   ROOM_RIGHT - (gab ? 72.0f : 12.0f));
+                g->vbeam_count = gab ? 2 : 1;
+                g->vbeam_x[0] = bxc;
+                if (gab)
+                    g->vbeam_x[1] = bxc +
+                        ((e->attack_pattern & 1) ? -55.0f : 55.0f);
+                g->vbeam_state = 1;      /* ground-marker telegraph */
+                g->vbeam_timer = 40;
+                audio_play(SFX_BOSS);
+                e->timer = gab ? 130 : 170;
+            }
+
+            /* Column state machine + damage (mirrors Isaac's case; only
+               one angel is ever alive so this ticks once per frame) */
+            if (g->vbeam_state == 1) {
+                g->vbeam_timer--;
+                if (g->vbeam_timer <= 0) {
+                    g->vbeam_state = 2;
+                    g->vbeam_timer = 20;
+                    trigger_shake(g, 4.0f, 12);
+                    audio_play(SFX_BOSS);
+                }
+            } else if (g->vbeam_state == 2) {
+                g->vbeam_timer--;
+                if (p->iframes == 0) {
+                    for (int vi = 0; vi < g->vbeam_count; vi++) {
+                        if (fabsf(p->x - g->vbeam_x[vi]) <
+                            PLAYER_SIZE + 9.0f) {
+                            p->hp -= player_absorb_dmg(p, 2);
+                            p->iframes = PLAYER_IFRAMES;
+                            g->hitstop = 3;
+                            audio_play(SFX_HURT_GRUNT);
+                            trigger_shake(g, 5.0f, 18);
+                            if (player_check_death(p)) {
+                                audio_play(SFX_PLAYER_DEATH);
+                                g->state = STATE_GAMEOVER;
+                            }
+                            break;
+                        }
+                    }
+                }
+                if (g->vbeam_timer <= 0) {
+                    g->vbeam_state = 0;
+                    g->vbeam_count = 0;
+                }
+            }
+            break;
+        }
+
+        case ENEMY_BOSS_KRAMPUS: {
+            /* R8 (M7): devil-room ambush. Chase + 4-way brimstone cross
+               (the SHARED g->ebeam_* machine with ebeam_cross set — every
+               use gated on ebeam_state == 0; Satan / The Lamb can never
+               share a devil room with him) + slow coal-lob volleys. */
+            e->timer--;
+
+            if (!suppressAI) {
+                float kdx = p->x - e->x, kdy = p->y - e->y;
+                float km = sqrtf(kdx * kdx + kdy * kdy);
+                if (km > 40.0f) {
+                    float kspd = 0.7f * fi->boss_speed_scale;
+                    e->x += (kdx / km) * kspd;
+                    e->y += (kdy / km) * kspd;
+                }
+            }
+
+            /* Coal lobs: 2-3 slow heavy shots fanned at the player */
+            e->shoot_timer--;
+            if (e->shoot_timer <= 0) {
+                e->shoot_timer = randi(70, 100);
+                e->attack_pattern++;
+                int lobs = 2 + (e->attack_pattern & 1);
+                float ldx = p->x - e->x, ldy = p->y - e->y;
+                float lm = sqrtf(ldx * ldx + ldy * ldy);
+                if (lm > 1.0f) {
+                    float lbase = atan2f(ldy, ldx);
+                    for (int li = 0; li < lobs; li++) {
+                        float fr = (lobs > 1)
+                                 ? ((float)li / (float)(lobs - 1) - 0.5f)
+                                 : 0.0f;
+                        float la = lbase + fr * 0.6f;
+                        boss_shoot_tear(g, e->x, e->y,
+                                        cosf(la) * BOSS_SHOT_SPEED * 0.7f,
+                                        sinf(la) * BOSS_SHOT_SPEED * 0.7f);
+                    }
+                }
+            }
+
+            /* 4-way brimstone cross when the shared machine is idle */
+            if (g->ebeam_state == 0 && e->timer <= 0) {
+                g->ebeam_x = e->x;
+                g->ebeam_y = e->y;
+                g->ebeam_dx = 1.0f; g->ebeam_dy = 0.0f; /* unused (cross) */
+                ebeam_clip_endpoint(g);
+                g->ebeam_cross = 1;
+                g->ebeam_state = 1;      /* telegraph */
+                g->ebeam_timer = 35;
+                audio_play(SFX_BOSS);
+                e->timer = 160;
+            }
+
+            /* Cross state machine + damage (this case owns the ebeam
+               while Krampus is alive — same pattern as The Lamb) */
+            if (g->ebeam_state == 1) {
+                g->ebeam_timer--;
+                if (g->ebeam_timer <= 0) {
+                    g->ebeam_state = 2;
+                    g->ebeam_timer = 12;
+                    trigger_shake(g, 5.0f, 12);
+                }
+            } else if (g->ebeam_state == 2) {
+                g->ebeam_timer--;
+                if (p->iframes == 0) {
+                    float krr = PLAYER_SIZE + 5.0f;
+                    if (fabsf(p->y - g->ebeam_y) < krr ||
+                        fabsf(p->x - g->ebeam_x) < krr) {
+                        p->hp -= player_absorb_dmg(p, 2);
+                        p->iframes = PLAYER_IFRAMES;
+                        g->hitstop = 3;
+                        audio_play(SFX_HURT_GRUNT);
+                        trigger_shake(g, 5.0f, 18);
+                        if (player_check_death(p)) {
+                            audio_play(SFX_PLAYER_DEATH);
+                            g->state = STATE_GAMEOVER;
+                        }
+                    }
+                }
+                if (g->ebeam_timer <= 0) {
+                    g->ebeam_state = 0;
+                    g->ebeam_cross = 0;
+                }
+            }
+            break;
+        }
+
+        case ENEMY_BOSS_BLUE_BABY: {
+            /* R8 (M3): ??? (Blue Baby) — Isaac's hop/ring skeleton, dark
+               mirror: NO light columns (never touches g->vbeam_*), denser
+               rings, aimed volleys below 2/3 HP, quickening cadence.
+               Contact damage stays ON (no prayer float — boss_praying is
+               Isaac-only). */
+            e->timer--;
+
+            {
+                int bp = (e->hp > e->max_hp * 0.66f) ? 0
+                       : (e->hp > e->max_hp * 0.33f) ? 1 : 2;
+                if (bp != e->phase) {
+                    e->phase = bp;
+                    e->timer = 40;
+                    trigger_shake(g, 5.0f, 20);
+                    boss_phase_juice(g, e);
+                }
+            }
+
+            if (e->timer <= 0) {
+                if (e->state == 1) {
+                    /* Hop: short dash toward the player */
+                    e->state = 0;
+                    e->timer = 22;
+                    float hdx = p->x - e->x, hdy = p->y - e->y;
+                    float hm = sqrtf(hdx * hdx + hdy * hdy);
+                    if (hm < 1.0f) hm = 1.0f;
+                    float hspd = (2.2f + 0.4f * (float)e->phase) *
+                                 fi->boss_speed_scale;
+                    e->dx = (hdx / hm) * hspd;
+                    e->dy = (hdy / hm) * hspd;
+                } else {
+                    /* Land: dense radial ring (10-14), back to hover */
+                    e->state = 1;
+                    e->timer = randi(45, 70) - e->phase * 8;
+                    e->attack_pattern++;
+                    int ring = 10 + (e->attack_pattern % 3) + e->phase;
+                    float roff = (float)e->attack_pattern * 0.43f;
+                    for (int ri = 0; ri < ring; ri++) {
+                        float ra = roff + ri * (2.0f * (float)M_PI / ring);
+                        boss_shoot_tear(g, e->x, e->y,
+                                        cosf(ra) * BOSS_SHOT_SPEED,
+                                        sinf(ra) * BOSS_SHOT_SPEED);
+                    }
+                    trigger_shake(g, 3.0f, 10);
+                    e->dx = 0; e->dy = 0;
+                }
+            }
+            if (e->state == 0 && !suppressAI) {
+                e->x += e->dx; e->y += e->dy;
+                e->dx *= 0.94f; e->dy *= 0.94f;
+            }
+
+            /* Below 2/3 HP: extra aimed 3-volley on its own cooldown */
+            if (e->phase >= 1) {
+                e->shoot_timer--;
+                if (e->shoot_timer <= 0) {
+                    e->shoot_timer = (e->phase == 2) ? 55 : 75;
+                    float bdx = p->x - e->x, bdy = p->y - e->y;
+                    float bm = sqrtf(bdx * bdx + bdy * bdy);
+                    if (bm > 1.0f) {
+                        float bbase = atan2f(bdy, bdx);
+                        for (int vi = 0; vi < 3; vi++) {
+                            float va = bbase + (float)(vi - 1) * 0.28f;
+                            boss_shoot_tear(g, e->x, e->y,
+                                            cosf(va) * BOSS_SHOT_SPEED * 1.1f,
+                                            sinf(va) * BOSS_SHOT_SPEED * 1.1f);
+                        }
+                    }
+                }
+            }
+
+            /* Desperation: keep 2 flies in the fight */
+            if (e->phase == 2 && count_alive_flies(r) < 2 &&
+                (g->frame % 160) == 0) {
+                boss_spawn_fly(g, r, e->x, e->y);
+                boss_spawn_fly(g, r, e->x, e->y);
             }
             break;
         }
@@ -7612,6 +8653,13 @@ void enemies_update(Game *g) {
         case ENEMY_BOSS_MOM:
         case ENEMY_BOSS_MOMS_HEART:
         case ENEMY_BOSS_SATAN:
+        case ENEMY_BOSS_ISAAC:
+        case ENEMY_BOSS_THE_LAMB:
+        case ENEMY_BOSS_IT_LIVES:
+        case ENEMY_BOSS_URIEL:
+        case ENEMY_BOSS_GABRIEL:
+        case ENEMY_BOSS_KRAMPUS:
+        case ENEMY_BOSS_BLUE_BABY:
             sz = ENEMY_SIZE * 2;
             break;
         default: break;
@@ -7625,11 +8673,11 @@ void enemies_update(Game *g) {
     for (int i = 0; i < r->enemy_count; i++) {
         Enemy *a = &r->enemies[i];
         if (!a->active) continue;
-        int aBoss = (a->type >= ENEMY_BOSS_DUKE && a->type <= ENEMY_BOSS_SATAN);
+        int aBoss = (a->type >= ENEMY_BOSS_DUKE && a->type <= ENEMY_BOSS_BLUE_BABY);
         for (int j = i + 1; j < r->enemy_count; j++) {
             Enemy *b = &r->enemies[j];
             if (!b->active) continue;
-            int bBoss = (b->type >= ENEMY_BOSS_DUKE && b->type <= ENEMY_BOSS_SATAN);
+            int bBoss = (b->type >= ENEMY_BOSS_DUKE && b->type <= ENEMY_BOSS_BLUE_BABY);
             float dx = b->x - a->x;
             float dy = b->y - a->y;
             float minD = ENEMY_SIZE * 1.6f;
@@ -7658,9 +8706,11 @@ static int circle_overlap(float x1, float y1, float r1,
 }
 
 static int is_boss_type(EnemyType t) {
-    /* Boss block runs Duke..Satan (Mom/Mom's Heart/Satan sit after Mega
-       Satan in the enum, still before the minion types). */
-    return t >= ENEMY_BOSS_DUKE && t <= ENEMY_BOSS_SATAN;
+    /* Boss block runs Duke..??? (Blue Baby). Mom/Mom's Heart/Satan, the R9
+       trio Isaac/The Lamb/It Lives, and the R8 quartet Uriel/Gabriel/
+       Krampus/Blue Baby all sit after Mega Satan in the enum, still before
+       the minion types. */
+    return t >= ENEMY_BOSS_DUKE && t <= ENEMY_BOSS_BLUE_BABY;
 }
 
 void collisions_update(Game *g) {
@@ -7695,6 +8745,13 @@ void collisions_update(Game *g) {
                 /* Float damage: fractional damage bonuses count for real.
                    Tiny floor so a cursed near-zero build still chips. */
                 float dmg = t->dmg;
+                /* R8 (M7) Lump of Coal: +0.03 damage per frame the tear
+                   flew before impact, capped at +2.5 (tears only). */
+                if ((p->stats.flags & ITEM_FLAG_COAL) && !t->is_enemy) {
+                    float coal = (float)t->anim_frame * 0.03f;
+                    if (coal > 2.5f) coal = 2.5f;
+                    dmg += coal;
+                }
                 if (dmg < 0.1f) dmg = 0.1f;
                 e->hp -= dmg;
                 /* Snappier hit-flash (was 6) — about 14 frames feels more
@@ -7745,13 +8802,15 @@ void collisions_update(Game *g) {
                     if (!e->active) break;
                 }
             } else if ((e->type == ENEMY_BOSS_GEMINI ||
-                        e->type == ENEMY_BOSS_STEVEN) &&
+                        e->type == ENEMY_BOSS_STEVEN ||
+                        e->type == ENEMY_BOSS_THE_LAMB) &&
                        e->gemini_chp > 0 && !e->hidden &&
                        circle_overlap(t->x, t->y, TEAR_RADIUS,
                                       e->gemini_cx, e->gemini_cy, 10.0f)) {
                 /* R8 #19: the second head is a real, killable target —
                    tears drain gemini_chp; at 0 the head goes down (no
-                   contact damage, not drawn) and the survivor enrages. */
+                   contact damage, not drawn) and the survivor enrages.
+                   R9: The Lamb's detached body uses the same fields. */
                 int hd = (int)t->dmg;
                 if (hd < 1) hd = 1;
                 e->gemini_chp -= hd;
@@ -7779,7 +8838,8 @@ void collisions_update(Game *g) {
            full heart from Sheol on (floor >= 6); big bruisers (Fatty /
            Leaper / Vis) already hit full on the Womb (floor 5). */
         if (e->active && p->iframes == 0 && !e->hidden && e->spawn_grace == 0 &&
-            !boss_airborne(e, NULL) /* R8 #18: no contact while mid-jump */) {
+            !boss_airborne(e, NULL) /* R8 #18: no contact while mid-jump */ &&
+            !boss_praying(e)   /* R9: Isaac deals no contact while praying */) {
             if (circle_overlap(p->x, p->y, PLAYER_SIZE, e->x, e->y, esz)) {
                 int big_bruiser = (e->type == ENEMY_FATTY ||
                                    e->type == ENEMY_LEAPER ||
@@ -7979,7 +9039,11 @@ void collisions_update(Game *g) {
                    zeroes the roll). 50/50 Devil vs Angel when it succeeds. */
                 int deal_chance = 15 + (g->floor_red_dmg ? 0 : 35);
                 if (randi(0, 99) < deal_chance) {
-                    int wantAngel = (randi(0, 99) < 50);
+                    /* R8 (M3): once the player has bought ANY devil deal
+                       this run, angels stop appearing — the flip always
+                       chooses the devil room (Rebirth rule). */
+                    int wantAngel = g->took_devil_deal ? 0
+                                                       : (randi(0, 99) < 50);
                     Dungeon *dd2 = &g->dungeon;
                     int bx2 = dd2->cur_x, by2 = dd2->cur_y;
                     int ddx2[] = {0, 0, -1, 1}, ddy2[] = {-1, 1, 0, 0};
@@ -8011,12 +9075,35 @@ void collisions_update(Game *g) {
                             dr->pedestal.active = (g->challenge != 6);
                             spawn_heart(dr, ROOM_LEFT + 60, ROOM_TOP + 60, HEART_SOUL);
                             spawn_heart(dr, ROOM_RIGHT - 60, ROOM_TOP + 60, HEART_SOUL);
+                            /* R8 (M3): this creation path skips
+                               room_spawn_enemies, so place the angel
+                               statue here too. */
+                            if (dr->obstacle_count < MAX_OBSTACLES) {
+                                Obstacle *st = &dr->obstacles[dr->obstacle_count++];
+                                st->x = (ROOM_LEFT + ROOM_RIGHT) / 2.0f;
+                                st->y = ROOM_TOP + 44.0f;
+                                st->type = OBST_ANGEL_STATUE;
+                                st->hp = 1;
+                                st->active = 1;
+                            }
                         } else {
                             dr->type = ROOM_DEVIL;
                             dr->doors[opp2[di2]] = 1;
                             dr->door_type[opp2[di2]] = 5;   /* devil door */
                             r->doors[di2] = 1;
                             r->door_type[di2] = 5;
+
+                            /* R8 (M7): ~10% of devil rooms are a KRAMPUS
+                               ambush instead — no stock, no free black
+                               heart; he attacks ~45f after entry and his
+                               death pedestal is the reward. */
+                            if (randi(0, 99) < 10) {
+                                dr->krampus_state = 1;
+                                dr->shop_count = 0;
+                                dd2->room_count++;
+                                audio_play(SFX_DOOR);
+                                break;
+                            }
 
                             /* Two items priced in heart containers. E4: The
                                Pact is devil-pool biased — the first slot has
@@ -8247,9 +9334,21 @@ void do_room_transition(Game *g, Direction dir) {
         g->bossrush_spawn_timer = 0;
     }
 
-    /* E3: never carry a live enemy beam through a door */
+    /* R8 (M7): stepping into an armed Krampus devil room starts the
+       ~45-frame ambush countdown (leaving before it fires re-arms it). */
+    if (newRoom->type == ROOM_DEVIL && newRoom->krampus_state == 1)
+        g->krampus_timer = 45;
+    /* A player-burst render never carries across rooms */
+    g->pbeam_timer = 0;
+
+    /* E3: never carry a live enemy beam through a door (R9: nor the
+       Lamb's cross flag or Isaac's light columns) */
     g->ebeam_state = 0;
     g->ebeam_timer = 0;
+    g->ebeam_cross = 0;
+    g->vbeam_state = 0;
+    g->vbeam_timer = 0;
+    g->vbeam_count = 0;
     /* E6: snap the familiar trail into the new room */
     familiars_reset_trail(g);
 
@@ -8295,6 +9394,20 @@ void do_room_transition(Game *g, Direction dir) {
         /* Entry grace: half a second of iframes stepping into any
            uncleared room, so doorway ambushes can't cheap-shot. */
         if (g->player.iframes < 30) g->player.iframes = 30;
+        /* R8: re-entering a non-boss room with a live miniboss (awakened
+           angel / Krampus after a warp-out) re-arms the boss HUD + music */
+        if (!g->boss_active && newRoom->type != ROOM_BOSSRUSH) {
+            for (int bi = 0; bi < newRoom->enemy_count; bi++) {
+                if (newRoom->enemies[bi].active &&
+                    is_boss_type(newRoom->enemies[bi].type)) {
+                    g->boss_active = 1;
+                    g->boss_name =
+                        boss_name_str(newRoom->enemies[bi].type);
+                    music_play(MUS_BOSS);
+                    break;
+                }
+            }
+        }
     }
 
     float midX = (ROOM_LEFT + ROOM_RIGHT) / 2.0f;
@@ -8861,7 +9974,8 @@ void game_update(Game *g, u32 kDown, u32 kHeld, circlePosition circlePos) {
                         Enemy *be = &br2->enemies[bi2];
                         if (!be->active) continue;
                         if (be->type == ENEMY_BOSS_MOM ||
-                            be->type == ENEMY_BOSS_MOMS_HEART) {
+                            be->type == ENEMY_BOSS_MOMS_HEART ||
+                            be->type == ENEMY_BOSS_IT_LIVES) {
                             be->hp = 0;
                             kill_enemy(g, br2, be);
                             did = 1;
@@ -8883,6 +9997,38 @@ void game_update(Game *g, u32 kDown, u32 kHeld, circlePosition circlePos) {
                              "The Bible - You feel lighter for a moment.");
                     g->pickup_msg_timer = 120;
                     audio_play(SFX_PICKUP);
+                }
+                break;
+            }
+            /* --- R8 (M7) --- */
+            case ITEM_HEAD_OF_KRAMPUS: {
+                /* 4-way brimstone burst from the player: one deterministic
+                   instant damage sweep along the four axis arms, plus a
+                   ~10-frame beam render (g->pbeam_*). Deliberately does
+                   NOT touch the enemy ebeam machine — it stays free for
+                   whatever boss owns it. */
+                Room *kr = current_room(g);
+                if (kr) {
+                    float arm = 14.0f;   /* arm half-width */
+                    int initial = kr->enemy_count;
+                    for (int ei = 0; ei < initial; ei++) {
+                        Enemy *ke = &kr->enemies[ei];
+                        if (!ke->active || ke->hidden) continue;
+                        if (ke->spawn_grace >= 9) continue;
+                        if (fabsf(ke->y - p->y) < arm + ENEMY_SIZE ||
+                            fabsf(ke->x - p->x) < arm + ENEMY_SIZE) {
+                            ke->hp -= 12.0f;
+                            ke->flash = 14;
+                            if (ke->hp <= 0) kill_enemy(g, kr, ke);
+                        }
+                    }
+                    g->pbeam_timer = 10;
+                    g->pbeam_x = p->x;
+                    g->pbeam_y = p->y;
+                    trigger_shake(g, 6.0f, 18);
+                    audio_play(SFX_BOSS);
+                } else {
+                    used = 0;
                 }
                 break;
             }
@@ -10107,14 +11253,15 @@ void render_unlocks_screen(Game *g, C2D_TextBuf textBuf) {
     draw_menu_title(textBuf, "UNLOCKS & STATS");
 
     /* Build all the lines. Sized to hold the character list + stats + the
-       full 20-boss roster (headers/stats 14 + 20 bosses = 34 < 36). buf is
-       static to keep the ~2KB scratch off the per-frame render stack.
+       full 27-boss roster (headers/stats 14 + 27 bosses = 41 < 44; sized
+       with headroom on purpose — resize when the roster grows again). buf
+       is static to keep the ~2.75KB scratch off the per-frame render stack.
        is_header/marker are presentation-only parallel flags — the
        line-count/window/scroll math below is untouched. */
-    static char buf[36][64];
-    const char *lines_text[36];
-    u8 is_header[36] = {0};
-    u8 marker[36] = {0};   /* 0 none, 1 = defeated X, 2 = pending dash */
+    static char buf[44][64];
+    const char *lines_text[44];
+    u8 is_header[44] = {0};
+    u8 marker[44] = {0};   /* 0 none, 1 = defeated X, 2 = pending dash */
     int line_count = 0;
 
     /* Header section: characters */
@@ -10152,8 +11299,8 @@ void render_unlocks_screen(Game *g, C2D_TextBuf textBuf) {
     /* Boss progress: count bits */
     int boss_count = 0;
     int boss_mask = g_config.bosses_defeated;
-    for (int b = 0; b < 20; b++) if (boss_mask & (1 << b)) boss_count++;
-    snprintf(buf[line_count], 64, "Bosses Defeated: %d / 20", boss_count);
+    for (int b = 0; b < 27; b++) if (boss_mask & (1 << b)) boss_count++;
+    snprintf(buf[line_count], 64, "Bosses Defeated: %d / 27", boss_count);
     lines_text[line_count] = buf[line_count]; line_count++;
 
     /* Boss list */
@@ -10161,17 +11308,19 @@ void render_unlocks_screen(Game *g, C2D_TextBuf textBuf) {
     is_header[line_count] = 1;
     lines_text[line_count] = buf[line_count]; line_count++;
 
-    /* Must stay in exact EnemyType enum order (ENEMY_BOSS_DUKE..ENEMY_BOSS_SATAN)
-       since boss_idx is computed as (e->type - ENEMY_BOSS_DUKE) -- keep in sync
-       whenever a boss is added/reordered. */
+    /* Must stay in exact EnemyType enum order (ENEMY_BOSS_DUKE..
+       ENEMY_BOSS_BLUE_BABY) since boss_idx is computed as
+       (e->type - ENEMY_BOSS_DUKE) -- keep in sync whenever a boss is
+       added/reordered. */
     const char *boss_names[] = {
         "Duke of Flies", "Monstro", "Gemini", "Larry Jr.", "Famine",
         "Peep", "Gurdy", "Pin", "The Haunt", "Widow", "Gish",
         "Loki", "Steven", "Chub", "Fistula", "Scolex", "Mega Satan",
-        "Mom", "Mom's Heart", "Satan"
+        "Mom", "Mom's Heart", "Satan", "Isaac", "The Lamb", "It Lives",
+        "Uriel", "Gabriel", "Krampus", "Blue Baby"
     };
     /* Pack two columns - we'll show ones we have seen vs ???  */
-    for (int b = 0; b < 20 && line_count < 36; b++) {
+    for (int b = 0; b < 27 && line_count < 44; b++) {
         int defeated = (g_config.bosses_defeated & (1 << b)) != 0;
         snprintf(buf[line_count], 64, "    %s",
                 defeated ? boss_names[b] : "???");
@@ -10489,6 +11638,26 @@ void render_hud(Game *g, C2D_TextBuf textBuf) {
         /* Held trinket charm, right of the pill/card slots */
         if (g->player.trinket != TRINKET_NONE) {
             draw_trinket_icon(px + 48, py, g->player.trinket, 0.9f);
+        }
+        /* R8 (M3): golden key halves, right of the trinket slot — the two
+           halves nest together when both are held. */
+        if (g->player.has_key_piece_1 || g->player.has_key_piece_2) {
+            int both = g->player.has_key_piece_1 &&
+                       g->player.has_key_piece_2;
+            u32 kc = C2D_Color32(232, 190, 80, 255);
+            u32 kd = C2D_Color32(150, 112, 30, 255);
+            for (int kp = 0; kp < 2; kp++) {
+                int has = (kp == 0) ? g->player.has_key_piece_1
+                                    : g->player.has_key_piece_2;
+                if (!has) continue;
+                float kx = px + 66.0f + (both ? kp * 5.0f : 0.0f);
+                C2D_DrawCircleSolid(kx, py - 3, 0, 3.0f, kc);
+                C2D_DrawCircleSolid(kx, py - 3, 0, 1.3f, kd);
+                C2D_DrawRectSolid(kx - 1, py - 1, 0, 2, 8, kc);
+                /* half-tooth faces the missing twin */
+                C2D_DrawRectSolid((kp == 0) ? kx - 3 : kx + 1, py + 4,
+                                  0, 2, 2, kc);
+            }
         }
 
     }
@@ -10886,7 +12055,7 @@ void render_hud(Game *g, C2D_TextBuf textBuf) {
  * art so each floor reads like its Rebirth chapter. Blends stay in the
  * 0.15-0.35 band so the stone detail survives; doors use half strength
  * so their identity colors stay readable. */
-static const struct { u8 r, g, b; float blend; } wall_pal[8] = {
+static const struct { u8 r, g, b; float blend; } wall_pal[10] = {
     { 150, 105,  60, 0.20f },  /* 0 Basement  — warm brown */
     { 160, 120,  80, 0.18f },  /* 1 Cellar    — dusty tan */
     { 110, 125, 145, 0.25f },  /* 2 Caves     — gray-blue */
@@ -10895,6 +12064,9 @@ static const struct { u8 r, g, b; float blend; } wall_pal[8] = {
     { 175,  55,  60, 0.30f },  /* 5 Womb      — flesh red */
     {  25,  22,  40, 0.35f },  /* 6 Sheol     — near-black cold */
     { 215, 180,  95, 0.25f },  /* 7 Chest     — warm gold */
+    /* R9 route alts (picked by env_wall_draw via g_floor_route): */
+    { 236, 224, 186, 0.30f },  /* 8 Cathedral — pale stone / gold */
+    {  38,  14,  18, 0.35f },  /* 9 Dark Room — near-black, red cast */
 };
 
 /* Top-left-anchored environment draw with the chapter tint applied.
@@ -10909,6 +12081,9 @@ static void env_wall_draw(int idx, float x, float y, float sx, float sy,
     int pi = fl;
     if (pi < 0) pi = 0;
     if (pi > 7) pi = 7;
+    /* R9 route alts: light floor 6 = Cathedral, dark floor 7 = Dark Room */
+    if (pi == 6 && g_floor_route == 1) pi = 8;
+    else if (pi == 7 && g_floor_route == 2) pi = 9;
     C2D_ImageTint tint;
     C2D_PlainImageTint(&tint,
                        C2D_Color32(wall_pal[pi].r, wall_pal[pi].g,
@@ -11203,10 +12378,79 @@ static void render_room_at(Game *g, int room_gx, int room_gy) {
             }
         }
 
+        /* R8 (M3): floor-7 golden door on the start room's top wall.
+           Distinct gold frame; twin key-half sigils light up per collected
+           piece (deterministic pulse from g->frame); reads as an open dark
+           passage once used. Offset left if a real top door exists. */
+        if (g->current_floor == 7 && r->type == ROOM_START) {
+            float gdx = (ROOM_LEFT + ROOM_RIGHT) / 2.0f -
+                        (r->doors[0] ? 80.0f : 0.0f);
+            float dw = (float)DOOR_WIDTH;
+            float dy = ROOM_TOP - 18.0f;
+            u32 goldD = C2D_Color32(150, 112, 30, 255);
+            u32 goldL = C2D_Color32(232, 190, 80, 255);
+            float gpulse = 0.6f + 0.4f * sinf((float)g->frame * 0.06f);
+            C2D_DrawRectSolid(gdx - dw / 2 - 3, dy - 3, 0, dw + 6, 24, goldD);
+            C2D_DrawRectSolid(gdx - dw / 2, dy, 0, dw, 18, goldL);
+            if (g->mega_created) {
+                /* opened: dark passage down to Mega Satan */
+                C2D_DrawRectSolid(gdx - dw / 2 + 4, dy + 3, 0, dw - 8, 15,
+                                  C2D_Color32(20, 10, 10, 255));
+            } else {
+                /* sealed slab: center seam + twin key-half sigils */
+                C2D_DrawRectSolid(gdx - 1, dy + 2, 0, 2, 16, goldD);
+                for (int kp = 0; kp < 2; kp++) {
+                    int has = kp == 0 ? g->player.has_key_piece_1
+                                      : g->player.has_key_piece_2;
+                    float kx = gdx + (kp == 0 ? -9.0f : 9.0f);
+                    u32 sig = has
+                        ? C2D_Color32(255, 240, 150,
+                                      (int)(160 + 90 * gpulse))
+                        : C2D_Color32(96, 70, 22, 255);
+                    C2D_DrawCircleSolid(kx, dy + 7, 0, 3.2f, sig);
+                    C2D_DrawRectSolid(kx - 1, dy + 7, 0, 2, 8, sig);
+                    /* half-key notch faces the seam */
+                    C2D_DrawRectSolid((kp == 0) ? kx : kx - 2, dy + 12,
+                                      0, 2, 2, sig);
+                }
+            }
+        }
+
         /* Obstacles - use rock sprite */
         for (int i = 0; i < r->obstacle_count; i++) {
             Obstacle *o = &r->obstacles[i];
             if (!o->active) continue;
+            /* R8 (M3): angel statue — fully procedural pale stone figure
+               with folded wings and gold accents (no atlas art). Slow
+               deterministic halo shimmer from g->frame. */
+            if (o->type == OBST_ANGEL_STATUE) {
+                float ax = o->x, ay = o->y;
+                float shimmer = 0.7f + 0.3f * sinf((float)g->frame * 0.05f);
+                u32 stone     = C2D_Color32(226, 226, 234, 255);
+                u32 stoneDark = C2D_Color32(178, 178, 192, 255);
+                u32 gold      = C2D_Color32(214, 178, 84, 255);
+                /* grounding shadow + plinth */
+                C2D_DrawEllipseSolid(ax - 16, ay + 12, 0, 32, 10,
+                                     C2D_Color32(0, 0, 0, 70));
+                C2D_DrawRectSolid(ax - 14, ay + 6, 0, 28, 8, stoneDark);
+                C2D_DrawRectSolid(ax - 11, ay + 4, 0, 22, 4, stone);
+                /* folded wings (two mirrored arcs behind the body) */
+                C2D_DrawEllipseSolid(ax - 22, ay - 22, 0, 16, 30, stoneDark);
+                C2D_DrawEllipseSolid(ax + 6,  ay - 22, 0, 16, 30, stoneDark);
+                C2D_DrawEllipseSolid(ax - 19, ay - 19, 0, 11, 24, stone);
+                C2D_DrawEllipseSolid(ax + 8,  ay - 19, 0, 11, 24, stone);
+                /* robed body */
+                C2D_DrawEllipseSolid(ax - 8, ay - 14, 0, 16, 22, stone);
+                C2D_DrawRectSolid(ax - 8, ay - 2, 0, 16, 8, stoneDark);
+                /* head + gold halo */
+                C2D_DrawCircleSolid(ax, ay - 18, 0, 6.0f, stone);
+                C2D_DrawEllipseSolid(ax - 8, ay - 28, 0, 16, 5,
+                                     C2D_Color32(214, 178, 84,
+                                                 (int)(200 * shimmer)));
+                /* gold sash accent */
+                C2D_DrawRectSolid(ax - 7, ay - 8, 0, 14, 2, gold);
+                continue;
+            }
             /* Grounding drop shadow (rocks/poop sit on the floor; spikes are flush) */
             if (o->type != OBST_SPIKES)
                 C2D_DrawEllipseSolid(o->x - OBSTACLE_SIZE * 0.55f, o->y + OBSTACLE_SIZE * 0.35f, 0,
@@ -11484,6 +12728,10 @@ static void render_room_at(Game *g, int room_gx, int room_gy) {
         else if (fl == 1) floorCol = C2D_Color32(130, 110, 85, 255);
         else if (fl == 2) floorCol = C2D_Color32(100, 100, 110, 255);
         else if (fl == 3) floorCol = C2D_Color32(90, 90, 105, 255);
+        else if (fl == 6 && g_floor_route == 1)
+            floorCol = C2D_Color32(205, 195, 165, 255);  /* Cathedral stone */
+        else if (fl == 7 && g_floor_route == 2)
+            floorCol = C2D_Color32(45, 32, 36, 255);     /* Dark Room */
         else floorCol = C2D_Color32(80, 70, 80, 255);
 
         if (r->type == ROOM_BOSS) floorCol = C2D_Color32(120, 70, 70, 255);
@@ -11756,13 +13004,25 @@ static void render_ambient_and_vignette(Game *g) {
             C2D_DrawRectSolid(0, pty, 0, TOP_SCREEN_WIDTH, pth,
                               C2D_Color32(140, 30, 40, 50));
         } else if (g->current_floor == 6) {
-            /* Sheol: dark hellish tint */
-            C2D_DrawRectSolid(0, pty, 0, TOP_SCREEN_WIDTH, pth,
-                              C2D_Color32(20, 0, 0, 90));
+            if (g->route == 1) {
+                /* Cathedral (light route): pale holy gold wash */
+                C2D_DrawRectSolid(0, pty, 0, TOP_SCREEN_WIDTH, pth,
+                                  C2D_Color32(240, 225, 175, 42));
+            } else {
+                /* Sheol: dark hellish tint */
+                C2D_DrawRectSolid(0, pty, 0, TOP_SCREEN_WIDTH, pth,
+                                  C2D_Color32(20, 0, 0, 90));
+            }
         } else if (g->current_floor == 7) {
-            /* The Chest: deep gold/white tint */
-            C2D_DrawRectSolid(0, pty, 0, TOP_SCREEN_WIDTH, pth,
-                              C2D_Color32(90, 80, 40, 70));
+            if (g->route == 2) {
+                /* Dark Room (dark route): near-black with a red accent */
+                C2D_DrawRectSolid(0, pty, 0, TOP_SCREEN_WIDTH, pth,
+                                  C2D_Color32(35, 0, 6, 100));
+            } else {
+                /* The Chest: deep gold/white tint */
+                C2D_DrawRectSolid(0, pty, 0, TOP_SCREEN_WIDTH, pth,
+                                  C2D_Color32(90, 80, 40, 70));
+            }
         }
     }
 
@@ -11941,6 +13201,36 @@ static void render_laser(Game *g) {
 static void render_enemy_beam(Game *g) {
     if (!g->ebeam_state) return;
     float ox = g->ebeam_x, oy = g->ebeam_y;
+
+    /* R9 (The Lamb): 4-way brimstone CROSS — the same telegraph/fire
+       styling applied to four axis-aligned arms running to the walls. */
+    if (g->ebeam_cross) {
+        float axs[4] = { (float)ROOM_LEFT, (float)ROOM_RIGHT, ox, ox };
+        float ays[4] = { oy, oy, (float)ROOM_TOP, (float)ROOM_BOTTOM };
+        if (g->ebeam_state == 1) {
+            float tfrac = 1.0f - (float)g->ebeam_timer / 35.0f;
+            if (tfrac < 0.0f) tfrac = 0.0f;
+            int a = (int)(90 + 100 * tfrac);
+            u32 warn = C2D_Color32(255, 40, 40, a);
+            for (int bi = 0; bi < 4; bi++)
+                C2D_DrawLine(ox, oy, warn, axs[bi], ays[bi], warn, 1.5f, 0);
+        } else {
+            float fade = (g->ebeam_timer < 3) ? (float)g->ebeam_timer / 3.0f
+                                              : 1.0f;
+            int a = (int)(255.0f * fade);
+            u32 dark = C2D_Color32(100, 5, 5, a);
+            u32 red  = C2D_Color32(210, 25, 25, a);
+            u32 core = C2D_Color32(255, 230, 230, a);
+            for (int bi = 0; bi < 4; bi++) {
+                C2D_DrawLine(ox, oy, dark, axs[bi], ays[bi], dark, 10.0f, 0);
+                C2D_DrawLine(ox, oy, red,  axs[bi], ays[bi], red,  5.0f, 0);
+                C2D_DrawLine(ox, oy, core, axs[bi], ays[bi], core, 2.0f, 0);
+            }
+            C2D_DrawCircleSolid(ox, oy, 0, 9.0f * fade, red);
+        }
+        return;
+    }
+
     float ex = g->ebeam_ex, ey = g->ebeam_ey;
     if (g->ebeam_state == 1) {
         /* Telegraph: thin warning line, eases in over the 30 frames */
@@ -11960,6 +13250,66 @@ static void render_enemy_beam(Game *g) {
         C2D_DrawLine(ox, oy, core, ex, ey, core, 2.0f, 0);
         C2D_DrawCircleSolid(ex, ey, 0, 7.0f * fade, red);
     }
+}
+
+/* R9 (Isaac): Cathedral light columns. Telegraph = warm ground-marker
+ * ellipse pulsing up over the 40-frame warning; fire = full-height light
+ * column for ~20 frames. All alphas ease smoothly (no strobing); pulse
+ * phase is deterministic from the telegraph timer. */
+static void render_vbeams(Game *g) {
+    if (!g->vbeam_state) return;
+    float gy = ROOM_BOTTOM - 8.0f;
+    for (int i = 0; i < g->vbeam_count; i++) {
+        float bx = g->vbeam_x[i];
+        if (g->vbeam_state == 1) {
+            float tfrac = 1.0f - (float)g->vbeam_timer / 40.0f;
+            if (tfrac < 0.0f) tfrac = 0.0f;
+            if (tfrac > 1.0f) tfrac = 1.0f;
+            int a = (int)(70 + 110 * tfrac);
+            float w = 10.0f + 8.0f * tfrac;
+            C2D_DrawEllipseSolid(bx - w, gy - w * 0.35f, 0,
+                                 w * 2.0f, w * 0.7f,
+                                 C2D_Color32(255, 235, 150, a));
+            C2D_DrawEllipseSolid(bx - w * 0.5f, gy - w * 0.18f, 0,
+                                 w, w * 0.35f,
+                                 C2D_Color32(255, 255, 220, a));
+        } else {
+            float fade = (g->vbeam_timer < 4) ? (float)g->vbeam_timer / 4.0f
+                                              : 1.0f;
+            int a = (int)(200.0f * fade);
+            C2D_DrawRectSolid(bx - 9, ROOM_TOP, 0, 18,
+                              ROOM_BOTTOM - ROOM_TOP,
+                              C2D_Color32(255, 245, 200, (int)(a * 0.55f)));
+            C2D_DrawRectSolid(bx - 4, ROOM_TOP, 0, 8,
+                              ROOM_BOTTOM - ROOM_TOP,
+                              C2D_Color32(255, 255, 235, a));
+            C2D_DrawEllipseSolid(bx - 14, gy - 5, 0, 28, 10,
+                                 C2D_Color32(255, 245, 200,
+                                             (int)(90.0f * fade)));
+        }
+    }
+}
+
+/* R8 (M7): Head of Krampus player burst — 4-way brimstone arms from the
+ * fire position, fading out over the ~10-frame pbeam_timer. Presentation
+ * only (damage was applied instantly at use); photosensitivity-safe fade. */
+static void render_pbeam(Game *g) {
+    if (g->pbeam_timer <= 0) return;
+    float fade = (float)g->pbeam_timer / 10.0f;
+    if (fade > 1.0f) fade = 1.0f;
+    int a = (int)(255.0f * fade);
+    float ox = g->pbeam_x, oy = g->pbeam_y;
+    float axs[4] = { (float)ROOM_LEFT, (float)ROOM_RIGHT, ox, ox };
+    float ays[4] = { oy, oy, (float)ROOM_TOP, (float)ROOM_BOTTOM };
+    u32 dark = C2D_Color32(100, 5, 5, a);
+    u32 red  = C2D_Color32(210, 25, 25, a);
+    u32 core = C2D_Color32(255, 230, 230, a);
+    for (int bi = 0; bi < 4; bi++) {
+        C2D_DrawLine(ox, oy, dark, axs[bi], ays[bi], dark, 10.0f, 0);
+        C2D_DrawLine(ox, oy, red,  axs[bi], ays[bi], red,  5.0f, 0);
+        C2D_DrawLine(ox, oy, core, axs[bi], ays[bi], core, 2.0f, 0);
+    }
+    C2D_DrawCircleSolid(ox, oy, 0, 9.0f * fade, red);
 }
 
 /* E6: familiars drawn as small tinted baby sprites at their trail slots */
@@ -12330,9 +13680,58 @@ static void render_enemies(Game *g) {
                         spr_draw_tinted(sheet_sprites, idx, draw_x, draw_y,
                                        draw_scaleX, draw_scaleY,
                                        C2D_Color32(255, 255, 255, 255), 0.7f);
+                    } else if (e->type == ENEMY_BOSS_ISAAC) {
+                        /* R9: holy pale-gold grade; deeper while praying */
+                        float hb = (e->state == 1) ? 0.45f : 0.25f;
+                        spr_draw_tinted(sheet_sprites, idx, draw_x, draw_y,
+                                       draw_scaleX, draw_scaleY,
+                                       C2D_Color32(255, 240, 190, 255), hb);
+                    } else if (e->type == ENEMY_BOSS_THE_LAMB) {
+                        /* R9: demonic near-black violet grade */
+                        spr_draw_tinted(sheet_sprites, idx, draw_x, draw_y,
+                                       draw_scaleX, draw_scaleY,
+                                       C2D_Color32(60, 45, 70, 255), 0.55f);
+                    } else if (e->type == ENEMY_BOSS_IT_LIVES) {
+                        /* R9: deep pulsing flesh-red grade */
+                        spr_draw_tinted(sheet_sprites, idx, draw_x, draw_y,
+                                       draw_scaleX, draw_scaleY,
+                                       C2D_Color32(190, 25, 35, 255), 0.5f);
+                    } else if (e->type == ENEMY_BOSS_URIEL ||
+                               e->type == ENEMY_BOSS_GABRIEL) {
+                        /* R8: pale-stone angel grade (Gabriel warmer/gold) */
+                        u32 acol = (e->type == ENEMY_BOSS_GABRIEL)
+                                 ? C2D_Color32(250, 226, 160, 255)
+                                 : C2D_Color32(232, 232, 240, 255);
+                        spr_draw_tinted(sheet_sprites, idx, draw_x, draw_y,
+                                       draw_scaleX, draw_scaleY, acol, 0.5f);
+                    } else if (e->type == ENEMY_BOSS_KRAMPUS) {
+                        /* R8: sooty near-black red grade */
+                        spr_draw_tinted(sheet_sprites, idx, draw_x, draw_y,
+                                       draw_scaleX, draw_scaleY,
+                                       C2D_Color32(55, 30, 30, 255), 0.55f);
+                    } else if (e->type == ENEMY_BOSS_BLUE_BABY) {
+                        /* R8: cold blue-grey corpse grade */
+                        spr_draw_tinted(sheet_sprites, idx, draw_x, draw_y,
+                                       draw_scaleX, draw_scaleY,
+                                       C2D_Color32(150, 175, 210, 255), 0.5f);
                     } else {
                         spr_draw(sheet_sprites, idx, draw_x, draw_y,
                                 draw_scaleX, draw_scaleY);
+                    }
+
+                    /* R9 Isaac: halo + soft prayer glow (deterministic
+                       pulse from g->frame — safe for stereoscopic 3D) */
+                    if (e->type == ENEMY_BOSS_ISAAC) {
+                        float hp2 = 0.75f + 0.25f * sinf((float)g->frame * 0.08f);
+                        C2D_DrawEllipseSolid(draw_x - 14.0f,
+                                             draw_y - sz - 12.0f, 0,
+                                             28.0f, 8.0f,
+                                             C2D_Color32(255, 235, 160,
+                                                         (int)(120 * hp2)));
+                        if (e->state == 1)
+                            C2D_DrawCircleSolid(draw_x, draw_y, 0,
+                                                sz * 1.15f,
+                                                C2D_Color32(255, 245, 200, 28));
                     }
 
                     /* Larry Jr / Chub / Scolex: body segments as flat
@@ -12371,9 +13770,13 @@ static void render_enemies(Game *g) {
                     /* Gemini/Steven: render companion entity + tether.
                        R8 #19: Steven's second head now draws too (it's a
                        killable target), and a dead head (gemini_chp <= 0)
-                       is not drawn at all. */
+                       is not drawn at all.
+                       R9: The Lamb's detached body reuses this draw
+                       (gemini_chp only becomes > 0 at the detach, and
+                       gemini_split is set there, so no tether shows). */
                     if ((e->type == ENEMY_BOSS_GEMINI ||
-                         e->type == ENEMY_BOSS_STEVEN) && e->gemini_chp > 0) {
+                         e->type == ENEMY_BOSS_STEVEN ||
+                         e->type == ENEMY_BOSS_THE_LAMB) && e->gemini_chp > 0) {
                         /* Draw tether line (if not split) */
                         if (!e->gemini_split) {
                             u32 tetherCol = C2D_Color32(180, 60, 60, 180);
@@ -12537,6 +13940,13 @@ static void render_enemies(Game *g) {
                     case ENEMY_BOSS_MOM:        col = C2D_Color32(200, 150, 130, 255); break;
                     case ENEMY_BOSS_MOMS_HEART: col = C2D_Color32(170, 30, 40, 255); break;
                     case ENEMY_BOSS_SATAN:      col = C2D_Color32(60, 10, 10, 255); break;
+                    case ENEMY_BOSS_ISAAC:      col = C2D_Color32(240, 230, 200, 255); break;
+                    case ENEMY_BOSS_THE_LAMB:   col = C2D_Color32(70, 50, 80, 255); break;
+                    case ENEMY_BOSS_IT_LIVES:   col = C2D_Color32(150, 20, 30, 255); break;
+                    case ENEMY_BOSS_URIEL:      col = C2D_Color32(225, 225, 235, 255); break;
+                    case ENEMY_BOSS_GABRIEL:    col = C2D_Color32(235, 210, 140, 255); break;
+                    case ENEMY_BOSS_KRAMPUS:    col = C2D_Color32(50, 28, 28, 255); break;
+                    case ENEMY_BOSS_BLUE_BABY:  col = C2D_Color32(140, 165, 200, 255); break;
                     case ENEMY_EYE:             col = C2D_Color32(230, 220, 220, 255); break;
                     case ENEMY_LIL_HAUNT:       col = C2D_Color32(120, 100, 130, 255); break;
                     case ENEMY_KEEPER:          col = C2D_Color32(200, 170, 40, 255); break;
@@ -12753,24 +14163,72 @@ void render_win(Game *g, C2D_TextBuf textBuf) {
     g->menu_timer++;
 
     u32 bone = C2D_Color32(238, 228, 206, 255);
+    int dark_end = (g->win_ending == 3);
 
     /* 1. Void */
     C2D_DrawRectSolid(0, 0, 0, TOP_SCREEN_WIDTH, TOP_SCREEN_HEIGHT,
                       C2D_Color32(0, 0, 0, 255));
 
-    /* 2. Spotlight: stacked soft ellipses centered on (200,130) */
-    C2D_DrawEllipseSolid(200 - 120, 130 - 90, 0, 240, 180,
-                         C2D_Color32(255, 244, 214, 25));
-    C2D_DrawEllipseSolid(200 - 95, 130 - 72, 0, 190, 144,
-                         C2D_Color32(255, 244, 214, 35));
-    C2D_DrawEllipseSolid(200 - 70, 130 - 54, 0, 140, 108,
-                         C2D_Color32(255, 244, 214, 45));
-    C2D_DrawEllipseSolid(200 - 48, 130 - 38, 0, 96, 76,
-                         C2D_Color32(255, 244, 214, 60));
+    /* 2. Spotlight: stacked soft ellipses centered on (200,130).
+       R9: the dark ending swaps the warm beam for a blood-red gloom;
+       the light ending (2) brightens the shaft. */
+    {
+        u8 sr = dark_end ? 120 : 255;
+        u8 sg2 = dark_end ? 12  : 244;
+        u8 sb = dark_end ? 18  : 214;
+        int boost = (g->win_ending == 2) ? 10 : 0;
+        C2D_DrawEllipseSolid(200 - 120, 130 - 90, 0, 240, 180,
+                             C2D_Color32(sr, sg2, sb, 25 + boost));
+        C2D_DrawEllipseSolid(200 - 95, 130 - 72, 0, 190, 144,
+                             C2D_Color32(sr, sg2, sb, 35 + boost));
+        C2D_DrawEllipseSolid(200 - 70, 130 - 54, 0, 140, 108,
+                             C2D_Color32(sr, sg2, sb, 45 + boost));
+        C2D_DrawEllipseSolid(200 - 48, 130 - 38, 0, 96, 76,
+                             C2D_Color32(sr, sg2, sb, 60 + boost));
+    }
 
-    /* 3+4. Isaac in the beam, chest at his feet (wood for Ending 1,
-       gold for the full escape). */
-    if (g_sprites_loaded) {
+    /* 3+4. Center tableau per ending. */
+    if (dark_end) {
+        /* THE LAMB CROWNED (procedural — no atlas art): dark silhouette,
+           curved horns, burning eyes, and a crown floating above. */
+        float lp = 0.75f + 0.25f * sinf(g->menu_timer * 0.06f);
+        u32 body = C2D_Color32(20, 14, 24, 255);
+        u32 horn = C2D_Color32(46, 34, 52, 255);
+        u32 eye  = C2D_Color32(220, 30, 30, (u8)(200 * lp));
+        u32 gold = C2D_Color32(212, 168, 60, 255);
+        /* horns */
+        C2D_DrawTriangle(178, 112, horn, 190, 118, horn, 172, 88, horn, 0);
+        C2D_DrawTriangle(222, 112, horn, 210, 118, horn, 228, 88, horn, 0);
+        /* head + body */
+        C2D_DrawCircleSolid(200, 154, 0, 22, body);
+        C2D_DrawCircleSolid(200, 124, 0, 24, body);
+        /* eyes */
+        C2D_DrawCircleSolid(191, 120, 0, 4, eye);
+        C2D_DrawCircleSolid(209, 120, 0, 4, eye);
+        /* crown: three gold spikes on a band, floating above the horns */
+        C2D_DrawRectSolid(184, 82, 0, 32, 6, gold);
+        C2D_DrawTriangle(184, 82, gold, 192, 82, gold, 188, 68, gold, 0);
+        C2D_DrawTriangle(196, 82, gold, 204, 82, gold, 200, 64, gold, 0);
+        C2D_DrawTriangle(208, 82, gold, 216, 82, gold, 212, 68, gold, 0);
+    } else if (g->win_ending == 2) {
+        /* ISAAC ASCENDS: he floats up inside a light column; the wooden
+           chest below has closed behind him. */
+        float rise = sinf(g->menu_timer * 0.05f) * 3.0f;
+        C2D_DrawRectSolid(200 - 16, 20, 0, 32, 150,
+                          C2D_Color32(255, 250, 220, 46));
+        C2D_DrawRectSolid(200 - 7, 20, 0, 14, 150,
+                          C2D_Color32(255, 255, 240, 70));
+        if (g_sprites_loaded) {
+            spr_draw(sheet_sprites, player_sprite_idx(DIR_DOWN, 0),
+                     200, 104 + rise, 2.0f, 2.0f);
+            if (sheet_environment)
+                spr_draw(sheet_environment,
+                         environment_atlas_env_chest_wood_idx,
+                         200, 168, 1.4f, 1.4f);
+        } else {
+            C2D_DrawCircleSolid(200, 104 + rise, 0, 14, bone);
+        }
+    } else if (g_sprites_loaded) {
         spr_draw(sheet_sprites, player_sprite_idx(DIR_DOWN, 0),
                  200, 128, 2.2f, 2.2f);
         if (sheet_environment)
@@ -12780,11 +14238,14 @@ void render_win(Game *g, C2D_TextBuf textBuf) {
                      200, 158, 1.4f, 1.4f);
     }
 
-    /* 5. Title, bone-white with a black offset shadow — the two endings
-       keep their distinct lines. */
+    /* 5. Title, bone-white with a black offset shadow — each ending
+       keeps its distinct line. */
     C2D_Text t1;
     gtext_parse(&t1, textBuf,
-                g->win_ending == 1 ? "ENDING 1" : "ISAAC ESCAPED.");
+                g->win_ending == 3 ? "THE LAMB IS CROWNED." :
+                g->win_ending == 2 ? "ISAAC ASCENDS."       :
+                g->win_ending == 1 ? "ENDING 1"             :
+                                     "ISAAC ESCAPED.");
     C2D_TextOptimize(&t1);
     {
         float tw = 0.0f, th = 0.0f;
@@ -12792,14 +14253,18 @@ void render_win(Game *g, C2D_TextBuf textBuf) {
         C2D_DrawText(&t1, C2D_WithColor, 200 - tw / 2 + 2, 36, 0, 0.7f, 0.7f,
                      C2D_Color32(0, 0, 0, 255));
         C2D_DrawText(&t1, C2D_WithColor, 200 - tw / 2, 34, 0, 0.7f, 0.7f,
-                     bone);
+                     dark_end ? C2D_Color32(220, 60, 60, 255) : bone);
     }
 
     /* 6. Stats lines (content kept from the old screen) */
     {
         u32 dim = C2D_Color32(190, 180, 160, 220);
         char lineBuf[64];
-        if (g->win_ending == 1)
+        if (g->win_ending == 3)
+            snprintf(lineBuf, sizeof(lineBuf), "Darkness has a new king.");
+        else if (g->win_ending == 2)
+            snprintf(lineBuf, sizeof(lineBuf), "The light takes him home.");
+        else if (g->win_ending == 1)
             snprintf(lineBuf, sizeof(lineBuf), "Isaac chose the light.");
         else
             snprintf(lineBuf, sizeof(lineBuf), "All %d floors conquered!",
@@ -13014,7 +14479,17 @@ void game_render_top(Game *g, C2D_TextBuf textBuf) {
             render_player(g);
             render_knife(g);   /* D3: knife rides above the player sprite */
             render_laser(g);   /* D1/D2: beam over everything in the room */
-            render_enemy_beam(g); /* E3: Satan's Brimstone telegraph/beam */
+            render_enemy_beam(g); /* E3: Satan/Lamb/Krampus Brimstone beam */
+            render_vbeams(g);     /* R9: Isaac/angel light columns */
+            render_pbeam(g);      /* R8: Head of Krampus player burst */
+            /* R8 (M7): brief lights-down pulse as Krampus reveals himself
+               (smooth fade-out, photosensitivity-safe — never strobes) */
+            if (g->krampus_dim > 0) {
+                int da = (int)(140.0f * ((float)g->krampus_dim / 40.0f));
+                C2D_DrawRectSolid(0, 0, 0, TOP_SCREEN_WIDTH,
+                                  TOP_SCREEN_HEIGHT,
+                                  C2D_Color32(0, 0, 0, da));
+            }
         }
 
         /* R8 #37: per-floor ambient tint + vignette (shared helper, also
@@ -13349,6 +14824,8 @@ void game_render_top(Game *g, C2D_TextBuf textBuf) {
         render_knife(g);
         render_laser(g);
         render_enemy_beam(g);
+        render_vbeams(g);   /* R9: Isaac's light columns under the pause dim */
+        render_pbeam(g);    /* R8: player burst under the pause dim */
         render_ambient_and_vignette(g);
         render_hud(g, textBuf);
         /* Dim overlay */
@@ -13945,9 +15422,19 @@ static void do_warp_cleanup(Game *g) {
     g->boss_active = 0;
     g->bossrush_active = 0;
     g->bossrush_spawn_timer = 0;
-    /* E3: a live enemy beam must not persist across a warp */
+    /* E3: a live enemy beam must not persist across a warp (R9: nor the
+       Lamb's cross flag or Isaac's light columns) */
     g->ebeam_state = 0;
     g->ebeam_timer = 0;
+    g->ebeam_cross = 0;
+    g->vbeam_state = 0;
+    g->vbeam_timer = 0;
+    g->vbeam_count = 0;
+    g->pbeam_timer = 0;
+    /* R8 (M7): warping into an armed Krampus devil room also starts the
+       ambush countdown (teleport / telepills entry path). */
+    if (nr->type == ROOM_DEVIL && nr->krampus_state == 1)
+        g->krampus_timer = 45;
 
     /* Center player and brief fade */
     g->player.x = (ROOM_LEFT + ROOM_RIGHT) / 2.0f;

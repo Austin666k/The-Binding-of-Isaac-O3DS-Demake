@@ -251,6 +251,15 @@ int boss_sprite_idx(int enemy_type) {
     case ENEMY_BOSS_MOM:        return sprites_atlas_boss_monstro_idx;    /* Mom - big fleshy stomper */
     case ENEMY_BOSS_MOMS_HEART: return sprites_atlas_boss_gemini_idx;     /* Mom's Heart - lumpy red mass */
     case ENEMY_BOSS_SATAN:      return sprites_atlas_boss_famine_idx;     /* Satan - hellish humanoid */
+    /* R9 (C1) route bosses: closest reuses (tinted in the renderer) */
+    case ENEMY_BOSS_ISAAC:      return sprites_atlas_boss_famine_idx;     /* Isaac - humanoid, pale-gold tint */
+    case ENEMY_BOSS_THE_LAMB:   return sprites_atlas_boss_famine_idx;     /* The Lamb - horned humanoid, dark tint */
+    case ENEMY_BOSS_IT_LIVES:   return sprites_atlas_boss_gemini_idx;     /* It Lives - Mom's Heart reskin, red tint */
+    /* R8 (M3/M7) bosses: closest reuses (tinted in the renderer) */
+    case ENEMY_BOSS_URIEL:      return sprites_atlas_boss_famine_idx;     /* Uriel - winged humanoid, pale-stone tint */
+    case ENEMY_BOSS_GABRIEL:    return sprites_atlas_boss_famine_idx;     /* Gabriel - winged humanoid, gold tint */
+    case ENEMY_BOSS_KRAMPUS:    return sprites_atlas_boss_famine_idx;     /* Krampus - horned humanoid, soot tint */
+    case ENEMY_BOSS_BLUE_BABY:  return sprites_atlas_boss_monstro_idx;    /* ??? - bloated baby, blue-grey tint */
     default:                 return sprites_atlas_boss_duke_of_flies_idx;
     }
 }
@@ -333,6 +342,9 @@ int item_sprite_idx(int item_type) {
     case ITEM_BROTHER_BOBBY:   return ui_items_atlas_item_steven_idx;        /* baby figure */
     case ITEM_GHOST_BABY:      return ui_items_atlas_heart_soul_half_idx;    /* pale spirit */
     case ITEM_DEMON_BABY:      return ui_items_atlas_item_dead_cat_idx;      /* dark critter */
+    /* R8 (M7) Krampus drops — documented reuses (no dedicated art) */
+    case ITEM_LUMP_OF_COAL:    return ui_items_atlas_item_bomb_idx;          /* round black lump */
+    case ITEM_HEAD_OF_KRAMPUS: return ui_items_atlas_item_brimstone_idx;     /* demonic head/beam */
     default:                   return ui_items_atlas_item_pentagram_idx;
     }
 }
