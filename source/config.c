@@ -78,6 +78,7 @@ int config_load(GameConfig *cfg) {
             cfg->music_volume = clampf((float)atof(val), 0.0f, 1.0f);
         } else if (strcmp(key, "unlocked_chars") == 0) {
             cfg->unlocked_chars = atoi(val);
+            if (cfg->unlocked_chars < 0) cfg->unlocked_chars = 0;
             /* Always keep Isaac unlocked */
             cfg->unlocked_chars |= 0x01;
         } else if (strcmp(key, "total_wins") == 0) {
@@ -95,6 +96,19 @@ int config_load(GameConfig *cfg) {
     }
 
     fclose(f);
+
+    /* Sanitize: a corrupt/hand-edited file must never load negative stats
+       (negative bitmasks would unlock everything; negative counters break
+       display + progression math). floors_reached is also bounded above
+       (CONFIG_FLOORS_MAX_INDEX mirrors MAX_FLOORS - 1 from game.h). */
+    if (cfg->total_wins           < 0) cfg->total_wins           = 0;
+    if (cfg->bosses_defeated      < 0) cfg->bosses_defeated      = 0;
+    if (cfg->characters_completed < 0) cfg->characters_completed = 0;
+    if (cfg->floors_reached       < 0) cfg->floors_reached       = 0;
+    if (cfg->total_runs_started   < 0) cfg->total_runs_started   = 0;
+    if (cfg->floors_reached > CONFIG_FLOORS_MAX_INDEX)
+        cfg->floors_reached = CONFIG_FLOORS_MAX_INDEX;
+
     return 0;
 }
 
@@ -102,7 +116,9 @@ int config_save(const GameConfig *cfg) {
     /* Ensure directory exists */
     mkdir(CONFIG_DIR, 0755);  /* ignore error if already exists */
 
-    FILE *f = fopen(CONFIG_PATH, "w");
+    /* Write to a temp file first, then swap it in — a power-off or HOME
+       mid-write must never destroy the existing config/unlock data. */
+    FILE *f = fopen(CONFIG_TMP_PATH, "w");
     if (!f) return -1;
 
     fprintf(f, "# Binding of Isaac 3DS - Configuration\n");
@@ -125,6 +141,15 @@ int config_save(const GameConfig *cfg) {
     fprintf(f, "total_runs_started=%d\n", cfg->total_runs_started);
     fprintf(f, "floors_reached=%d\n", cfg->floors_reached);
 
-    fclose(f);
+    if (fclose(f) != 0) {
+        remove(CONFIG_TMP_PATH);
+        return -1;
+    }
+
+    /* Swap into place. FAT/sdmc rename() fails if the target exists, so
+       remove the old file first (the fully-written temp is the fallback). */
+    remove(CONFIG_PATH);  /* may not exist yet — ignore result */
+    if (rename(CONFIG_TMP_PATH, CONFIG_PATH) != 0) return -1;
+
     return 0;
 }

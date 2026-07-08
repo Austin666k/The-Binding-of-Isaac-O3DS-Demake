@@ -30,9 +30,15 @@ typedef struct {
 /* Default unlocked characters: only Isaac (bit 0) */
 #define CONFIG_DEFAULT_UNLOCKED_CHARS 0x01
 
-/* Config file path */
-#define CONFIG_DIR   "sdmc:/3ds/binding_of_isaac"
-#define CONFIG_PATH  "sdmc:/3ds/binding_of_isaac/config.ini"
+/* Config file path (saves go through a temp file + rename so a power-off
+ * mid-write can never destroy the existing config/unlock data) */
+#define CONFIG_DIR      "sdmc:/3ds/binding_of_isaac"
+#define CONFIG_PATH     "sdmc:/3ds/binding_of_isaac/config.ini"
+#define CONFIG_TMP_PATH "sdmc:/3ds/binding_of_isaac/config.ini.tmp"
+
+/* Highest legal floors_reached value. config.c cannot see game.h;
+ * keep in sync with MAX_FLOORS - 1 (game.h). */
+#define CONFIG_FLOORS_MAX_INDEX 7
 
 /* ---------- API ---------- */
 

@@ -290,7 +290,7 @@ void init_item_pool(void) {
         "Huge fire rate, short range");
     DEF(ITEM_DR_FETUS,        "Dr. Fetus",       1.2f,  0.0f, -1.5f,  0.0f,  0, ITEM_FLAG_BOMB_TEAR,
         "Shoots bombs");
-    DEF(ITEM_EPIC_FETUS,      "Epic Fetus",      1.8f,  0.0f, -2.0f,  0.5f,  0, ITEM_FLAG_BOMB_TEAR | ITEM_FLAG_EXPLOSIVE,
+    DEF(ITEM_EPIC_FETUS,      "Epic Fetus",      1.8f,  0.0f, -2.0f,  0.5f,  0, ITEM_FLAG_BOMB_TEAR,
         "Targeted bomb strikes");
     DEF(ITEM_DEAD_CAT,        "Dead Cat",        0.0f,  0.0f,  0.0f,  0.0f,  0, 0,
         "9 lives. Max HP set to 1");
@@ -303,7 +303,7 @@ void init_item_pool(void) {
     DEF(ITEM_SOY_MILK,        "Soy Milk",       -0.5f,  0.0f,  3.0f,  0.0f,  0, 0,
         "Tiny tears, huge fire rate");
     DEF(ITEM_YUM_HEART,       "Yum Heart",       0.0f,  0.0f,  0.0f,  0.0f,  0, ITEM_FLAG_ACTIVE,
-        "Active: heal half a heart");
+        "Active: heals one heart");
     DEF(ITEM_LUCKY_FOOT,      "Lucky Foot",      0.0f,  0.1f,  0.0f,  0.0f,  0, 0,
         "Luck up, better drops");
     DEF(ITEM_BOOK_OF_BELIAL,  "Book of Belial",  0.0f,  0.0f,  0.0f,  0.0f,  0, ITEM_FLAG_ACTIVE,
@@ -905,7 +905,10 @@ static int player_check_death(Player *p) {
     return 1;
 }
 
-void collect_item(Game *g, ItemType item) {
+/* Returns 1 if the item was actually granted, 0 if refused (passive-item
+ * cap reached). Purchases must gate their payment on this so the player
+ * can never pay and get nothing. */
+int collect_item(Game *g, ItemType item) {
     Player *p = &g->player;
     const ItemDef *def = get_item_def(item);
 
@@ -933,10 +936,10 @@ void collect_item(Game *g, ItemType item) {
                      def->description ? def->description : "");
             g->pickup_msg_timer = 180;
         }
-        return;
+        return 1;
     }
 
-    if (p->item_count >= MAX_ITEMS_HELD) return;
+    if (p->item_count >= MAX_ITEMS_HELD) return 0;
 
     p->items[p->item_count++] = item;
     recalc_player_stats(p);
@@ -981,6 +984,7 @@ void collect_item(Game *g, ItemType item) {
             if (p->soul_hp > 12) p->soul_hp = 12;
         }
     }
+    return 1;
 }
 
 static int get_tear_cooldown(Player *p) {
@@ -1992,8 +1996,8 @@ void room_spawn_enemies(Game *g, Room *r) {
     if (r->type == ROOM_LIBRARY) {
         r->enemy_count = 0;
         r->cleared = 1;
-        /* Free item pedestal biased toward active items, plus a second
-           free pedestal (any item) -- both no-cost, no enemies. */
+        /* One free item pedestal biased toward active items -- no cost,
+           no enemies. */
         r->pedestal.x = (ROOM_LEFT + ROOM_RIGHT) / 2.0f;
         r->pedestal.y = (ROOM_TOP + ROOM_BOTTOM) / 2.0f;
         r->pedestal.item = pick_random_active_item(g);
@@ -2258,6 +2262,9 @@ void room_spawn_enemies(Game *g, Room *r) {
             e->hp = e->hp * hp_mult;
             if (e->hp < 1) e->hp = 1;
             e->max_hp = e->hp;
+            /* R8 #19: keep Gemini/Steven's second-head HP proportional so
+               the healthbar's max_hp/3 head share stays accurate. */
+            e->gemini_chp = (int)((float)e->gemini_chp * hp_mult);
         }
 
         /* Champion / Elite roll: 15% chance, non-bosses only */
@@ -2365,7 +2372,6 @@ void start_new_game(Game *g) {
     g->player.lives = 0;
     g->player.holy_mantle_active = 0;
     g->player.book_belial_dmg_timer = 0;
-    g->player.yum_heart_cd = 0;
     g->player.active_item = ITEM_NONE;
     g->player.active_charge = 0;
     g->player.active_max_charge = 0;
@@ -2453,8 +2459,9 @@ void apply_character_start(Game *g) {
             collect_item(g, ITEM_YUM_HEART);
             break;
         case CHAR_CAIN:
-            /* Lucky Foot starter, missing eye visual */
-            p->items[p->item_count++] = ITEM_LUCKY_FOOT;
+            /* Lucky Foot starter, missing eye visual (through collect_item
+               so the luck stat is recalculated immediately) */
+            collect_item(g, ITEM_LUCKY_FOOT);
             break;
         case CHAR_JUDAS:
             /* Book of Belial starter (active item) */
@@ -2604,7 +2611,6 @@ void player_update(Game *g, u32 kHeld, circlePosition circlePos) {
     /* ── Timers ── */
     if (p->iframes > 0) p->iframes--;
     if (p->tear_cooldown > 0) p->tear_cooldown--;
-    if (p->kb_timer > 0) p->kb_timer--;
     if (p->shoot_anim > 0) p->shoot_anim--;
     if (p->pickup_anim > 0) p->pickup_anim--;
     if (g->pickup_flash > 0) g->pickup_flash--;
@@ -2671,12 +2677,7 @@ void player_update(Game *g, u32 kHeld, circlePosition circlePos) {
      * 2. MOMENTUM PHYSICS — Isaac's "slippery" feel
      * ══════════════════════════════════════════════════════════ */
 
-    /* During knockback stun, player has no movement control */
-    if (p->kb_timer > 0) {
-        /* Knockback decays via friction every frame */
-        p->vx *= PLAYER_FRICTION;
-        p->vy *= PLAYER_FRICTION;
-    } else if (hasInput) {
+    if (hasInput) {
         /* Target velocity = direction × magnitude × max speed */
         float tvx = ix * inputStrength * spd;
         float tvy = iy * inputStrength * spd;
@@ -2737,8 +2738,8 @@ void player_update(Game *g, u32 kHeld, circlePosition circlePos) {
         p->moving = 1;
         p->anim_timer++;
 
-        /* Update facing only from intentional input (not knockback drift) */
-        if (hasInput && p->kb_timer <= 0) {
+        /* Update facing only from intentional input */
+        if (hasInput) {
             if (fabsf(ix) > fabsf(iy)) {
                 p->face_dir = (ix > 0) ? DIR_RIGHT : DIR_LEFT;
             } else {
@@ -2758,13 +2759,16 @@ void player_update(Game *g, u32 kHeld, circlePosition circlePos) {
         float pdx = p->x - r->pedestal.x;
         float pdy = p->y - r->pedestal.y;
         if (pdx * pdx + pdy * pdy < (PLAYER_SIZE + 10) * (PLAYER_SIZE + 10)) {
-            g->last_pickup = r->pedestal.item;
-            g->pickup_flash = PICKUP_FLASH_FRAMES;
-            p->pickup_anim = 40;  /* show pickup pose for ~0.7s */
-            collect_item(g, r->pedestal.item);
-            r->pedestal.active = 0;
-            g->score += 50;
-            audio_play(SFX_PICKUP);
+            /* Only consume the pedestal if the item was actually granted
+               (collect_item refuses passives at the 32-item cap). */
+            if (collect_item(g, r->pedestal.item)) {
+                g->last_pickup = r->pedestal.item;
+                g->pickup_flash = PICKUP_FLASH_FRAMES;
+                p->pickup_anim = 40;  /* show pickup pose for ~0.7s */
+                r->pedestal.active = 0;
+                g->score += 50;
+                audio_play(SFX_PICKUP);
+            }
         }
     }
 
@@ -2916,6 +2920,8 @@ void player_update(Game *g, u32 kHeld, circlePosition circlePos) {
             default: break;
             }
             if (p->coins > 99) p->coins = 99;
+            if (p->bombs > 99) p->bombs = 99;
+            if (p->keys  > 99) p->keys  = 99;
             if (picked_up) {
                 c->active = 0;
                 r->consumable_count--;
@@ -2944,12 +2950,11 @@ void player_update(Game *g, u32 kHeld, circlePosition circlePos) {
                         /* Dead Cat floors max_hp to 2, so heart-container payment
                            is impossible. Pay a spare life per heart of cost. */
                         int lifeCost = si->cost;
-                        if (p->lives >= lifeCost) {
+                        if (p->lives >= lifeCost && collect_item(g, si->item)) {
                             p->lives -= lifeCost;
                             g->last_pickup = si->item;
                             g->pickup_flash = PICKUP_FLASH_FRAMES;
                             p->pickup_anim = 40;
-                            collect_item(g, si->item);
                             si->active = 0;
                             g->score += 66;
                             g->hurt_flash_timer = HURT_FLASH_FRAMES;
@@ -2958,8 +2963,10 @@ void player_update(Game *g, u32 kHeld, circlePosition circlePos) {
                             audio_play(SFX_HURT);
                             g->shop_deny_timer = 30;
                         }
-                    } else if (p->stats.max_hp - hpCost >= 2) {
-                        /* Burn over-cap pill HP first so the heart payment is
+                    } else if (p->stats.max_hp - hpCost >= 2 &&
+                               collect_item(g, si->item)) {
+                        /* Item granted (cap not hit) — now take the payment.
+                           Burn over-cap pill HP first so the heart payment is
                            always real — recalc's cap clamp used to swallow the
                            whole debit for over-cap players. */
                         if (p->pill_max_hp_bonus > 0) {
@@ -2970,11 +2977,11 @@ void player_update(Game *g, u32 kHeld, circlePosition circlePos) {
                             p->pill_max_hp_bonus = (saved > head) ? head : saved;
                         }
                         p->pill_max_hp_bonus -= hpCost;  /* persistent debit */
+                        recalc_player_stats(p);
+                        if (p->hp > p->stats.max_hp) p->hp = p->stats.max_hp;
                         g->last_pickup = si->item;
                         g->pickup_flash = PICKUP_FLASH_FRAMES;
                         p->pickup_anim = 40;
-                        collect_item(g, si->item);       /* recalcs stats */
-                        if (p->hp > p->stats.max_hp) p->hp = p->stats.max_hp;
                         si->active = 0;
                         g->score += 66;
                         g->hurt_flash_timer = HURT_FLASH_FRAMES; /* it hurts */
@@ -2983,12 +2990,12 @@ void player_update(Game *g, u32 kHeld, circlePosition circlePos) {
                         audio_play(SFX_HURT);
                         g->shop_deny_timer = 30;
                     }
-                } else if (p->coins >= si->cost) {
+                } else if (p->coins >= si->cost &&
+                           collect_item(g, si->item)) {
                     p->coins -= si->cost;
                     g->last_pickup = si->item;
                     g->pickup_flash = PICKUP_FLASH_FRAMES;
                     p->pickup_anim = 40;
-                    collect_item(g, si->item);
                     si->active = 0;
                     g->score += 50;
                     audio_play(SFX_PICKUP);
@@ -3014,8 +3021,10 @@ void player_update(Game *g, u32 kHeld, circlePosition circlePos) {
     }
 
     /* E2: Mom's Heart end-run choice — the "beam of light" next to the
-       trapdoor ends the run immediately with Ending 1. */
-    if (r->has_ending_beam && g->state == STATE_PLAYING) {
+       trapdoor ends the run immediately with Ending 1.
+       R8 #24: only once the room is actually cleared — leftover wave
+       minions must not be skippable by dashing into the beam mid-combat. */
+    if (r->has_ending_beam && r->cleared && g->state == STATE_PLAYING) {
         float bx = (ROOM_LEFT + ROOM_RIGHT) / 2.0f + 60.0f;
         float by = (ROOM_TOP + ROOM_BOTTOM) / 2.0f;
         float bdx = p->x - bx;
@@ -3159,8 +3168,8 @@ static void render_blood_particles(Game *g) {
 /* Stamp a permanent blood stain onto the room floor (persists between
    visits — rooms get progressively gorier as you fight, like Rebirth). */
 static void spawn_blood_decal(Room *r, float x, float y, int big) {
-    BloodDecal *bd = &r->decals[r->decal_next % MAX_BLOOD_DECALS];
-    r->decal_next++;
+    BloodDecal *bd = &r->decals[r->decal_next];
+    r->decal_next = (r->decal_next + 1) % MAX_BLOOD_DECALS;  /* wrap: no unbounded growth */
     bd->active = 1;
     /* Keep stains on the floor area, off the walls */
     bd->x = clampf(x, ROOM_LEFT + 8.0f, ROOM_RIGHT - 8.0f);
@@ -3459,6 +3468,7 @@ static void fetus_fire(Game *g, Direction dir) {
     b->timer = 45;                        /* short Dr. Fetus fuse */
     b->flash = 0;
     b->is_epic = player_has_item(p, ITEM_EPIC_FETUS);
+    b->is_fetus = 1;                      /* blast scales with damage stat */
     b->active = 1;
     p->tear_cooldown = get_tear_cooldown(p);
     weapon_face(g, dir);
@@ -3540,8 +3550,14 @@ void shoot_tear(Game *g, Direction dir) {
 
 /* D5 Ipecac detonation: small blast, tear dmg + 20 to everything in it,
  * and it CAN hurt the player standing too close (that's the Ipecac deal;
- * the player hit is Pyromaniac-gated inside bomb_explode_ex). */
+ * the player hit is Pyromaniac-gated inside bomb_explode_ex).
+ * Ipecac Lite (without the real Ipecac) gets a smaller, weaker blast. */
 static void tear_detonate(Game *g, Tear *t) {
+    if (player_has_item(&g->player, ITEM_IPECAC_LITE) &&
+        !player_has_item(&g->player, ITEM_IPECAC)) {
+        bomb_explode_ex(g, t->x, t->y, 24.0f, t->dmg + 10.0f, t->dmg + 10.0f, 2);
+        return;
+    }
     bomb_explode_ex(g, t->x, t->y, 32.0f, t->dmg + 20.0f, t->dmg + 20.0f, 2);
 }
 
@@ -3784,12 +3800,12 @@ static void monstro_shotgun(Game *g, float bx, float by) {
 
 /* ----- Phase 2 boss minion spawn helpers ----- */
 
-/* Peep: spawn a small eye that pursues player */
+/* Peep: spawn a small eye that pursues player.
+   R8 #20: routed through alloc_dynamic_enemy (dead-slot reuse + spawn_grace)
+   like every other mid-combat spawner. */
 static void boss_spawn_eye(Room *r, float bx, float by) {
-    if (r->enemy_count >= MAX_ENEMIES) return;
-    Enemy *e = &r->enemies[r->enemy_count];
-    memset(e, 0, sizeof(Enemy));
-    e->active = 1;
+    Enemy *e = alloc_dynamic_enemy(r);
+    if (!e) return; /* active/spawn_grace set by alloc_dynamic_enemy */
     e->type = ENEMY_EYE;
     e->hp = 3;
     e->max_hp = 3;
@@ -3799,15 +3815,12 @@ static void boss_spawn_eye(Room *r, float bx, float by) {
     e->dy = randf(-1.0f, 1.0f);
     e->timer = randi(30, 60);
     e->shoot_timer = randi(60, 100);
-    r->enemy_count++;
 }
 
-/* Haunt: spawn a Lil Haunt minion */
+/* Haunt: spawn a Lil Haunt minion (R8 #20: alloc_dynamic_enemy) */
 static void boss_spawn_lil_haunt(Room *r, float bx, float by) {
-    if (r->enemy_count >= MAX_ENEMIES) return;
-    Enemy *e = &r->enemies[r->enemy_count];
-    memset(e, 0, sizeof(Enemy));
-    e->active = 1;
+    Enemy *e = alloc_dynamic_enemy(r);
+    if (!e) return;
     e->type = ENEMY_LIL_HAUNT;
     e->hp = 4;
     e->max_hp = 4;
@@ -3816,15 +3829,12 @@ static void boss_spawn_lil_haunt(Room *r, float bx, float by) {
     e->dx = randf(-0.8f, 0.8f);
     e->dy = randf(-0.8f, 0.8f);
     e->timer = randi(60, 90);
-    r->enemy_count++;
 }
 
-/* Widow / Gurdy: spawn a small spider */
+/* Widow / Gurdy: spawn a small spider (R8 #20: alloc_dynamic_enemy) */
 static void boss_spawn_spider(Room *r, float bx, float by) {
-    if (r->enemy_count >= MAX_ENEMIES) return;
-    Enemy *e = &r->enemies[r->enemy_count];
-    memset(e, 0, sizeof(Enemy));
-    e->active = 1;
+    Enemy *e = alloc_dynamic_enemy(r);
+    if (!e) return;
     e->type = ENEMY_SPIDER;
     e->hp = 2;
     e->max_hp = 2;
@@ -3833,15 +3843,12 @@ static void boss_spawn_spider(Room *r, float bx, float by) {
     e->dx = randf(-2.0f, 2.0f);
     e->dy = randf(-2.0f, 2.0f);
     e->timer = randi(30, 60);
-    r->enemy_count++;
 }
 
-/* Gurdy: spawn pooter minion */
+/* Gurdy: spawn pooter minion (R8 #20: alloc_dynamic_enemy) */
 static void boss_spawn_pooter(Room *r, float bx, float by) {
-    if (r->enemy_count >= MAX_ENEMIES) return;
-    Enemy *e = &r->enemies[r->enemy_count];
-    memset(e, 0, sizeof(Enemy));
-    e->active = 1;
+    Enemy *e = alloc_dynamic_enemy(r);
+    if (!e) return;
     e->type = ENEMY_POOTER;
     e->hp = 3;
     e->max_hp = 3;
@@ -3851,7 +3858,82 @@ static void boss_spawn_pooter(Room *r, float bx, float by) {
     e->dy = randf(-1.0f, 1.0f);
     e->timer = randi(40, 80);
     e->shoot_timer = randi(60, 100);
-    r->enemy_count++;
+}
+
+/* ----- R8 #18/#44: airborne-boss helpers ----- */
+
+/* Is this boss mid-jump? Airborne bosses deal NO ground contact damage and
+ * cast a growing landing-shadow telegraph at (target_x, target_y).
+ * Sign conventions verified per boss: Monstro/Gish/Mom launch with
+ * jump_vz < 0 (jump_z negative = up, lands at jump_z >= 0); Satan's stomp
+ * lives in phase 2 / attack_pattern 1 with the same sign; Widow launches
+ * with jump_vz = +7 (jump_z positive = up, lands at jump_z <= 0).
+ * If `progress` is non-NULL it receives 0..1 landing progress (0 = just
+ * launched, 1 = touchdown) derived from the jump's known frame budget. */
+static int boss_airborne(const Enemy *e, float *progress) {
+    int air = 0;
+    float dur = 1.0f;
+    switch (e->type) {
+    case ENEMY_BOSS_MONSTRO:
+    case ENEMY_BOSS_GISH:
+        air = (e->phase == 1);
+        dur = (e->attack_pattern == 2) ? 45.0f : 30.0f; /* big jump vs hop */
+        break;
+    case ENEMY_BOSS_MOM:
+        air = (e->phase == 1);
+        dur = 45.0f;
+        break;
+    case ENEMY_BOSS_SATAN:
+        air = (e->phase == 2 && e->attack_pattern == 1);
+        dur = 40.0f;
+        break;
+    case ENEMY_BOSS_WIDOW:
+        air = (e->phase == 1);
+        dur = 30.0f;
+        break;
+    default:
+        break;
+    }
+    if (air && progress)
+        *progress = clampf(1.0f - (float)e->timer / dur, 0.0f, 1.0f);
+    return air;
+}
+
+/* R8 #44: landing thump — standing at ground zero of a boss landing still
+ * punishes (1 full heart in a small ~28px AoE), replacing the unfair
+ * whole-body contact damage the boss used to deal while airborne. */
+static void boss_landing_thump(Game *g, float lx, float ly) {
+    Player *p = &g->player;
+    if (p->iframes != 0) return;
+    float dx = p->x - lx;
+    float dy = p->y - ly;
+    if (dx * dx + dy * dy >= 28.0f * 28.0f) return;
+    p->hp -= player_absorb_dmg(p, 2);
+    p->iframes = PLAYER_IFRAMES;
+    g->hitstop = 3;
+    float m = sqrtf(dx * dx + dy * dy);
+    if (m > 0.1f) {
+        p->vx = (dx / m) * PLAYER_KB_FORCE;
+        p->vy = (dy / m) * PLAYER_KB_FORCE;
+    } else {
+        p->vx = randf(-1.0f, 1.0f) * PLAYER_KB_FORCE;
+        p->vy = randf(-1.0f, 1.0f) * PLAYER_KB_FORCE;
+    }
+    audio_play(SFX_HURT_GRUNT);
+    if (player_check_death(p)) {
+        audio_play(SFX_PLAYER_DEATH);
+        g->state = STATE_GAMEOVER;
+    }
+}
+
+/* R8 #28/#43: shared boss phase-transition juice — hitstop freeze, a full
+ * white flash on the boss, the roar SFX, and an enemy-projectile wipe so
+ * the new phase always starts on a readable, fair slate. */
+static void boss_phase_juice(Game *g, Enemy *e) {
+    g->hitstop = 10;
+    e->flash = 20;              /* long white flash (render tints on flash) */
+    audio_play(SFX_BOSS);
+    for (int i = 0; i < MAX_ENEMY_SHOTS; i++) g->enemy_shots[i].active = 0;
 }
 
 /* Phase 2 boss: shoot a 4-way spread of tears */
@@ -4138,7 +4220,7 @@ void roll_curse(Game *g) {
          * LABYRINTH) are rarer/absent on early floors and become
          * progressively more likely the deeper the run goes, so new
          * players aren't hit with the harsher curses immediately. */
-        int pool[6];
+        int pool[8];
         int pool_count = 0;
         pool[pool_count++] = CURSE_DARKNESS;
         pool[pool_count++] = CURSE_LOST;
@@ -4152,7 +4234,8 @@ void roll_curse(Game *g) {
         if (g->current_floor >= 4) pool[pool_count++] = CURSE_LABYRINTH;
         if (g->current_floor >= 5) {
             /* Extra weight for the deep curses on late floors */
-            if (pool_count < 6) pool[pool_count++] = CURSE_UNKNOWN;
+            pool[pool_count++] = CURSE_UNKNOWN;
+            pool[pool_count++] = CURSE_MAZE;
         }
 
         g->active_curse = pool[randi(0, pool_count - 1)];
@@ -4172,8 +4255,26 @@ const char *character_unlock_name(int char_idx) {
         case 1: return "MAGDALENE";
         case 2: return "CAIN";
         case 3: return "JUDAS";
+        case 4: return "EVE";
+        case 5: return "SAMSON";
+        case 6: return "???";      /* Blue Baby */
         default: return "?";
     }
+}
+
+/* Apply the character-unlock progression gates from characters_completed.
+ * Shared by unlock_check_after_win and the retroactive pass at boot (an old
+ * save whose wins predate newly-added characters must still unlock them).
+ * Returns 1 if any new character was unlocked. */
+static int apply_unlock_gates(void) {
+    int before = g_config.unlocked_chars;
+    if (g_config.characters_completed & 0x01) g_config.unlocked_chars |= 0x02; /* Magdalene */
+    if (g_config.characters_completed & 0x02) g_config.unlocked_chars |= 0x04; /* Cain */
+    if (g_config.characters_completed & 0x04) g_config.unlocked_chars |= 0x08; /* Judas */
+    if (g_config.characters_completed & 0x08) g_config.unlocked_chars |= 0x10; /* Eve */
+    if (g_config.characters_completed & 0x10) g_config.unlocked_chars |= 0x20; /* Samson */
+    if (g_config.characters_completed & 0x20) g_config.unlocked_chars |= 0x40; /* Blue Baby */
+    return g_config.unlocked_chars != before;
 }
 
 /* Called on game win to update unlocks/achievements. */
@@ -4184,29 +4285,7 @@ void unlock_check_after_win(Game *g) {
 
     /* Unlock next character (progression: Isaac -> Magdalene -> Cain -> Judas
      * -> Eve -> Samson -> ??? (Blue Baby)) */
-    int prev_unlocked = g_config.unlocked_chars;
-    if ((g_config.characters_completed & 0x01) && !(g_config.unlocked_chars & 0x02)) {
-        g_config.unlocked_chars |= 0x02;  /* unlock Magdalene */
-    }
-    if ((g_config.characters_completed & 0x02) && !(g_config.unlocked_chars & 0x04)) {
-        g_config.unlocked_chars |= 0x04;  /* unlock Cain */
-    }
-    if ((g_config.characters_completed & 0x04) && !(g_config.unlocked_chars & 0x08)) {
-        g_config.unlocked_chars |= 0x08;  /* unlock Judas */
-    }
-    if ((g_config.characters_completed & 0x08) && !(g_config.unlocked_chars & 0x10)) {
-        g_config.unlocked_chars |= 0x10;  /* unlock Eve */
-    }
-    if ((g_config.characters_completed & 0x10) && !(g_config.unlocked_chars & 0x20)) {
-        g_config.unlocked_chars |= 0x20;  /* unlock Samson */
-    }
-    if ((g_config.characters_completed & 0x20) && !(g_config.unlocked_chars & 0x40)) {
-        g_config.unlocked_chars |= 0x40;  /* unlock Blue Baby */
-    }
-
-    /* Track current boss in defeated mask (current_boss_type may not always
-     * be valid; bosses_defeated mainly accrued via collisions_update on kill) */
-    (void)prev_unlocked;
+    apply_unlock_gates();
 
     /* Save progress */
     config_save(&g_config);
@@ -4258,6 +4337,18 @@ static int kill_enemy(Game *g, Room *r, Enemy *e) {
         for (int f = 0; f < nflies; f++) {
             spawn_fly_from_death(r, e->x, e->y, fi);
         }
+    }
+
+    /* R8 #27: Fistula always bursts on death. The quarter-threshold split
+       paths require SURVIVING the hit, so a one-shot from full HP (or the
+       final killing blow) used to spawn zero balls. Spawning here (before
+       the boss epilogue sweep below) keeps boss_active/music alive until
+       the balls are dealt with. */
+    if (e->type == ENEMY_BOSS_FISTULA) {
+        float ball_hp = e->max_hp / 6.0f;
+        if (ball_hp < 1.0f) ball_hp = 1.0f;
+        spawn_fistula_ball(r, e->x, e->y, ball_hp);
+        spawn_fistula_ball(r, e->x, e->y, ball_hp);
     }
 
     /* Drops (difficulty-scaled) */
@@ -4437,6 +4528,7 @@ void place_bomb(Game *g) {
     g->bombs[slot].timer = 90;   /* ~1.5 seconds at 60fps */
     g->bombs[slot].flash = 0;
     g->bombs[slot].is_epic = 0;
+    g->bombs[slot].is_fetus = 0;
     g->bombs[slot].active = 1;
     audio_play(SFX_SHOOT);  /* reuse shoot sound for placement */
 }
@@ -4454,6 +4546,7 @@ static int spawn_troll_bomb(Game *g, float x, float y) {
         g->bombs[i].timer = randi(60, 110);  /* staggered fuses */
         g->bombs[i].flash = 0;
         g->bombs[i].is_epic = 0;
+        g->bombs[i].is_fetus = 0;
         g->bombs[i].active = 1;
         return 1;
     }
@@ -4526,6 +4619,9 @@ static void bomb_explode_ex(Game *g, float bx, float by, float blast,
            captured count when the array is full — spawn_grace marks them.
            R4: only fresh spawns (grace >= 9) are blast-immune. */
         if (e->spawn_grace >= 9) continue;
+        /* R8 #26: hidden/burrowed enemies (Host in shell, Pin/Scolex/Round
+           Worm underground) are safe from blasts, matching tear immunity. */
+        if (e->hidden) continue;
         float dx = e->x - bx, dy = e->y - by;
         if (dx * dx + dy * dy < blast * blast) {
             float bomb_prev_hp = e->hp;
@@ -4625,9 +4721,20 @@ void bomb_update(Game *g) {
         b->flash++;
         if (b->timer > 0) continue;
         b->active = 0;
-        if (b->is_epic) {
-            /* D4 Epic Fetus: x1.5 blast radius and x1.5 damage */
-            bomb_explode_ex(g, b->x, b->y, 72.0f, 90.0f, 22.5f, 2);
+        if (b->is_fetus) {
+            /* D4 Dr./Epic Fetus tear-bombs scale with the damage stat.
+               Baseline: the historical fixed numbers at Isaac's base 3.5
+               damage, so balance is unchanged for an itemless run. */
+            float ds = g->player.stats.damage / 3.5f;
+            if (ds < 0.2f) ds = 0.2f;   /* keep blasts meaningful */
+            if (b->is_epic) {
+                /* Epic Fetus: x1.5 blast radius and x1.5 damage */
+                bomb_explode_ex(g, b->x, b->y, 72.0f,
+                                90.0f * ds, 22.5f * ds, 2);
+            } else {
+                bomb_explode_ex(g, b->x, b->y, 48.0f,
+                                60.0f * ds, 15.0f * ds, 2);
+            }
         } else {
             bomb_explode(g, b->x, b->y);
         }
@@ -4876,10 +4983,19 @@ void enemies_update(Game *g) {
        room is guaranteed to become clearable -- see the safety net below. */
     if (r->type == ROOM_BOSSRUSH && !r->cleared) {
         if (!g->bossrush_active) {
-            /* First frame in the room: start the gauntlet */
+            /* First frame in the room: start (or RESUME) the gauntlet.
+               R8 #25: wave progress lives in r->bossrush_wave, so warping
+               out and back in never refights waves already cleared. If an
+               interrupted wave left bosses alive, re-arm the boss HUD. */
             g->bossrush_active = 1;
-            g->bossrush_wave = 0;
-            g->bossrush_spawn_timer = 30; /* brief grace period before wave 1 */
+            g->bossrush_spawn_timer = 30; /* brief grace period */
+            for (int i = 0; i < r->enemy_count; i++) {
+                if (r->enemies[i].active && is_boss_type(r->enemies[i].type)) {
+                    g->boss_active = 1;
+                    g->boss_name = boss_name_str(r->enemies[i].type);
+                    break;
+                }
+            }
         }
 
         if (g->bossrush_spawn_timer > 0) {
@@ -4891,7 +5007,7 @@ void enemies_update(Game *g) {
             }
 
             if (alive_bosses == 0) {
-                if (g->bossrush_wave >= BOSSRUSH_TOTAL_WAVES) {
+                if (r->bossrush_wave >= BOSSRUSH_TOTAL_WAVES) {
                     /* Anti-softlock safety net: zero alive enemies and the wave
                        counter is at/after the final wave -- always clear here,
                        regardless of how we got to this state. */
@@ -4976,9 +5092,11 @@ void enemies_update(Game *g) {
                             e->hp = e->hp * hp_mult;
                             if (e->hp < 1) e->hp = 1;
                             e->max_hp = e->hp;
+                            /* R8 #19: scale the twin head with the body */
+                            e->gemini_chp = (int)((float)e->gemini_chp * hp_mult);
                         }
                     }
-                    g->bossrush_wave++;
+                    r->bossrush_wave++;
                     g->boss_active = 1;
                     g->bossrush_spawn_timer = 40; /* short breather before next check */
                     trigger_shake(g, 4.0f, 20);
@@ -5017,6 +5135,14 @@ void enemies_update(Game *g) {
         float kbMag2 = e->kb_dx * e->kb_dx + e->kb_dy * e->kb_dy;
         int suppressAI = (kbMag2 > 1.0f);
 
+        /* R8 #22: champion speed multiplier — the one-shot dx/dy scaling in
+           enemy_make_champion was overwritten by the per-frame velocity
+           recomputes below, making blue champions a speed no-op. Derived
+           from e->champion (not a stored field) so the many memset-spawn
+           paths can never zero it. Applied to the chase/hop/charge movers. */
+        float champ_spd = (e->champion == CHAMP_BLUE) ? 1.3f : 1.0f;
+        (void)champ_spd;
+
         switch (e->type) {
         case ENEMY_FLY: {
             /* Rebirth black fly: wanders aimlessly — the threat is only
@@ -5024,7 +5150,7 @@ void enemies_update(Game *g) {
             e->timer--;
             if (e->timer <= 0) {
                 float ang = randf(0, 6.28f);
-                float spd = 0.7f * fi->enemy_speed_mult;
+                float spd = 0.7f * fi->enemy_speed_mult * champ_spd;
                 e->dx = cosf(ang) * spd;
                 e->dy = sinf(ang) * spd;
                 e->timer = randi(40, 90);
@@ -5043,7 +5169,7 @@ void enemies_update(Game *g) {
             float gdy = p->y - e->y;
             float gm = sqrtf(gdx * gdx + gdy * gdy);
             float speed = (e->type == ENEMY_GAPER_SMALL ? 1.0f : 0.8f) *
-                          fi->enemy_speed_mult;
+                          fi->enemy_speed_mult * champ_spd;
             e->wobble += 0.16f;
 
             if (gm > 1.0f && !suppressAI) {
@@ -5092,7 +5218,7 @@ void enemies_update(Game *g) {
             float gdx = p->x - e->x;
             float gdy = p->y - e->y;
             float gm = sqrtf(gdx * gdx + gdy * gdy);
-            float speed = 0.45f * fi->enemy_speed_mult;  /* slower than gaper's 0.8 */
+            float speed = 0.45f * fi->enemy_speed_mult * champ_spd;  /* slower than gaper's 0.8 */
             e->wobble += 0.10f;
 
             if (gm > 1.0f && !suppressAI) {
@@ -5142,8 +5268,8 @@ void enemies_update(Game *g) {
                     e->timer = 24;
                     float pdmag = sqrtf(pd2);
                     if (pdmag > 0.1f) {
-                        e->dx = (pdx / pdmag) * 2.8f * fi->enemy_speed_mult;
-                        e->dy = (pdy / pdmag) * 2.8f * fi->enemy_speed_mult;
+                        e->dx = (pdx / pdmag) * 2.8f * fi->enemy_speed_mult * champ_spd;
+                        e->dy = (pdy / pdmag) * 2.8f * fi->enemy_speed_mult * champ_spd;
                     }
                 }
 
@@ -5154,7 +5280,7 @@ void enemies_update(Game *g) {
                     e->timer--;
                     if (e->timer <= 0) {
                         e->state = 0;
-                        e->dx = (randi(0, 1) == 0 ? 1 : -1) * 1.2f * fi->enemy_speed_mult;
+                        e->dx = (randi(0, 1) == 0 ? 1 : -1) * 1.2f * fi->enemy_speed_mult * champ_spd;
                         e->dy = 0;
                     }
                 } else {
@@ -5181,7 +5307,7 @@ void enemies_update(Game *g) {
                     /* Aligned on an axis -> begin a straight charge along it */
                     e->state = 1;
                     e->timer = 40;
-                    float spd = 3.2f * fi->enemy_speed_mult;
+                    float spd = 3.2f * fi->enemy_speed_mult * champ_spd;
                     if (fabsf(pdy) < 14.0f) {
                         /* horizontal charge */
                         e->dx = (pdx >= 0 ? 1.0f : -1.0f) * spd;
@@ -5202,7 +5328,7 @@ void enemies_update(Game *g) {
                         e->y <= ROOM_TOP + ENEMY_SIZE  || e->y >= ROOM_BOTTOM - ENEMY_SIZE ||
                         e->timer <= 0) {
                         e->state = 0;
-                        e->dx = (randi(0, 1) == 0 ? 1 : -1) * 1.2f * fi->enemy_speed_mult;
+                        e->dx = (randi(0, 1) == 0 ? 1 : -1) * 1.2f * fi->enemy_speed_mult * champ_spd;
                         e->dy = 0;
                     }
                 } else {
@@ -5231,8 +5357,8 @@ void enemies_update(Game *g) {
                         /* Random scatter so multiple spiders don't all run the same line */
                         float jx = randf(-0.3f, 0.3f);
                         float jy = randf(-0.3f, 0.3f);
-                        e->dx = ((sdx / sm) + jx) * 3.4f * fi->enemy_speed_mult;
-                        e->dy = ((sdy / sm) + jy) * 3.4f * fi->enemy_speed_mult;
+                        e->dx = ((sdx / sm) + jx) * 3.4f * fi->enemy_speed_mult * champ_spd;
+                        e->dy = ((sdy / sm) + jy) * 3.4f * fi->enemy_speed_mult * champ_spd;
                     }
                     e->state = 1;
                     e->timer = 12;
@@ -5262,8 +5388,8 @@ void enemies_update(Game *g) {
                 if (pmag > 0.5f) {
                     /* perpendicular */
                     float dirSign = (randi(0, 1) == 0) ? 1.0f : -1.0f;
-                    e->dx = (-pdy / pmag) * 1.0f * dirSign * fi->enemy_speed_mult;
-                    e->dy = ( pdx / pmag) * 1.0f * dirSign * fi->enemy_speed_mult;
+                    e->dx = (-pdy / pmag) * 1.0f * dirSign * fi->enemy_speed_mult * champ_spd;
+                    e->dy = ( pdx / pmag) * 1.0f * dirSign * fi->enemy_speed_mult * champ_spd;
                 } else {
                     e->dx = randf(-1.0f, 1.0f) * fi->enemy_speed_mult;
                     e->dy = randf(-1.0f, 1.0f) * fi->enemy_speed_mult;
@@ -5296,7 +5422,7 @@ void enemies_update(Game *g) {
             float pdy = p->y - e->y;
             float pd  = sqrtf(pdx * pdx + pdy * pdy);
             if (pd > 1.0f && !suppressAI) {
-                float spd = 1.4f * fi->enemy_speed_mult;
+                float spd = 1.4f * fi->enemy_speed_mult * champ_spd;
                 e->dx = (pdx / pd) * spd;
                 e->dy = (pdy / pd) * spd;
                 e->x += e->dx;
@@ -5371,8 +5497,8 @@ void enemies_update(Game *g) {
                     float ry = randf(-1, 1) + (pm > 1 ? (pdy / pm) * bias : 0);
                     float rm = sqrtf(rx * rx + ry * ry);
                     if (rm > 0.1f) { rx /= rm; ry /= rm; }
-                    e->dx = rx * 2.5f * fi->enemy_speed_mult;
-                    e->dy = ry * 2.5f * fi->enemy_speed_mult;
+                    e->dx = rx * 2.5f * fi->enemy_speed_mult * champ_spd;
+                    e->dy = ry * 2.5f * fi->enemy_speed_mult * champ_spd;
                     e->state = 1;
                     e->timer = 18;
                 }
@@ -5395,7 +5521,7 @@ void enemies_update(Game *g) {
             float pdx = p->x - e->x;
             float pdy = p->y - e->y;
             float pm  = sqrtf(pdx * pdx + pdy * pdy);
-            float spd = 0.4f * fi->enemy_speed_mult;
+            float spd = 0.4f * fi->enemy_speed_mult * champ_spd;
             if (pm > 1.0f && !suppressAI) {
                 e->dx = (pdx / pm) * spd;
                 e->dy = (pdy / pm) * spd;
@@ -5412,7 +5538,7 @@ void enemies_update(Game *g) {
                 float pdx = p->x - e->x;
                 float pdy = p->y - e->y;
                 float pm  = sqrtf(pdx * pdx + pdy * pdy);
-                float spd = 1.8f * fi->enemy_speed_mult;
+                float spd = 1.8f * fi->enemy_speed_mult * champ_spd;
                 if (pm > 1.0f && !suppressAI) {
                     e->dx = (pdx / pm) * spd;
                     e->dy = (pdy / pm) * spd;
@@ -5435,7 +5561,7 @@ void enemies_update(Game *g) {
         case ENEMY_BOOM_FLY: {
             /* Rebirth pattern: bounces diagonally around the room (it does
                NOT chase); the threat is the on-death explosion. */
-            float spd = 1.4f * fi->enemy_speed_mult;
+            float spd = 1.4f * fi->enemy_speed_mult * champ_spd;
             if (e->dx == 0 && e->dy == 0) {
                 /* start on a random diagonal */
                 e->dx = (randi(0, 1) ? 1.0f : -1.0f) * spd * 0.7071f;
@@ -5483,7 +5609,7 @@ void enemies_update(Game *g) {
             float pdx = p->x - e->x;
             float pdy = p->y - e->y;
             float pm  = sqrtf(pdx * pdx + pdy * pdy);
-            float spd = 0.8f * fi->enemy_speed_mult;
+            float spd = 0.8f * fi->enemy_speed_mult * champ_spd;
             e->wobble += 0.12f;
             if (pm > 1.0f && !suppressAI) {
                 float w = sinf(e->wobble) * 0.35f;
@@ -5541,7 +5667,7 @@ void enemies_update(Game *g) {
             float pdy = p->y - e->y;
             float pm  = sqrtf(pdx * pdx + pdy * pdy);
             if (pm > 1.0f && !suppressAI) {
-                float spd = 1.2f * fi->enemy_speed_mult;
+                float spd = 1.2f * fi->enemy_speed_mult * champ_spd;
                 e->x += (pdx / pm) * spd;
                 e->y += (pdy / pm) * spd;
             }
@@ -5570,8 +5696,8 @@ void enemies_update(Game *g) {
                     float pdy = p->y - e->y;
                     float pm  = sqrtf(pdx * pdx + pdy * pdy);
                     if (pm > 1.0f) {
-                        e->dx = (pdx / pm) * 3.0f * fi->enemy_speed_mult;
-                        e->dy = (pdy / pm) * 3.0f * fi->enemy_speed_mult;
+                        e->dx = (pdx / pm) * 3.0f * fi->enemy_speed_mult * champ_spd;
+                        e->dy = (pdy / pm) * 3.0f * fi->enemy_speed_mult * champ_spd;
                     }
                     e->attack_pattern++;  /* hop counter */
                     e->state = 1;
@@ -5614,8 +5740,8 @@ void enemies_update(Game *g) {
                     float pdy = p->y - e->y;
                     float pm  = sqrtf(pdx * pdx + pdy * pdy);
                     if (pm > 1.0f) {
-                        e->dx = (pdx / pm) * 4.6f * fi->enemy_speed_mult;  /* faster */
-                        e->dy = (pdy / pm) * 4.6f * fi->enemy_speed_mult;
+                        e->dx = (pdx / pm) * 4.6f * fi->enemy_speed_mult * champ_spd;  /* faster */
+                        e->dy = (pdy / pm) * 4.6f * fi->enemy_speed_mult * champ_spd;
                     }
                     e->state = 1;
                     e->timer = 16; /* shorter jump */
@@ -5671,7 +5797,7 @@ void enemies_update(Game *g) {
             e->timer--;
             if (e->timer <= 0) {
                 float ang = randf(0, 6.28f);
-                float spd = 1.6f * fi->enemy_speed_mult;
+                float spd = 1.6f * fi->enemy_speed_mult * champ_spd;
                 e->dx = cosf(ang) * spd;
                 e->dy = sinf(ang) * spd;
                 e->timer = randi(15, 40);
@@ -5723,7 +5849,7 @@ void enemies_update(Game *g) {
                 float bdy = p->y - e->y;
                 float bm = sqrtf(bdx * bdx + bdy * bdy);
                 if (bm > 1.0f) {
-                    float spd = 1.6f * fi->enemy_speed_mult;
+                    float spd = 1.6f * fi->enemy_speed_mult * champ_spd;
                     e->dx = (bdx / bm) * spd;
                     e->dy = (bdy / bm) * spd;
                 }
@@ -5742,7 +5868,7 @@ void enemies_update(Game *g) {
                 float pdy = p->y - e->y;
                 float pm = sqrtf(pdx * pdx + pdy * pdy);
                 if (pm > 1.0f) {
-                    float spd = 1.0f * fi->enemy_speed_mult;
+                    float spd = 1.0f * fi->enemy_speed_mult * champ_spd;
                     e->dx = (pdx / pm) * spd;
                     e->dy = (pdy / pm) * spd;
                 }
@@ -5908,6 +6034,9 @@ void enemies_update(Game *g) {
                     monstro_tear_spread(g, e->x, e->y);
                     /* Spawn blood splatter at landing */
                     spawn_blood_splatter(g, e->x, e->y, 0, 0, 0);
+                    /* R8 #44: no contact damage while airborne — the small
+                       landing AoE is the punish for standing at ground zero */
+                    boss_landing_thump(g, e->x, e->y);
                 }
             } else {
                 /* Phase 2: Landing recovery - brief stun */
@@ -5929,10 +6058,15 @@ void enemies_update(Game *g) {
              * After split (below 50% HP): both move independently, small one charges */
             float speed_main = 0.9f * fi->boss_speed_scale;
 
+            /* R8 #19: dead second head (gemini_chp <= 0) = no movement, no
+               contact, not drawn; the surviving body enrages mildly (+20%). */
+            if (e->gemini_chp <= 0) speed_main *= 1.2f;
+
             if (!e->gemini_split && e->hp < e->max_hp / 2) {
                 /* Split! */
                 e->gemini_split = 1;
                 trigger_shake(g, 4.0f, 15);
+                boss_phase_juice(g, e);  /* R8 #28 */
             }
 
             if (!e->gemini_split) {
@@ -5945,7 +6079,9 @@ void enemies_update(Game *g) {
                     e->y += (gdy / gm) * speed_main;
                 }
 
-                /* Companion follows main body with tether constraint */
+                /* Companion follows main body with tether constraint
+                   (R8 #19: skipped once the head is dead) */
+                if (e->gemini_chp > 0) {
                 float tdx = e->x - e->gemini_cx;
                 float tdy = e->y - e->gemini_cy;
                 float td = sqrtf(tdx * tdx + tdy * tdy);
@@ -5962,6 +6098,7 @@ void enemies_update(Game *g) {
                 /* Companion wobbles */
                 e->gemini_cx += sinf(g->frame * 0.07f) * 0.5f;
                 e->gemini_cy += cosf(g->frame * 0.09f) * 0.5f;
+                }
             } else {
                 /* Post-split: main body continues chasing, but faster */
                 float gdx = p->x - e->x;
@@ -5969,13 +6106,16 @@ void enemies_update(Game *g) {
                 float gm = sqrtf(gdx * gdx + gdy * gdy);
                 if (gm > 1.0f && !suppressAI) {
                     float post_spd = 1.6f * fi->boss_speed_scale;
+                    if (e->gemini_chp <= 0) post_spd *= 1.2f; /* R8 #19 enrage */
                     e->x += (gdx / gm) * post_spd;
                     e->y += (gdy / gm) * post_spd;
                 }
 
                 /* Companion: aggressive charge behavior */
                 e->timer--;
-                if (e->state == 0) {
+                if (e->gemini_chp <= 0) {
+                    /* R8 #19: head dead — no more charges */
+                } else if (e->state == 0) {
                     /* Waiting to charge */
                     e->gemini_cdx *= 0.92f;
                     e->gemini_cdy *= 0.92f;
@@ -6010,8 +6150,8 @@ void enemies_update(Game *g) {
                                       ROOM_BOTTOM - ENEMY_SIZE);
             }
 
-            /* Companion collision with player */
-            if (p->iframes == 0) {
+            /* Companion collision with player (R8 #19: dead head = harmless) */
+            if (p->iframes == 0 && e->gemini_chp > 0) {
                 float cdx = p->x - e->gemini_cx;
                 float cdy = p->y - e->gemini_cy;
                 float cdsq = cdx * cdx + cdy * cdy;
@@ -6040,7 +6180,9 @@ void enemies_update(Game *g) {
             /* Larry Jr: segmented worm - head leads, body follows in snake pattern
              * Speeds up when damaged, bounces off walls */
             float hpRatio = (float)e->hp / (float)e->max_hp;
-            e->seg_speed = 1.8f + (1.0f - hpRatio) * 2.0f; /* faster when hurt */
+            /* R8 #23: the per-frame recompute must keep the floor's boss
+               speed scale (init applied it, then this overwrote it). */
+            e->seg_speed = (1.8f + (1.0f - hpRatio) * 2.0f) * fi->boss_speed_scale;
 
             e->timer--;
             if (e->timer <= 0) {
@@ -6146,6 +6288,7 @@ void enemies_update(Game *g) {
                 e->phase = 1;
                 e->timer = 10;
                 trigger_shake(g, 5.0f, 20);
+                boss_phase_juice(g, e);  /* R8 #28: wipe shots BEFORE burst */
                 /* Shoot burst on phase transition */
                 monstro_tear_spread(g, e->x, e->y);
             }
@@ -6230,6 +6373,7 @@ void enemies_update(Game *g) {
             if (e->phase == 0 && e->hp < e->max_hp / 2) {
                 e->phase = 1;
                 trigger_shake(g, 4.0f, 18);
+                boss_phase_juice(g, e);  /* R8 #28 */
                 /* On detach, spawn 2 eyes immediately */
                 boss_spawn_eye(r, e->x, e->y);
                 boss_spawn_eye(r, e->x, e->y);
@@ -6402,6 +6546,7 @@ void enemies_update(Game *g) {
             if (e->phase == 0 && e->hp < e->max_hp / 2) {
                 e->phase = 1;
                 trigger_shake(g, 5.0f, 25);
+                boss_phase_juice(g, e);  /* R8 #28 */
                 e->shoot_timer = 60;
             }
 
@@ -6521,6 +6666,7 @@ void enemies_update(Game *g) {
                     /* Shoot 4-way burst on landing */
                     boss_spread_4way(g, e->x, e->y, BOSS_SHOT_SPEED * 0.9f);
                     trigger_shake(g, 3.5f, 12);
+                    boss_landing_thump(g, e->x, e->y);  /* R8 #44 */
                     e->timer = randi(40, 70);
                 }
             }
@@ -6684,6 +6830,7 @@ void enemies_update(Game *g) {
                     trigger_shake(g, 7.0f, 24);
                     boss_spread_8way(g, e->x, e->y, BOSS_SHOT_SPEED);
                     spawn_blood_splatter(g, e->x, e->y, 0, 0, 0);
+                    boss_landing_thump(g, e->x, e->y);  /* R8 #44 */
                 }
             } else {
                 /* Landing recovery */
@@ -6771,6 +6918,7 @@ void enemies_update(Game *g) {
                     e->jump_vz = 0;
                     e->timer = 50;
                     trigger_shake(g, 5.0f, 20);
+                    boss_phase_juice(g, e);  /* R8 #28 */
                 }
             }
 
@@ -6904,6 +7052,7 @@ void enemies_update(Game *g) {
                         boss_spread_8way(g, e->x, e->y, BOSS_SHOT_SPEED * 1.1f);
                         boss_spread_4way(g, e->x, e->y, BOSS_SHOT_SPEED * 0.7f);
                         spawn_blood_splatter(g, e->x, e->y, 0, 0, 0);
+                        boss_landing_thump(g, e->x, e->y);  /* R8 #44 */
                     }
                 } else {
                     e->dx *= 0.85f;
@@ -6991,6 +7140,7 @@ void enemies_update(Game *g) {
                     trigger_shake(g, 5.0f, 20);
                     monstro_tear_spread(g, e->x, e->y);
                     spawn_blood_splatter(g, e->x, e->y, 0, 0, 0);
+                    boss_landing_thump(g, e->x, e->y);  /* R8 #44 */
                     /* Gish signature: leave a pool of green creep on landing */
                     if (!suppressAI) {
                         spawn_creep(g, e->x, e->y, 1, 240);
@@ -7058,10 +7208,13 @@ void enemies_update(Game *g) {
              * drops below half HP, starts making short aggressive lunges
              * (like Gemini's companion, but never fully detaches). */
             float speed_main = 1.0f * fi->boss_speed_scale;
+            /* R8 #19: dead second head = mild enrage for the survivor */
+            if (e->gemini_chp <= 0) speed_main *= 1.2f;
 
             if (!e->gemini_split && e->hp < e->max_hp / 2) {
                 e->gemini_split = 1;  /* second head becomes aggressive */
                 trigger_shake(g, 3.0f, 12);
+                boss_phase_juice(g, e);  /* R8 #28 */
             }
 
             float gdx = p->x - e->x;
@@ -7072,7 +7225,9 @@ void enemies_update(Game *g) {
                 e->y += (gdy / gm) * speed_main;
             }
 
-            if (!e->gemini_split) {
+            if (e->gemini_chp <= 0) {
+                /* R8 #19: head dead — skip all second-head behavior */
+            } else if (!e->gemini_split) {
                 /* Second head trails on a short tether, gentle wobble */
                 float tdx = e->x - e->gemini_cx;
                 float tdy = e->y - e->gemini_cy;
@@ -7121,8 +7276,8 @@ void enemies_update(Game *g) {
                                       ROOM_BOTTOM - ENEMY_SIZE);
             }
 
-            /* Second head collision with player */
-            if (p->iframes == 0) {
+            /* Second head collision with player (R8 #19: dead = harmless) */
+            if (p->iframes == 0 && e->gemini_chp > 0) {
                 float cdx = p->x - e->gemini_cx;
                 float cdy = p->y - e->gemini_cy;
                 float cdsq = cdx * cdx + cdy * cdy;
@@ -7151,7 +7306,8 @@ void enemies_update(Game *g) {
             /* Chub: segmented like Larry Jr, but fatter and slower/tankier.
              * Reuses the same segment-follow logic with reduced speed. */
             float hpRatio = (float)e->hp / (float)e->max_hp;
-            e->seg_speed = 1.3f + (1.0f - hpRatio) * 1.2f; /* speeds up when hurt, less than Larry */
+            /* R8 #23: keep the floor's boss speed scale in the recompute */
+            e->seg_speed = (1.3f + (1.0f - hpRatio) * 1.2f) * fi->boss_speed_scale;
 
             e->timer--;
             if (e->timer <= 0) {
@@ -7292,7 +7448,9 @@ void enemies_update(Game *g) {
             } else {
                 /* Emerged: slower segmented chase, vulnerable body collision */
                 float hpRatio = (float)e->hp / (float)e->max_hp;
-                e->seg_speed = 1.4f + (1.0f - hpRatio) * 1.0f; /* speeds up when hurt */
+                /* R8 #23: keep the floor's boss speed scale in the recompute
+                   (the burrowed branch above already scales) */
+                e->seg_speed = (1.4f + (1.0f - hpRatio) * 1.0f) * fi->boss_speed_scale;
                 float ldx = p->x - e->x;
                 float ldy = p->y - e->y;
                 float lm = sqrtf(ldx * ldx + ldy * ldy);
@@ -7586,6 +7744,31 @@ void collisions_update(Game *g) {
                        at point-blank must not re-run the death path). */
                     if (!e->active) break;
                 }
+            } else if ((e->type == ENEMY_BOSS_GEMINI ||
+                        e->type == ENEMY_BOSS_STEVEN) &&
+                       e->gemini_chp > 0 && !e->hidden &&
+                       circle_overlap(t->x, t->y, TEAR_RADIUS,
+                                      e->gemini_cx, e->gemini_cy, 10.0f)) {
+                /* R8 #19: the second head is a real, killable target —
+                   tears drain gemini_chp; at 0 the head goes down (no
+                   contact damage, not drawn) and the survivor enrages. */
+                int hd = (int)t->dmg;
+                if (hd < 1) hd = 1;
+                e->gemini_chp -= hd;
+                e->flash = 14;
+                audio_play(SFX_HIT);
+                spawn_blood_splatter(g, t->x, t->y, t->dx, t->dy, 1);
+                spawn_tear_pop(g, t->x, t->y, 0);
+                if (!t->piercing) t->active = 0;
+                if (e->gemini_chp <= 0) {
+                    e->gemini_chp = 0;
+                    /* Head-down gore + pop so the kill reads clearly */
+                    spawn_blood_splatter(g, e->gemini_cx, e->gemini_cy,
+                                         0, 0, 1);
+                    spawn_blood_decal(r, e->gemini_cx, e->gemini_cy, 0);
+                    audio_play(SFX_ENEMY_DEATH);
+                    trigger_shake(g, 3.0f, 10);
+                }
             }
         }
 
@@ -7595,7 +7778,8 @@ void collisions_update(Game *g) {
            Bosses hit for a full heart everywhere; normal enemies hit for a
            full heart from Sheol on (floor >= 6); big bruisers (Fatty /
            Leaper / Vis) already hit full on the Womb (floor 5). */
-        if (e->active && p->iframes == 0 && !e->hidden && e->spawn_grace == 0) {
+        if (e->active && p->iframes == 0 && !e->hidden && e->spawn_grace == 0 &&
+            !boss_airborne(e, NULL) /* R8 #18: no contact while mid-jump */) {
             if (circle_overlap(p->x, p->y, PLAYER_SIZE, e->x, e->y, esz)) {
                 int big_bruiser = (e->type == ENEMY_FATTY ||
                                    e->type == ENEMY_LEAPER ||
@@ -7662,8 +7846,9 @@ void collisions_update(Game *g) {
 
     /* Arcade room: slot machine obstacle -- walk in with >=1 coin to pay and
        roll a reward (heart / consumable / small chance at a pedestal item).
-       Bounded to a single use per room visit via arcade_slot_used, mirroring
-       the shop's shop_deny_timer cooldown for the "can't afford" feedback. */
+       Bounded to a single use per room (arcade_slot_used persists across
+       re-entries), mirroring the shop's shop_deny_timer cooldown for the
+       "can't afford" feedback. */
     if (r->type == ROOM_ARCADE && g->state == STATE_PLAYING) {
         if (g->shop_deny_timer > 0) g->shop_deny_timer--;
         for (int i = 0; i < r->obstacle_count; i++) {
@@ -7841,7 +8026,7 @@ void collisions_update(Game *g) {
                             dr->shop_count = (g->challenge == 6) ? 0 : 2;
                             for (int si2 = 0; si2 < dr->shop_count; si2++) {
                                 ShopItem *dsi = &dr->shop_items[si2];
-                                dsi->item = (ItemType)randi(1, ITEM_COUNT - 1);
+                                dsi->item = pick_random_item(g); /* owned-item filtered */
                                 if (si2 == 0 && randi(0, 99) < 40 &&
                                     !player_has_item(&g->player, ITEM_THE_PACT)) {
                                     dsi->item = ITEM_THE_PACT;
@@ -8051,14 +8236,14 @@ void do_room_transition(Game *g, Direction dir) {
     /* Secret room landing (normal entry or maze redirect): open its doors */
     reveal_secret_room(g, nx, ny);
 
-    /* Arcade slot machine is once per VISIT, not once per run */
-    if (newRoom->type == ROOM_ARCADE) newRoom->arcade_slot_used = 0;
+    /* NOTE: arcade_slot_used deliberately NOT reset on re-entry — the slot
+       machine is once per room, or leaving/re-entering prints infinite items */
 
-    /* Entering an uncleared Boss Rush room: reset the Game-global wave state
-       so a prior/aborted gauntlet can't leak a stale wave counter into it. */
+    /* Entering an uncleared Boss Rush room: reset the Game-global wave
+       machine so the controller re-arms cleanly. R8 #25: the wave COUNTER
+       itself lives in the Room now, so re-entry resumes where it left off. */
     if (newRoom->type == ROOM_BOSSRUSH && !newRoom->cleared) {
         g->bossrush_active = 0;
-        g->bossrush_wave = 0;
         g->bossrush_spawn_timer = 0;
     }
 
@@ -8439,6 +8624,7 @@ void game_update(Game *g, u32 kDown, u32 kHeld, circlePosition circlePos) {
         if (kDown & (KEY_B | KEY_START)) {
             if (g->settings_changed) {
                 config_save(&g_config);
+                g->settings_changed = 0;  /* saved — no exit re-save needed */
             }
             g->state = STATE_MENU;
         }
@@ -8512,7 +8698,6 @@ void game_update(Game *g, u32 kDown, u32 kHeld, circlePosition circlePos) {
             g->player.book_belial_dmg_timer--;
             if (g->player.book_belial_dmg_timer == 0) recalc_player_stats(&g->player);
         }
-        if (g->player.yum_heart_cd > 0) g->player.yum_heart_cd--;
         if (g->homing_timer > 0) g->homing_timer--;
         if (g->curse_display_timer > 0) g->curse_display_timer--;
         if (g->floor_intro_timer > 0) g->floor_intro_timer--;
@@ -8546,7 +8731,7 @@ void game_update(Game *g, u32 kDown, u32 kHeld, circlePosition circlePos) {
 
         /* Track HP across this frame's updates to trigger the hurt pulse.
            Red HP is tracked separately for devil-deal eligibility. */
-        int hp_before = g->player.hp + g->player.soul_hp;
+        int hp_before = g->player.hp + g->player.soul_hp + g->player.black_hp;
         int red_before = g->player.hp;
 
         player_update(g, kHeld, circlePos);
@@ -8727,8 +8912,9 @@ void game_update(Game *g, u32 kDown, u32 kHeld, circlePosition circlePos) {
 
         check_door_transition(g);
 
-        /* Any HP lost this frame -> red vignette pulse */
-        if (g->player.hp + g->player.soul_hp < hp_before) {
+        /* Any HP lost this frame -> red vignette pulse (black hearts absorb
+           BEFORE soul hearts, so they must count or absorbed hits are silent) */
+        if (g->player.hp + g->player.soul_hp + g->player.black_hp < hp_before) {
             g->hurt_flash_timer = HURT_FLASH_FRAMES;
             /* Swallowed Penny: pain pays — drop a coin on damage */
             if (g->player.trinket == TRINKET_SWALLOWED_PENNY)
@@ -10065,22 +10251,68 @@ void render_hud(Game *g, C2D_TextBuf textBuf) {
     int maxHearts = g->player.stats.max_hp / 2;
     if (maxHearts > 12) maxHearts = 12;
 
-    /* R2: total displayed heart slots (red containers + soul + black —
-       mirror of the row math below). More than 12 slots wraps onto a 3rd
-       heart row (y 30-42), which lands on the active-item box frame at
-       WALL_THICKNESS+4 — shift the ENTIRE left HUD stack (active box,
-       counter column, pill/card/trinket doodads) down one heart row so
-       nothing overlaps and they can't drift apart. */
-    float hudShift = 0.0f;
+    /* R8 #34: row math derives from the TOTAL displayed slots (red
+       containers + soul + black), not just the red containers, so
+       soul-heavy builds wrap exactly like red-heavy ones. All three
+       heart loops below share this `wrapped` flag and 6-per-row grid.
+       R8 #36: rows_used also drives the active-item box top offset.
+       hudShift moves the rest of the left HUD stack only when a 3rd
+       heart row is actually rendered. */
+    int slotsSoul = 0, slotsBlack = 0;
     if (g->active_curse != CURSE_UNKNOWN) {
-        int slotsSoul = (g->player.soul_hp + 1) / 2;
+        slotsSoul = (g->player.soul_hp + 1) / 2;
         if (maxHearts + slotsSoul > 18) slotsSoul = 18 - maxHearts;
         if (slotsSoul < 0) slotsSoul = 0;
-        int slotsBlack = (g->player.black_hp + 1) / 2;
+        slotsBlack = (g->player.black_hp + 1) / 2;
         if (maxHearts + slotsSoul + slotsBlack > 18)
             slotsBlack = 18 - maxHearts - slotsSoul;
         if (slotsBlack < 0) slotsBlack = 0;
-        if (maxHearts + slotsSoul + slotsBlack > 12) hudShift = 14.0f;
+    }
+    int totalSlots = maxHearts + slotsSoul + slotsBlack;
+    int wrapped = (totalSlots > 6);
+    int rows_used = (totalSlots + 5) / 6;
+    if (rows_used < 1 || g->active_curse == CURSE_UNKNOWN) rows_used = 1;
+    float hudShift = (rows_used > 2) ? 14.0f : 0.0f;
+
+    /* R8 #41: HUD heart damage jiggle — track previously displayed HP in
+       statics; on a loss, the affected heart slot(s) get a ~12-frame
+       eased scale pop (0.75 -> ~0.95 -> 0.75). Render-side only. */
+    static int jig_prev_red = -1, jig_prev_soul = -1, jig_prev_black = -1;
+    static int jig_timer = 0, jig_lo = 0, jig_hi = -1;
+    {
+        int curRed = g->player.hp;
+        int curSoul = g->player.soul_hp;
+        int curBlack = g->player.black_hp;
+        if (jig_prev_red >= 0) {
+            int lo = 9999, hi = -1;
+            if (curRed < jig_prev_red) {
+                int a = curRed / 2, b = (jig_prev_red - 1) / 2;
+                if (a < lo) lo = a;
+                if (b > hi) hi = b;
+            }
+            if (curSoul < jig_prev_soul) {
+                int a = maxHearts + curSoul / 2;
+                int b = maxHearts + (jig_prev_soul - 1) / 2;
+                if (a < lo) lo = a;
+                if (b > hi) hi = b;
+            }
+            if (curBlack < jig_prev_black) {
+                int a = maxHearts + slotsSoul + curBlack / 2;
+                int b = maxHearts + slotsSoul + (jig_prev_black - 1) / 2;
+                if (a < lo) lo = a;
+                if (b > hi) hi = b;
+            }
+            if (hi >= 0) { jig_timer = 12; jig_lo = lo; jig_hi = hi; }
+        }
+        jig_prev_red = curRed;
+        jig_prev_soul = curSoul;
+        jig_prev_black = curBlack;
+    }
+    float jigScale = 0.0f;
+    if (jig_timer > 0) {
+        float jt = 1.0f - (float)jig_timer / 12.0f;
+        jigScale = 0.20f * sinf(jt * 3.14159265f);  /* eased 0->0.20->0 */
+        jig_timer--;
     }
 
     /* Curse of the Unknown: hide the heart row entirely (render-only —
@@ -10097,8 +10329,8 @@ void render_hud(Game *g, C2D_TextBuf textBuf) {
     for (int i = 0; i < maxHearts; i++) {
         /* Wrap to a second row instead of the old hard 8-heart cap, so
            high max-HP loadouts (Blood/Soul Hearts, Bag of Fish, etc.) all
-           remain visible instead of silently vanishing off the HUD. */
-        int wrapped = (maxHearts > 6);
+           remain visible instead of silently vanishing off the HUD.
+           (R8 #34: `wrapped` is total-slot based, computed above.) */
         int row = wrapped ? i / 6 : 0;
         int col = wrapped ? i % 6 : i;
         float hx = 12 + col * 15;
@@ -10107,6 +10339,8 @@ void render_hud(Game *g, C2D_TextBuf textBuf) {
 
         if (g_sprites_loaded) {
             float hs = 0.75f; /* slightly smaller hearts to fit HUD */
+            if (jigScale > 0.0f && i >= jig_lo && i <= jig_hi)
+                hs += jigScale;   /* R8 #41 damage pop */
             if (hpForThisHeart >= 2) {
                 spr_draw(sheet_ui_items, ui_items_atlas_heart_red_full_idx, hx, hy, hs, hs);
             } else if (hpForThisHeart == 1) {
@@ -10133,19 +10367,18 @@ void render_hud(Game *g, C2D_TextBuf textBuf) {
     int soulShown = 0;
     if (g->active_curse != CURSE_UNKNOWN) {
         int soulUnits = g->player.soul_hp;
-        int soulHearts = (soulUnits + 1) / 2;
-        if (maxHearts + soulHearts > 18) soulHearts = 18 - maxHearts;
-        if (soulHearts < 0) soulHearts = 0;
-        int heartWrapped = (maxHearts > 6);
+        int soulHearts = slotsSoul;   /* R8 #34: same math as row calc */
         for (int i = 0; i < soulHearts; i++) {
             int slot = maxHearts + i;
-            int row = heartWrapped ? slot / 6 : 0;
-            int col = heartWrapped ? slot % 6 : slot;
+            int row = wrapped ? slot / 6 : 0;
+            int col = wrapped ? slot % 6 : slot;
             float hx = 12 + col * 15;
             float hy = 8 + row * 14;
             int unitsForThis = soulUnits - i * 2;
             if (g_sprites_loaded) {
                 float hs = 0.75f;
+                if (jigScale > 0.0f && slot >= jig_lo && slot <= jig_hi)
+                    hs += jigScale;   /* R8 #41 damage pop */
                 spr_draw(sheet_ui_items,
                          (unitsForThis >= 2) ? ui_items_atlas_heart_soul_full_idx
                                              : ui_items_atlas_heart_soul_half_idx,
@@ -10162,20 +10395,18 @@ void render_hud(Game *g, C2D_TextBuf textBuf) {
            red containers is the closest simple read). Half hearts draw the
            full sprite at reduced scale (no dedicated half-black art). */
         int blackUnits = g->player.black_hp;
-        int blackHearts = (blackUnits + 1) / 2;
-        if (maxHearts + soulShown + blackHearts > 18)
-            blackHearts = 18 - maxHearts - soulShown;
-        if (blackHearts < 0) blackHearts = 0;
-        int rowWrapped = (maxHearts > 6);
+        int blackHearts = slotsBlack;   /* R8 #34: same math as row calc */
         for (int i = 0; i < blackHearts; i++) {
             int slot = maxHearts + soulShown + i;
-            int row = rowWrapped ? slot / 6 : 0;
-            int col = rowWrapped ? slot % 6 : slot;
+            int row = wrapped ? slot / 6 : 0;
+            int col = wrapped ? slot % 6 : slot;
             float hx = 12 + col * 15;
             float hy = 8 + row * 14;
             int unitsForThis = blackUnits - i * 2;
             if (g_sprites_loaded) {
                 float hs = (unitsForThis >= 2) ? 0.75f : 0.55f;
+                if (jigScale > 0.0f && slot >= jig_lo && slot <= jig_hi)
+                    hs += jigScale;   /* R8 #41 damage pop */
                 spr_draw(sheet_ui_items, ui_items_atlas_heart_black_full_idx,
                          hx, hy, hs, hs);
             } else {
@@ -10268,9 +10499,12 @@ void render_hud(Game *g, C2D_TextBuf textBuf) {
     if (g->player.active_item != ITEM_NONE) {
         Player *p = &g->player;
         float bx = 8;                    /* box left */
-        float by = WALL_THICKNESS + 4 + hudShift; /* just under the HUD
-                                            heart strip (R2: +1 row when
-                                            hearts wrap to a 3rd row) */
+        /* R8 #36: box top derived from the heart rows actually rendered.
+           Last row center y = 8 + (rows-1)*14, sprite half-height ~6, plus
+           4px clearance and the 2px frame => 20 + (rows-1)*14. Never above
+           the classic WALL_THICKNESS+4 resting spot. */
+        float by = 20.0f + (float)(rows_used - 1) * 14.0f;
+        if (by < WALL_THICKNESS + 4) by = WALL_THICKNESS + 4;
         float bs = 20;                   /* box size */
         int ready = (p->active_charge >= p->active_max_charge);
 
@@ -10536,7 +10770,16 @@ void render_hud(Game *g, C2D_TextBuf textBuf) {
         if (boss) {
             float barX = TOP_SCREEN_WIDTH / 2.0f;
             float barY = TOP_SCREEN_HEIGHT - 14;
-            float hpPct = (float)boss->hp / (float)boss->max_hp;
+            /* R8 #19: Gemini/Steven's killable second head counts toward
+               the bar (head max is max_hp/3, mirroring init + hp scaling) */
+            float bhp  = boss->hp;
+            float bmax = boss->max_hp;
+            if (boss->type == ENEMY_BOSS_GEMINI ||
+                boss->type == ENEMY_BOSS_STEVEN) {
+                bhp  += (float)boss->gemini_chp;
+                bmax += boss->max_hp / 3.0f;
+            }
+            float hpPct = bhp / bmax;
             if (hpPct < 0) hpPct = 0;
             if (hpPct > 1) hpPct = 1;
 
@@ -10639,6 +10882,62 @@ void render_hud(Game *g, C2D_TextBuf textBuf) {
 /* Render one room of the dungeon grid. Parameterized by grid coords so the
    sliding room transition can draw the outgoing and incoming rooms in the
    same frame (each under its own C2D view translation). */
+/* R8 #40: per-chapter wall palette — a subtle tint over the shared wall
+ * art so each floor reads like its Rebirth chapter. Blends stay in the
+ * 0.15-0.35 band so the stone detail survives; doors use half strength
+ * so their identity colors stay readable. */
+static const struct { u8 r, g, b; float blend; } wall_pal[8] = {
+    { 150, 105,  60, 0.20f },  /* 0 Basement  — warm brown */
+    { 160, 120,  80, 0.18f },  /* 1 Cellar    — dusty tan */
+    { 110, 125, 145, 0.25f },  /* 2 Caves     — gray-blue */
+    {  95, 105, 130, 0.28f },  /* 3 Catacombs — deeper gray-blue */
+    {  55,  60,  75, 0.32f },  /* 4 Depths    — dark slate */
+    { 175,  55,  60, 0.30f },  /* 5 Womb      — flesh red */
+    {  25,  22,  40, 0.35f },  /* 6 Sheol     — near-black cold */
+    { 215, 180,  95, 0.25f },  /* 7 Chest     — warm gold */
+};
+
+/* Top-left-anchored environment draw with the chapter tint applied.
+ * blendScale < 1 softens the tint (doors). Also carries per-axis scale
+ * so the last wall tile of a row can be clamped to the room edge
+ * (R8 #38) instead of overhanging. */
+static void env_wall_draw(int idx, float x, float y, float sx, float sy,
+                          int fl, float blendScale) {
+    if (!sheet_environment) return;
+    C2D_Image img = C2D_SpriteSheetGetImage(sheet_environment, idx);
+    if (!img.subtex) return;
+    int pi = fl;
+    if (pi < 0) pi = 0;
+    if (pi > 7) pi = 7;
+    C2D_ImageTint tint;
+    C2D_PlainImageTint(&tint,
+                       C2D_Color32(wall_pal[pi].r, wall_pal[pi].g,
+                                   wall_pal[pi].b, 255),
+                       wall_pal[pi].blend * blendScale);
+    C2D_DrawImageAt(img, x, y, 0, &tint, sx, sy);
+}
+
+/* R8 #42: warm pedestal spotlight — stacked translucent floor ellipses
+ * plus a narrow upward light shaft built from two alpha-graded triangles
+ * (alpha ~25 at the base fading to 0 at the top). Pure geometry, no art. */
+static void render_pedestal_spotlight(float px, float py) {
+    u32 baseCol = C2D_Color32(255, 225, 160, 25);
+    u32 topCol  = C2D_Color32(255, 225, 160, 0);
+    C2D_DrawTriangle(px - 9.0f, py + 2.0f, baseCol,
+                     px + 9.0f, py + 2.0f, baseCol,
+                     px + 15.0f, py - 62.0f, topCol, 0);
+    C2D_DrawTriangle(px - 9.0f, py + 2.0f, baseCol,
+                     px + 15.0f, py - 62.0f, topCol,
+                     px - 15.0f, py - 62.0f, topCol, 0);
+    /* Warm pool of light on the floor under the pedestal */
+    C2D_DrawEllipseSolid(px - 24, py + 2, 0, 48, 14,
+                         C2D_Color32(255, 215, 150, 18));
+    C2D_DrawEllipseSolid(px - 17, py + 4, 0, 34, 10,
+                         C2D_Color32(255, 220, 160, 24));
+    C2D_DrawEllipseSolid(px - 10, py + 6, 0, 20, 6,
+                         C2D_Color32(255, 230, 180, 30));
+}
+
 static void render_room_at(Game *g, int room_gx, int room_gy) {
     Room *r = &g->dungeon.rooms[room_gy][room_gx];
     int fl = g->current_floor;
@@ -10730,33 +11029,39 @@ static void render_room_at(Game *g, int room_gx, int room_gy) {
                                  C2D_Color32(190, 30, 25, (u8)(ca * 160)));
         }
 
-        /* Walls - continuous directional wall tiles (64x24 horiz, 24x64 vert) */
-        for (float tx = WALL_THICKNESS; tx < TOP_SCREEN_WIDTH - WALL_THICKNESS; tx += 64) {
-            spr_draw_at(sheet_environment, environment_atlas_env_wall_top_idx,
-                        tx, ROOM_TOP - WALL_THICKNESS, 1.0f, 1.0f);
-        }
-        for (float tx = WALL_THICKNESS; tx < TOP_SCREEN_WIDTH - WALL_THICKNESS; tx += 64) {
-            spr_draw_at(sheet_environment, environment_atlas_env_wall_bottom_idx,
-                        tx, ROOM_BOTTOM, 1.0f, 1.0f);
-        }
-        for (float ty = ROOM_TOP; ty < ROOM_BOTTOM; ty += 64) {
-            spr_draw_at(sheet_environment, environment_atlas_env_wall_left_idx,
-                        0, ty, 1.0f, 1.0f);
-        }
-        for (float ty = ROOM_TOP; ty < ROOM_BOTTOM; ty += 64) {
-            spr_draw_at(sheet_environment, environment_atlas_env_wall_right_idx,
-                        ROOM_RIGHT, ty, 1.0f, 1.0f);
+        /* Walls - continuous directional wall tiles (64x24 horiz, 24x64 vert).
+           R8 #38: the last tile of each row is clamped to the room edge via
+           x/y scale instead of overhanging the screen / opposite wall.
+           R8 #40: all wall art routes through the per-chapter tint. */
+        {
+            const float wallEndX = TOP_SCREEN_WIDTH - WALL_THICKNESS;
+            for (float tx = WALL_THICKNESS; tx < wallEndX; tx += 64) {
+                float sx = (tx + 64.0f > wallEndX) ? (wallEndX - tx) / 64.0f
+                                                   : 1.0f;
+                env_wall_draw(environment_atlas_env_wall_top_idx,
+                              tx, ROOM_TOP - WALL_THICKNESS, sx, 1.0f, fl, 1.0f);
+                env_wall_draw(environment_atlas_env_wall_bottom_idx,
+                              tx, ROOM_BOTTOM, sx, 1.0f, fl, 1.0f);
+            }
+            for (float ty = ROOM_TOP; ty < ROOM_BOTTOM; ty += 64) {
+                float sy = (ty + 64.0f > ROOM_BOTTOM)
+                           ? ((float)ROOM_BOTTOM - ty) / 64.0f : 1.0f;
+                env_wall_draw(environment_atlas_env_wall_left_idx,
+                              0, ty, 1.0f, sy, fl, 1.0f);
+                env_wall_draw(environment_atlas_env_wall_right_idx,
+                              ROOM_RIGHT, ty, 1.0f, sy, fl, 1.0f);
+            }
         }
 
         /* Corner tiles (24x24) */
-        spr_draw_at(sheet_environment, environment_atlas_env_corner_tl_idx,
-                    0, ROOM_TOP - WALL_THICKNESS, 1.0f, 1.0f);
-        spr_draw_at(sheet_environment, environment_atlas_env_corner_tr_idx,
-                    ROOM_RIGHT, ROOM_TOP - WALL_THICKNESS, 1.0f, 1.0f);
-        spr_draw_at(sheet_environment, environment_atlas_env_corner_bl_idx,
-                    0, ROOM_BOTTOM, 1.0f, 1.0f);
-        spr_draw_at(sheet_environment, environment_atlas_env_corner_br_idx,
-                    ROOM_RIGHT, ROOM_BOTTOM, 1.0f, 1.0f);
+        env_wall_draw(environment_atlas_env_corner_tl_idx,
+                      0, ROOM_TOP - WALL_THICKNESS, 1.0f, 1.0f, fl, 1.0f);
+        env_wall_draw(environment_atlas_env_corner_tr_idx,
+                      ROOM_RIGHT, ROOM_TOP - WALL_THICKNESS, 1.0f, 1.0f, fl, 1.0f);
+        env_wall_draw(environment_atlas_env_corner_bl_idx,
+                      0, ROOM_BOTTOM, 1.0f, 1.0f, fl, 1.0f);
+        env_wall_draw(environment_atlas_env_corner_br_idx,
+                      ROOM_RIGHT, ROOM_BOTTOM, 1.0f, 1.0f, fl, 1.0f);
 
         /* (d) Wall bevel: 2px darker inner lip along the inside edge of the
            four walls to fake a recessed stone frame. */
@@ -10857,8 +11162,10 @@ static void render_room_at(Game *g, int room_gx, int room_gy) {
                 spr_variant = 0; /* normal/open */
             }
 
-            spr_draw_at(sheet_environment, door_spr_arr[di][spr_variant],
-                       door_pos[di][0], door_pos[di][1], 1.0f, 1.0f);
+            /* R8 #40: half-strength chapter tint keeps doors readable */
+            env_wall_draw(door_spr_arr[di][spr_variant],
+                          door_pos[di][0], door_pos[di][1], 1.0f, 1.0f,
+                          fl, 0.5f);
 
             /* Door center + covered wall rect (for identity overlays) */
             float dcx = door_pos[di][0] + DOOR_WIDTH / 2.0f;
@@ -10930,6 +11237,9 @@ static void render_room_at(Game *g, int room_gx, int room_gy) {
             float py = r->pedestal.y;
             float t = (float)g->frame;
 
+            /* R8 #42: warm spotlight shaft + floor glow under the item */
+            render_pedestal_spotlight(px, py);
+
             /* Outer glow pulse */
             float pulse = sinf(t * 0.05f) * 0.3f + 0.7f;
             u32 glowOuter = C2D_Color32(255, 255, 180, (int)(pulse * 40));
@@ -10956,8 +11266,9 @@ static void render_room_at(Game *g, int room_gx, int room_gy) {
             spr_draw(sheet_ui_items, ui_items_atlas_ui_item_pickup_idx,
                      px, py + 5, 1.0f, 1.0f);
 
-            /* Item sits still on its pedestal (no bob), subtle scale pulse */
+            /* R8 #42: slow bob in the spotlight + subtle scale pulse */
             float scPulse = 1.0f + sinf(t * 0.08f) * 0.05f;
+            float bobP = sinf(t * 0.05f) * 2.0f;
             if (g->active_curse == CURSE_BLIND) {
                 /* Draw a question mark instead */
                 float qx = px;
@@ -10979,7 +11290,8 @@ static void render_room_at(Game *g, int room_gx, int room_gy) {
                                   C2D_Color32(255, 255, 200, 255));
             } else {
                 int itemIdx = item_sprite_idx(r->pedestal.item);
-                spr_draw(sheet_ui_items, itemIdx, px, py - 6, scPulse, scPulse);
+                spr_draw(sheet_ui_items, itemIdx, px, py - 6 + bobP,
+                         scPulse, scPulse);
             }
         }
 
@@ -11104,6 +11416,8 @@ static void render_room_at(Game *g, int room_gx, int room_gy) {
             if (si->active) {
                 float bob_s = sinf((float)g->frame * 0.06f + (float)i) * 2.0f;
                 int sIdx = item_sprite_idx(si->item);
+                /* R8 #42: spotlight on shop/devil pedestals too */
+                render_pedestal_spotlight(si->x, si->y);
                 /* Pedestal */
                 spr_draw(sheet_ui_items, ui_items_atlas_ui_item_pickup_idx,
                          si->x, si->y + 5, 0.8f, 0.8f);
@@ -11149,8 +11463,9 @@ static void render_room_at(Game *g, int room_gx, int room_gy) {
                      cx, cy, pulse, pulse);
         }
 
-        /* E2: end-run "beam of light" (Ending 1) beside the trapdoor */
-        if (r->has_ending_beam) {
+        /* E2: end-run "beam of light" (Ending 1) beside the trapdoor.
+           R8 #24: hidden until the room is cleared (matches the trigger). */
+        if (r->has_ending_beam && r->cleared) {
             float ebx = (ROOM_LEFT + ROOM_RIGHT) / 2.0f + 60.0f;
             float eby = (ROOM_TOP + ROOM_BOTTOM) / 2.0f;
             float bp = 0.75f + 0.25f * sinf((float)g->frame * 0.08f);
@@ -11293,6 +11608,8 @@ static void render_room_at(Game *g, int room_gx, int room_gy) {
             float px = r->pedestal.x;
             float py = r->pedestal.y;
             float pulse = sinf((float)g->frame * 0.05f) * 0.3f + 0.7f;
+            /* R8 #42: spotlight on the fallback pedestal too */
+            render_pedestal_spotlight(px, py);
             u32 glowCol = C2D_Color32(255, 255, 200, (int)(pulse * 80));
             C2D_DrawCircleSolid(px, py, 0, 20, glowCol);
             C2D_DrawRectSolid(px - 10, py + 4, 0, 20, 6, COL_PEDESTAL);
@@ -11346,6 +11663,8 @@ static void render_room_at(Game *g, int room_gx, int room_gy) {
             ShopItem *si = &r->shop_items[i];
             if (si->active) {
                 float bob_s = sinf((float)g->frame * 0.06f + (float)i) * 2.0f;
+                /* R8 #42: spotlight on fallback shop pedestals */
+                render_pedestal_spotlight(si->x, si->y);
                 /* Pedestal base */
                 C2D_DrawRectSolid(si->x - 10, si->y + 4, 0, 20, 6,
                                   COL_PEDESTAL);
@@ -11385,8 +11704,9 @@ static void render_room_at(Game *g, int room_gx, int room_gy) {
             C2D_DrawCircleSolid(cx, cy, 0, 6, C2D_Color32(0, 0, 0, 255));
         }
 
-        /* E2: end-run "beam of light" (Ending 1), procedural fallback */
-        if (r->has_ending_beam) {
+        /* E2: end-run "beam of light" (Ending 1), procedural fallback.
+           R8 #24: hidden until the room is cleared (matches the trigger). */
+        if (r->has_ending_beam && r->cleared) {
             float ebx = (ROOM_LEFT + ROOM_RIGHT) / 2.0f + 60.0f;
             float eby = (ROOM_TOP + ROOM_BOTTOM) / 2.0f;
             float bp = 0.75f + 0.25f * sinf((float)g->frame * 0.08f);
@@ -11407,6 +11727,77 @@ static void render_room_at(Game *g, int room_gx, int room_gy) {
 /* Render the room the player is currently in */
 static void render_room(Game *g) {
     render_room_at(g, g->dungeon.cur_x, g->dungeon.cur_y);
+}
+
+/* R8 #37: per-floor ambient tint + standing vignette, shared by the
+   normal PLAYING render and the PAUSED underlay so pausing doesn't
+   cause a visible color pop. */
+static void render_ambient_and_vignette(Game *g) {
+    /* Per-floor ambient tint (Rebirth's chapters each have a palette).
+       Clipped to the play rect (ROOM_TOP..ROOM_BOTTOM) so it dyes the
+       room, not the HUD. Floors 0/1 (Basement/Cellar) get a subtle
+       warm-brown grade of their own. */
+    {
+        float pty = ROOM_TOP, pth = ROOM_BOTTOM - ROOM_TOP;
+        if (g->current_floor == 0 || g->current_floor == 1) {
+            /* Basement/Cellar: subtle warm brown */
+            C2D_DrawRectSolid(0, pty, 0, TOP_SCREEN_WIDTH, pth,
+                              C2D_Color32(120, 85, 45, 24));
+        } else if (g->current_floor == 2 || g->current_floor == 3) {
+            /* Caves: warm earthy brown */
+            C2D_DrawRectSolid(0, pty, 0, TOP_SCREEN_WIDTH, pth,
+                              C2D_Color32(120, 85, 40, 28));
+        } else if (g->current_floor == 4) {
+            /* Depths: cold near-black gray */
+            C2D_DrawRectSolid(0, pty, 0, TOP_SCREEN_WIDTH, pth,
+                              C2D_Color32(25, 25, 35, 55));
+        } else if (g->current_floor == 5) {
+            /* Womb: red flesh tint */
+            C2D_DrawRectSolid(0, pty, 0, TOP_SCREEN_WIDTH, pth,
+                              C2D_Color32(140, 30, 40, 50));
+        } else if (g->current_floor == 6) {
+            /* Sheol: dark hellish tint */
+            C2D_DrawRectSolid(0, pty, 0, TOP_SCREEN_WIDTH, pth,
+                              C2D_Color32(20, 0, 0, 90));
+        } else if (g->current_floor == 7) {
+            /* The Chest: deep gold/white tint */
+            C2D_DrawRectSolid(0, pty, 0, TOP_SCREEN_WIDTH, pth,
+                              C2D_Color32(90, 80, 40, 70));
+        }
+    }
+
+    /* Rebirth-style vignette: soft dark edges all the time, heavier on
+       deeper floors. Three nested edge bands fake a radial falloff. */
+    {
+        int va = 26 + g->current_floor * 5;
+        if (va > 60) va = 60;
+        for (int vi = 0; vi < 3; vi++) {
+            int band = 10 + vi * 12;
+            int a = va / (vi + 1);
+            u32 vc = C2D_Color32(0, 0, 0, a);
+            C2D_DrawRectSolid(0, 0, 0, TOP_SCREEN_WIDTH, band, vc);
+            C2D_DrawRectSolid(0, TOP_SCREEN_HEIGHT - band, 0,
+                              TOP_SCREEN_WIDTH, band, vc);
+            C2D_DrawRectSolid(0, band, 0, band,
+                              TOP_SCREEN_HEIGHT - band * 2, vc);
+            C2D_DrawRectSolid(TOP_SCREEN_WIDTH - band, band, 0, band,
+                              TOP_SCREEN_HEIGHT - band * 2, vc);
+        }
+
+        /* (f) Radial corner vignette: stamp four darker ellipses at the
+           room corners so corners read darkest (more radial falloff). */
+        u32 corner_vc = C2D_Color32(0, 0, 0, va);
+        float ew = 70.0f, eh = 55.0f;
+        C2D_DrawEllipseSolid(0 - ew * 0.4f, 0 - eh * 0.4f, 0,
+                             ew, eh, corner_vc);
+        C2D_DrawEllipseSolid(TOP_SCREEN_WIDTH - ew * 0.6f, 0 - eh * 0.4f, 0,
+                             ew, eh, corner_vc);
+        C2D_DrawEllipseSolid(0 - ew * 0.4f, TOP_SCREEN_HEIGHT - eh * 0.6f, 0,
+                             ew, eh, corner_vc);
+        C2D_DrawEllipseSolid(TOP_SCREEN_WIDTH - ew * 0.6f,
+                             TOP_SCREEN_HEIGHT - eh * 0.6f, 0,
+                             ew, eh, corner_vc);
+    }
 }
 
 static void render_player(Game *g) {
@@ -11640,6 +12031,13 @@ static void render_knife(Game *g) {
 }
 
 static void render_tears(Game *g) {
+    /* R8 #45: count active tears once — skip the trail draws when the
+       screen is saturated so the C2D budget stays healthy. */
+    int tearCount = 0;
+    for (int i = 0; i < MAX_TEARS; i++)
+        if (g->tears[i].active) tearCount++;
+    int drawTrails = (tearCount <= 20);
+
     for (int i = 0; i < MAX_TEARS; i++) {
         Tear *t = &g->tears[i];
         if (!t->active) continue;
@@ -11680,6 +12078,27 @@ static void render_tears(Game *g) {
             C2D_DrawCircleSolid(t->x, t->y + 2.0f, 0,
                                TEAR_RADIUS * 0.6f * base_scale,
                                C2D_Color32(0, 0, 0, 40));
+
+            /* R8 #45: short fading trail behind player tears using the
+               previously unused bulletatlas tear_trail_1/2/3 sprites.
+               Afterimages are offset against velocity — no history
+               arrays. Piercing tears keep their own distinct trail. */
+            if (drawTrails && !t->is_enemy && !t->piercing) {
+                static const int trail_idx[3] = {
+                    bulletatlas_tear_trail_1_idx,
+                    bulletatlas_tear_trail_2_idx,
+                    bulletatlas_tear_trail_3_idx
+                };
+                static const float trail_alpha[3] = { 0.42f, 0.28f, 0.16f };
+                for (int tr = 0; tr < 3; tr++) {
+                    float trx = t->x - t->dx * 1.6f * (float)(tr + 1);
+                    float tryy = render_y - t->dy * 1.6f * (float)(tr + 1);
+                    spr_draw_rotated_alpha(sheet_bullets, trail_idx[tr],
+                                           trx, tryy,
+                                           base_scale, base_scale,
+                                           t->rotation, trail_alpha[tr]);
+                }
+            }
 
             if (t->spectral) {
                 /* Spectral: semi-transparent with ghostly tint */
@@ -11874,6 +12293,17 @@ static void render_enemies(Game *g) {
                         }
                     }
 
+                    /* R8 #44: the other jumpers get the same airborne draw
+                       offset. Gish/Mom/Satan share Monstro's convention
+                       (jump_z negative = up); Widow's arc is positive-up. */
+                    if (e->type == ENEMY_BOSS_GISH ||
+                        e->type == ENEMY_BOSS_MOM ||
+                        e->type == ENEMY_BOSS_SATAN) {
+                        draw_y += e->jump_z;
+                    } else if (e->type == ENEMY_BOSS_WIDOW) {
+                        draw_y -= e->jump_z;
+                    }
+
                     /* Duke: gentle bobbing */
                     if (e->type == ENEMY_BOSS_DUKE) {
                         draw_y += e->wobble;
@@ -11938,8 +12368,12 @@ static void render_enemies(Game *g) {
                         }
                     }
 
-                    /* Gemini: render companion entity + tether */
-                    if (e->type == ENEMY_BOSS_GEMINI) {
+                    /* Gemini/Steven: render companion entity + tether.
+                       R8 #19: Steven's second head now draws too (it's a
+                       killable target), and a dead head (gemini_chp <= 0)
+                       is not drawn at all. */
+                    if ((e->type == ENEMY_BOSS_GEMINI ||
+                         e->type == ENEMY_BOSS_STEVEN) && e->gemini_chp > 0) {
                         /* Draw tether line (if not split) */
                         if (!e->gemini_split) {
                             u32 tetherCol = C2D_Color32(180, 60, 60, 180);
@@ -11965,13 +12399,20 @@ static void render_enemies(Game *g) {
                         }
                     }
 
-                    /* Monstro: landing shadow when in air */
-                    if (e->type == ENEMY_BOSS_MONSTRO && e->phase == 1) {
-                        float shadowAlpha = clampf(-e->jump_z / 40.0f, 0.2f, 0.6f);
-                        float shadowSz = sz + (-e->jump_z * 0.3f);
-                        C2D_DrawEllipseSolid(e->x - shadowSz, e->y + sz * 0.3f, 0,
-                                            shadowSz * 2, shadowSz * 0.4f,
-                                            C2D_Color32(0, 0, 0, (u8)(shadowAlpha * 180)));
+                    /* R8 #44: shared landing telegraph for ALL jump bosses
+                       (Monstro/Gish/Mom/Satan/Widow) — a dark ellipse at
+                       the landing target that grows as touchdown nears,
+                       replacing the old Monstro-only under-body shadow. */
+                    {
+                        float jprog = 0.0f;
+                        if (boss_airborne(e, &jprog)) {
+                            float shR = sz * (0.4f + 0.6f * jprog);
+                            u8 shA = (u8)(70.0f + 110.0f * jprog);
+                            C2D_DrawEllipseSolid(e->target_x - shR,
+                                                 e->target_y - shR * 0.4f, 0,
+                                                 shR * 2.0f, shR * 0.8f,
+                                                 C2D_Color32(0, 0, 0, shA));
+                        }
                     }
 
                 } else {
@@ -12523,11 +12964,15 @@ void game_render_top(Game *g, C2D_TextBuf textBuf) {
         break;
 
     case STATE_PLAYING: {
-        /* Compute shake offset */
+        /* Compute shake offset — R8 #39: frame-seeded deterministic jitter
+           (never rand() in the render path; keeps stereo/replay safe and
+           doesn't burn the RNG stream on cosmetics). Two incommensurate
+           prime-ish frequencies per axis read as noise. */
         float sox = 0, soy = 0;
         if (g->shake_timer > 0 && g->shake_intensity > 0.1f) {
-            sox = randf(-g->shake_intensity, g->shake_intensity);
-            soy = randf(-g->shake_intensity, g->shake_intensity);
+            float fs = (float)g->frame;
+            sox = sinf(fs * 1.3f) * cosf(fs * 2.9f) * g->shake_intensity;
+            soy = sinf(fs * 1.7f + 1.1f) * cosf(fs * 2.3f) * g->shake_intensity;
             C2D_ViewTranslate(sox, soy);
         }
 
@@ -12572,71 +13017,9 @@ void game_render_top(Game *g, C2D_TextBuf textBuf) {
             render_enemy_beam(g); /* E3: Satan's Brimstone telegraph/beam */
         }
 
-        /* Per-floor ambient tint (Rebirth's chapters each have a palette).
-           Clipped to the play rect (ROOM_TOP..ROOM_BOTTOM) so it dyes the
-           room, not the HUD. Floors 0/1 (Basement/Cellar) get a subtle
-           warm-brown grade of their own. */
-        {
-            float pty = ROOM_TOP, pth = ROOM_BOTTOM - ROOM_TOP;
-            if (g->current_floor == 0 || g->current_floor == 1) {
-                /* Basement/Cellar: subtle warm brown */
-                C2D_DrawRectSolid(0, pty, 0, TOP_SCREEN_WIDTH, pth,
-                                  C2D_Color32(120, 85, 45, 24));
-            } else if (g->current_floor == 2 || g->current_floor == 3) {
-                /* Caves: warm earthy brown */
-                C2D_DrawRectSolid(0, pty, 0, TOP_SCREEN_WIDTH, pth,
-                                  C2D_Color32(120, 85, 40, 28));
-            } else if (g->current_floor == 4) {
-                /* Depths: cold near-black gray */
-                C2D_DrawRectSolid(0, pty, 0, TOP_SCREEN_WIDTH, pth,
-                                  C2D_Color32(25, 25, 35, 55));
-            } else if (g->current_floor == 5) {
-                /* Womb: red flesh tint */
-                C2D_DrawRectSolid(0, pty, 0, TOP_SCREEN_WIDTH, pth,
-                                  C2D_Color32(140, 30, 40, 50));
-            } else if (g->current_floor == 6) {
-                /* Sheol: dark hellish tint */
-                C2D_DrawRectSolid(0, pty, 0, TOP_SCREEN_WIDTH, pth,
-                                  C2D_Color32(20, 0, 0, 90));
-            } else if (g->current_floor == 7) {
-                /* The Chest: deep gold/white tint */
-                C2D_DrawRectSolid(0, pty, 0, TOP_SCREEN_WIDTH, pth,
-                                  C2D_Color32(90, 80, 40, 70));
-            }
-        }
-
-        /* Rebirth-style vignette: soft dark edges all the time, heavier on
-           deeper floors. Three nested edge bands fake a radial falloff. */
-        {
-            int va = 26 + g->current_floor * 5;
-            if (va > 60) va = 60;
-            for (int vi = 0; vi < 3; vi++) {
-                int band = 10 + vi * 12;
-                int a = va / (vi + 1);
-                u32 vc = C2D_Color32(0, 0, 0, a);
-                C2D_DrawRectSolid(0, 0, 0, TOP_SCREEN_WIDTH, band, vc);
-                C2D_DrawRectSolid(0, TOP_SCREEN_HEIGHT - band, 0,
-                                  TOP_SCREEN_WIDTH, band, vc);
-                C2D_DrawRectSolid(0, band, 0, band,
-                                  TOP_SCREEN_HEIGHT - band * 2, vc);
-                C2D_DrawRectSolid(TOP_SCREEN_WIDTH - band, band, 0, band,
-                                  TOP_SCREEN_HEIGHT - band * 2, vc);
-            }
-
-            /* (f) Radial corner vignette: stamp four darker ellipses at the
-               room corners so corners read darkest (more radial falloff). */
-            u32 corner_vc = C2D_Color32(0, 0, 0, va);
-            float ew = 70.0f, eh = 55.0f;
-            C2D_DrawEllipseSolid(0 - ew * 0.4f, 0 - eh * 0.4f, 0,
-                                 ew, eh, corner_vc);
-            C2D_DrawEllipseSolid(TOP_SCREEN_WIDTH - ew * 0.6f, 0 - eh * 0.4f, 0,
-                                 ew, eh, corner_vc);
-            C2D_DrawEllipseSolid(0 - ew * 0.4f, TOP_SCREEN_HEIGHT - eh * 0.6f, 0,
-                                 ew, eh, corner_vc);
-            C2D_DrawEllipseSolid(TOP_SCREEN_WIDTH - ew * 0.6f,
-                                 TOP_SCREEN_HEIGHT - eh * 0.6f, 0,
-                                 ew, eh, corner_vc);
-        }
+        /* R8 #37: per-floor ambient tint + vignette (shared helper, also
+           used by the STATE_PAUSED underlay for frame parity). */
+        render_ambient_and_vignette(g);
 
         /* Red hurt pulse: screen edges flash red briefly when damaged */
         if (g->hurt_flash_timer > 0) {
@@ -12650,43 +13033,61 @@ void game_render_top(Game *g, C2D_TextBuf textBuf) {
                               TOP_SCREEN_HEIGHT - 28, hc);
         }
 
-        /* Curse: Darkness - real circular vignette centered on the player.
-         * Only a small radius around Isaac is visible; the rest of the
-         * room is heavily darkened so the curse is actually a challenge. */
+        /* Curse: Darkness — R8 #33 rebuild. The old approach stacked
+         * semi-transparent circles ON TOP of a full-screen black sheet;
+         * with citro2d's src-alpha blending an alpha-0 "punch-out" circle
+         * is a no-op, so the player area ended up ~97% black. Instead the
+         * darkness is now built only from geometry OUTSIDE the player's
+         * light: 4 edge rects beyond dim_r plus 4 concentric square ring
+         * bands that fake the radial falloff from clear_r (nearly clear)
+         * out to dim_r (heavily dark). Max darkness is capped at 200
+         * alpha so the room stays barely readable (accessibility), and a
+         * warm candle glow flickers near Isaac (Rebirth candlelit look). */
         if (g->active_curse == CURSE_DARKNESS) {
             float cx = g->player.x;
             float cy = g->player.y;
-            /* Vision radius: ~80px clear, dim from there outward */
-            const float clear_r = 70.0f;
-            const float dim_r   = 130.0f;
-            /* Solid black corners (outside dim_r) - cover screen with 4 wide
-             * rectangles that don't include the visible center area */
-            const int OUTER_A = 220;          /* near-black outside */
-            const int MID_A   = 180;          /* heavy dim in middle band */
+            const float clear_r = 55.0f;   /* nearly clear around Isaac */
+            const float dim_r   = 110.0f;  /* heavy dark from here out */
+            const int   MAX_A   = 200;     /* accessibility cap */
+            u32 dark = C2D_Color32(0, 0, 0, MAX_A);
+            const float W = TOP_SCREEN_WIDTH, H = TOP_SCREEN_HEIGHT;
 
-            /* Full-screen black underlay, then "punch out" the visible area
-             * using stacked semi-transparent circles to fake a radial gradient. */
-            C2D_DrawRectSolid(0, 0, 0, TOP_SCREEN_WIDTH, TOP_SCREEN_HEIGHT,
-                              C2D_Color32(0, 0, 0, OUTER_A));
+            /* 4 edge rects covering everything outside the dim_r box */
+            float x0 = cx - dim_r, x1 = cx + dim_r;
+            float y0 = cy - dim_r, y1 = cy + dim_r;
+            float bx0 = (x0 > 0) ? x0 : 0;
+            float bx1 = (x1 < W) ? x1 : W;
+            if (x0 > 0) C2D_DrawRectSolid(0, 0, 0, x0, H, dark);
+            if (x1 < W) C2D_DrawRectSolid(x1, 0, 0, W - x1, H, dark);
+            if (y0 > 0) C2D_DrawRectSolid(bx0, 0, 0, bx1 - bx0, y0, dark);
+            if (y1 < H) C2D_DrawRectSolid(bx0, y1, 0, bx1 - bx0, H - y1, dark);
 
-            /* Larger faint circle to soften the dim->dark transition */
-            C2D_DrawCircleSolid(cx, cy, 0, dim_r + 18.0f,
-                                C2D_Color32(0, 0, 0, OUTER_A - MID_A));
-            /* Medium circle: heavy dim zone */
-            C2D_DrawCircleSolid(cx, cy, 0, dim_r,
-                                C2D_Color32(0, 0, 0, MID_A - 80));
-            /* Smaller circle: lighter dim closer to player */
-            C2D_DrawCircleSolid(cx, cy, 0, dim_r - 30.0f,
-                                C2D_Color32(0, 0, 0, 60));
-            /* Innermost circle: fully clear around Isaac */
-            C2D_DrawCircleSolid(cx, cy, 0, clear_r,
-                                C2D_Color32(0, 0, 0, 0));
+            /* 4 concentric square ring bands, darkest outermost, grading
+               down toward the clear radius (rect approximation of rings) */
+            static const int bandA[4] = { 170, 120, 72, 34 };
+            const float bw = (dim_r - clear_r) / 4.0f;
+            for (int bi = 0; bi < 4; bi++) {
+                float outer = dim_r - bw * (float)bi;
+                float inner = outer - bw;
+                u32 bc = C2D_Color32(0, 0, 0, bandA[bi]);
+                C2D_DrawRectSolid(cx - outer, cy - outer, 0,
+                                  outer * 2.0f, bw, bc);            /* top */
+                C2D_DrawRectSolid(cx - outer, cy + inner, 0,
+                                  outer * 2.0f, bw, bc);            /* bottom */
+                C2D_DrawRectSolid(cx - outer, cy - inner, 0,
+                                  bw, inner * 2.0f, bc);            /* left */
+                C2D_DrawRectSolid(cx + inner, cy - inner, 0,
+                                  bw, inner * 2.0f, bc);            /* right */
+            }
 
-            /* Subtle warm flicker so the player feels like they're holding
-             * a candle - tiny radius pulse from the player */
-            float flicker = sinf((float)g->frame * 0.25f) * 3.0f;
-            C2D_DrawCircleSolid(cx, cy, 0, clear_r * 0.75f + flicker,
-                                C2D_Color32(255, 200, 100, 12));
+            /* Warm candlelight near the player: two soft glows with a
+               gentle two-frequency flicker (deterministic, frame-seeded) */
+            float flicker = sinf((float)g->frame * 0.21f) * 2.5f
+                          + sinf((float)g->frame * 0.53f) * 1.5f;
+            C2D_DrawCircleSolid(cx, cy, 0, clear_r * 0.8f + flicker,
+                                C2D_Color32(255, 190, 110, 16));
+            C2D_DrawCircleSolid(cx, cy, 0, clear_r * 0.45f + flicker * 0.6f,
+                                C2D_Color32(255, 210, 140, 12));
         }
 
         /* Reset view for HUD (no shake on HUD) */
@@ -12712,16 +13113,19 @@ void game_render_top(Game *g, C2D_TextBuf textBuf) {
             C2D_Text ctext;
             gtext_parse(&ctext, textBuf, banner);
             C2D_TextOptimize(&ctext);
-            /* Paper strip with a BLOOD frame + BLOOD text */
+            /* Paper strip with a BLOOD frame + BLOOD text.
+               R8 #35: strip now ends at x=330 so it clears the top-right
+               minimap (x335-398, y24-74) and the difficulty tag (~x340,
+               y78) that it used to overlap for its ~3s of display. */
             u32 cframe = C2D_Color32(171, 22, 26, alpha);  /* BLOOD, alpha-scaled */
-            C2D_DrawRectSolid(53, 64, 0, 300, 30, C2D_Color32(0, 0, 0, (alpha * 45) / 255));
-            C2D_DrawRectSolid(48, 58, 0, 304, 2, cframe);
-            C2D_DrawRectSolid(48, 90, 0, 304, 2, cframe);
+            C2D_DrawRectSolid(53, 64, 0, 278, 30, C2D_Color32(0, 0, 0, (alpha * 45) / 255));
+            C2D_DrawRectSolid(48, 58, 0, 282, 2, cframe);
+            C2D_DrawRectSolid(48, 90, 0, 282, 2, cframe);
             C2D_DrawRectSolid(48, 60, 0, 2, 30, cframe);
-            C2D_DrawRectSolid(350, 60, 0, 2, 30, cframe);
-            C2D_DrawRectSolid(50, 60, 0, 300, 30,
+            C2D_DrawRectSolid(328, 60, 0, 2, 30, cframe);
+            C2D_DrawRectSolid(50, 60, 0, 278, 30,
                               C2D_Color32(234, 221, 200, (alpha * 240) / 255));
-            C2D_DrawText(&ctext, C2D_WithColor, 80, 68, 0, 0.6f, 0.6f, cframe);
+            C2D_DrawText(&ctext, C2D_WithColor, 70, 68, 0, 0.6f, 0.6f, cframe);
         }
 
         /* Floor-intro nameplate: Rebirth-style floor title on entry */
@@ -12931,8 +13335,11 @@ void game_render_top(Game *g, C2D_TextBuf textBuf) {
     }
 
     case STATE_PAUSED: {
-        /* Render game underneath dimmed */
+        /* Render game underneath dimmed — R8 #37: mirror the PLAYING
+           frame (shop prices + ambient tint + vignette) so pausing
+           doesn't visibly pop the room's color grade. */
         render_room(g);
+        render_shop_prices(g, textBuf);
         render_tears(g);
         render_enemy_shots(g);
         render_blood_particles(g);
@@ -12942,6 +13349,7 @@ void game_render_top(Game *g, C2D_TextBuf textBuf) {
         render_knife(g);
         render_laser(g);
         render_enemy_beam(g);
+        render_ambient_and_vignette(g);
         render_hud(g, textBuf);
         /* Dim overlay */
         C2D_DrawRectSolid(0, 0, 0, TOP_SCREEN_WIDTH, TOP_SCREEN_HEIGHT,
@@ -13513,8 +13921,8 @@ static void do_warp_cleanup(Game *g) {
     nr->visited = 1;
     /* Warping into a secret room must open its doors (see reveal_secret_room) */
     reveal_secret_room(g, g->dungeon.cur_x, g->dungeon.cur_y);
-    /* Arcade slot machine is once per VISIT, not once per run */
-    if (nr->type == ROOM_ARCADE) nr->arcade_slot_used = 0;
+    /* NOTE: arcade_slot_used deliberately NOT reset — once per room, or
+       warping in and out prints infinite items */
     if (!nr->enemies_spawned) room_spawn_enemies(g, nr);
 
     /* Clear projectiles, creep and reset Holy Mantle */
@@ -13532,10 +13940,10 @@ static void do_warp_cleanup(Game *g) {
     if (g->player.stats.flags & ITEM_FLAG_MANTLE) g->player.holy_mantle_active = 1;
 
     /* Warping out mid-Boss-Rush (or mid-boss-fight) must not leave stale
-       boss/wave state behind — same reset as the door re-entry path */
+       boss/wave state behind — same reset as the door re-entry path.
+       R8 #25: wave progress itself stays in the Room struct. */
     g->boss_active = 0;
     g->bossrush_active = 0;
-    g->bossrush_wave = 0;
     g->bossrush_spawn_timer = 0;
     /* E3: a live enemy beam must not persist across a warp */
     g->ebeam_state = 0;
@@ -13566,6 +13974,11 @@ static void do_warp_cleanup(Game *g) {
                 break;
             }
         }
+    } else {
+        /* R8 #21: warping OUT of a boss fight (Fool/Emperor/Telepills) left
+           MUS_BOSS playing forever. Any non-boss destination gets the floor
+           track back; music_play no-ops if it's already the current track. */
+        music_play(music_for_floor(g->current_floor));
     }
     audio_play(SFX_DOOR);
 }
@@ -13840,6 +14253,11 @@ int main(int argc, char *argv[]) {
     config_init(&g_config);
     config_load(&g_config);  /* -1 = no file, defaults kept */
 
+    /* Retroactive unlocks: an old save whose completed characters predate
+       newly-added roster entries earns those unlocks immediately at boot,
+       not only after the next win. Persist if anything changed. */
+    if (apply_unlock_gates()) config_save(&g_config);
+
     /* Initialize audio system with multi-layer safety checks */
     audio_init(g_config.audio_enabled);
     audio_load_all();
@@ -13896,6 +14314,10 @@ int main(int argc, char *argv[]) {
 
         C3D_FrameEnd(0);
     }
+
+    /* HOME-menu / SELECT exit: persist any settings changed in the settings
+       menu that were never saved (the user backed out via HOME, not B). */
+    if (game.settings_changed) config_save(&g_config);
 
     /* Cleanup */
     audio_exit();

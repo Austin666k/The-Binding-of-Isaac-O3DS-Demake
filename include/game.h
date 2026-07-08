@@ -121,7 +121,6 @@ typedef enum {
 
 /* ---------- Items ---------- */
 #define MAX_ITEMS_HELD     32       /* max items player can collect */
-#define MAX_ITEM_POOL      85       /* total unique items in the game */
 
 /* ---------- Familiars ---------- */
 #define MAX_FAMILIARS      2        /* follower slots (Phase E6) */
@@ -193,6 +192,7 @@ typedef struct {
     int   flash;     /* visual flash counter */
     int   active;
     int   is_epic;   /* Epic Fetus bomb: x1.5 blast radius and damage */
+    int   is_fetus;  /* Dr./Epic Fetus tear-bomb: blast scales with damage stat */
 } ActiveBomb;
 
 /* ---------- Creep / hazard tile ---------- */
@@ -617,7 +617,7 @@ typedef struct {
     float range;         /* tear range in pixels */
     int   max_hp;        /* maximum HP */
     int   flags;         /* ITEM_FLAG_* abilities */
-    float luck;          /* +luck improves drop chances and crit roll */
+    float luck;          /* +luck improves drop chances */
     int   shot_speed;    /* tear speed bonus (integer for display) */
 } PlayerStats;
 
@@ -628,7 +628,6 @@ typedef struct {
     int   hp;
     int   iframes;
     int   tear_cooldown;
-    int   kb_timer;        /* knockback stun: frames of lost movement control */
     int   shoot_anim;      /* >0 = frames remaining of shooting face (crying head) */
     Direction shoot_dir;   /* direction player last shot (for crying head) */
     int   pickup_anim;     /* >0 = frames of item pickup pose */
@@ -656,8 +655,6 @@ typedef struct {
     int   lives;            /* extra lives from Dead Cat etc. */
     int   holy_mantle_active; /* 1 if can absorb next hit */
     int   book_belial_dmg_timer; /* frames remaining of Book of Belial damage boost */
-    /* Magdalene Yum Heart cooldown (frames) */
-    int   yum_heart_cd;
     /* Soul hearts */
     int   soul_hp;          /* extra "soul" HP (consumed before red HP) */
     /* Black hearts (Phase E5): absorbed BEFORE soul hearts; each depleted
@@ -747,6 +744,10 @@ typedef struct {
     /* Phase E2: Mom's Heart kill spawns a "beam of light" end-run object
        next to the trapdoor; touching it wins the run with Ending 1. */
     int      has_ending_beam;
+    /* R8 #25: Boss Rush wave progress lives WITH the room so warping out
+       and back never refights waves already cleared (the Game-side
+       bossrush_active/spawn_timer are still reset on exit/entry). */
+    int      bossrush_wave;
 } Room;
 
 /* ---------- Dungeon / Floor ---------- */
@@ -897,9 +898,9 @@ typedef struct {
     int   characters_completed_run; /* runtime bitmask of chars who beat a run */
     /* Game-feel: hitstop freeze frames (skips sim updates while > 0) */
     int   hitstop;
-    /* Boss Rush room wave state */
+    /* Boss Rush room wave state (R8 #25: the wave COUNTER moved into the
+       Room struct so progress survives warping out and back in) */
     int   bossrush_active;       /* 1 while the wave machine is running in this room */
-    int   bossrush_wave;         /* current wave number (0-based) */
     int   bossrush_spawn_timer;  /* frames until next wave spawns (grace period) */
     /* Enemy Brimstone beam (Phase E3 - Satan). Kept fully separate from the
        player's laser_* fields. 0 = off, 1 = telegraph (thin red line, 30f),
@@ -941,7 +942,9 @@ void collisions_update(Game *g);
 void shoot_tear(Game *g, Direction dir);
 void check_door_transition(Game *g);
 void do_room_transition(Game *g, Direction dir);
-void collect_item(Game *g, ItemType item);
+/* Returns 1 if the item was actually granted, 0 if refused (passive-item
+ * cap reached). Purchases must gate their payment on this. */
+int  collect_item(Game *g, ItemType item);
 void apply_item_stats(Player *p, const ItemDef *def);
 void advance_floor(Game *g);
 void recalc_player_stats(Player *p);
