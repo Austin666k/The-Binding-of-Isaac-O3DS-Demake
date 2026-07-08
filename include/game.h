@@ -846,11 +846,6 @@ typedef struct {
     int        floor_intro_timer;
     /* AAA Menu animation state */
     int        menu_timer;       /* animation timer for menu effects */
-    float      particle_x[20];   /* floating particle positions */
-    float      particle_y[20];
-    float      particle_vx[20];
-    float      particle_vy[20];
-    int        particles_init;   /* 1 if particles have been initialized */
     /* Blood splatter particles */
     BloodParticle blood[MAX_BLOOD_PARTICLES];
     /* Active bombs (small pool: player-placed + troll bombs) */
@@ -959,7 +954,7 @@ void render_mode_select(Game *g, C2D_TextBuf textBuf);
 void render_challenge_select(Game *g, C2D_TextBuf textBuf);
 void render_character_select(Game *g, C2D_TextBuf textBuf);
 void render_difficulty_select(Game *g, C2D_TextBuf textBuf);
-void render_controls(C2D_TextBuf textBuf);
+void render_controls(Game *g, C2D_TextBuf textBuf);
 void render_gameover(Game *g, C2D_TextBuf textBuf);
 void render_win(Game *g, C2D_TextBuf textBuf);
 void render_hud(Game *g, C2D_TextBuf textBuf);

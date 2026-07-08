@@ -643,6 +643,19 @@ static u32 COL_MENU_SEL, COL_MENU_BG, COL_OBSTACLE;
 static u32 COL_PEDESTAL, COL_ITEM_GLOW, COL_TRAPDOOR;
 static u32 COL_HOMING_TEAR, COL_SPECTRAL_TEAR;
 
+/* Isaac Rebirth paper palette (Round 7 UI restyle) */
+static u32 PAPER;        /* cream/bone page                */
+static u32 PAPER_DARK;   /* blotches/creases               */
+static u32 PAPER_EDGE;   /* crease lines                   */
+static u32 INK;          /* main text                      */
+static u32 INK_FAINT;    /* hints/secondary text           */
+static u32 INK_DISABLED; /* grayed options                 */
+static u32 BORDER_BROWN; /* panel frames                   */
+static u32 BLOOD;        /* selector/accents               */
+static u32 BLOOD_DARK;   /* drip shading                   */
+static u32 GOLD_CHARGE;  /* active-item ready              */
+static u32 DIM_BLACK140; /* pause dim                      */
+
 static void init_colours(void) {
     COL_BG            = C2D_Color32(30,  30,  30,  255);
     COL_WALL          = C2D_Color32(80,  60,  45,  255);
@@ -671,6 +684,18 @@ static void init_colours(void) {
     COL_TRAPDOOR      = C2D_Color32(40,  30,  20,  255);
     COL_HOMING_TEAR   = C2D_Color32(200, 100, 255, 255);
     COL_SPECTRAL_TEAR = C2D_Color32(255, 255, 255, 160);
+
+    PAPER        = C2D_Color32(234, 221, 200, 255);
+    PAPER_DARK   = C2D_Color32(219, 204, 178, 255);
+    PAPER_EDGE   = C2D_Color32(190, 173, 143, 255);
+    INK          = C2D_Color32(55,  43,  33,  255);
+    INK_FAINT    = C2D_Color32(122, 99,  75,  255);
+    INK_DISABLED = C2D_Color32(168, 148, 126, 255);
+    BORDER_BROWN = C2D_Color32(62,  47,  34,  255);
+    BLOOD        = C2D_Color32(171, 22,  26,  255);
+    BLOOD_DARK   = C2D_Color32(110, 12,  16,  255);
+    GOLD_CHARGE  = C2D_Color32(247, 198, 74,  255);
+    DIM_BLACK140 = C2D_Color32(0,   0,   0,   140);
 }
 
 /* ================================================================
@@ -3697,12 +3722,14 @@ static int count_alive_flies(Room *r) {
     return c;
 }
 
+/* B6: boss minion spawners go through alloc_dynamic_enemy (append-first,
+   reuse-dead-slots fallback) so long fights keep spawning even after
+   enemy_count has ratcheted up to MAX_ENEMIES. */
+static Enemy *alloc_dynamic_enemy(Room *r);
+
 static void boss_spawn_fly(Game *g, Room *r, float bx, float by) {
-    if (r->enemy_count >= MAX_ENEMIES) return;
-    Enemy *e = &r->enemies[r->enemy_count];
-    memset(e, 0, sizeof(Enemy));
-    e->active = 1;
-    e->spawn_grace = 10; /* F6: no same-frame contact */
+    Enemy *e = alloc_dynamic_enemy(r);
+    if (!e) return; /* active/spawn_grace set by alloc_dynamic_enemy */
     e->type = ENEMY_FLY;
     /* T5: same difficulty/infinite HP scaling as room spawns */
     e->hp = 2.0f * spawn_hp_mult(g);
@@ -3712,7 +3739,6 @@ static void boss_spawn_fly(Game *g, Room *r, float bx, float by) {
     e->dx = randf(-1.5f, 1.5f);
     e->dy = randf(-1.5f, 1.5f);
     e->timer = randi(30, 60);
-    r->enemy_count++;
 }
 
 /* Spawn boss tear in a specific direction */
@@ -4279,16 +4305,17 @@ static int kill_enemy(Game *g, Room *r, Enemy *e) {
     audio_play(SFX_ENEMY_DEATH);
     if (is_boss_type(e->type)) {
         trigger_shake(g, 7.0f, 40);
-        g->boss_active = 0;
         g->boss_death_anim = 60; /* boss death explosion effect */
         g->boss_death_x = e->x;  /* anchor the death anim on the corpse */
         g->boss_death_y = e->y;
         /* Track in persistent unlocks (bosses_defeated bitmask).
-           20 bosses: Duke..Mega Satan (17) + Mom, Mom's Heart, Satan. */
+           20 bosses: Duke..Mega Satan (17) + Mom, Mom's Heart, Satan.
+           B4: only pay the blocking config_save on FIRST-time defeat. */
         {
             int boss_idx = (int)e->type - (int)ENEMY_BOSS_DUKE;
-            if (boss_idx >= 0 && boss_idx < 20) {
-                g_config.bosses_defeated |= (1 << boss_idx);
+            if (boss_idx >= 0 && boss_idx < 20 &&
+                !(g_config.bosses_defeated & (1u << boss_idx))) {
+                g_config.bosses_defeated |= (1u << boss_idx);
                 config_save(&g_config);
             }
         }
@@ -4306,10 +4333,54 @@ static int kill_enemy(Game *g, Room *r, Enemy *e) {
             g->ebeam_state = 0;
             g->ebeam_timer = 0;
         }
-        /* Return to floor music after boss defeat */
-        music_play(music_for_floor(g->current_floor));
+        /* B3: the boss-defeat epilogue (clear boss_active + floor music)
+           only fires when NO other boss-grade enemy is still alive — a
+           Boss Rush wave partner or surviving Fistula pieces keep the
+           fight (and its music) going. During the Boss Rush gauntlet the
+           music is never switched here; the rush's own clear path in
+           enemies_update owns the end-of-gauntlet state. */
+        {
+            int others_alive = 0;
+            for (int oi = 0; oi < r->enemy_count; oi++) {
+                Enemy *oe = &r->enemies[oi];
+                if (!oe->active) continue;
+                if (is_boss_type(oe->type) ||
+                    oe->type == ENEMY_FISTULA_BALL) {
+                    others_alive = 1;
+                    break;
+                }
+            }
+            if (!others_alive) {
+                g->boss_active = 0;
+                /* Return to floor music after boss defeat */
+                if (!g->bossrush_active)
+                    music_play(music_for_floor(g->current_floor));
+            }
+        }
     } else {
         trigger_shake(g, 1.5f, 6);
+        /* R1: the main Fistula corpse skips the epilogue while its balls
+           live (see B3 above) — so when the LAST ball dies, the release
+           must fire from here or boss_active + boss music stay stuck
+           until the floor changes. Balls only run the release: no drops
+           bitmask / death-anim boss bookkeeping for a chunk. */
+        if (e->type == ENEMY_FISTULA_BALL && g->boss_active) {
+            int others_alive = 0;
+            for (int oi = 0; oi < r->enemy_count; oi++) {
+                Enemy *oe = &r->enemies[oi];
+                if (!oe->active) continue;
+                if (is_boss_type(oe->type) ||
+                    oe->type == ENEMY_FISTULA_BALL) {
+                    others_alive = 1;
+                    break;
+                }
+            }
+            if (!others_alive) {
+                g->boss_active = 0;
+                if (!g->bossrush_active)
+                    music_play(music_for_floor(g->current_floor));
+            }
+        }
     }
     return 1;
 }
@@ -4325,10 +4396,30 @@ static void damage_all_enemies(Game *g, float dmg) {
     for (int i = 0; i < initial; i++) {
         Enemy *e = &r->enemies[i];
         if (!e->active) continue;
+        /* B5: skip just-spawned enemies (death-spawns of this same sweep).
+           When the array is full, alloc_dynamic_enemy reuses a dead slot
+           BELOW the captured `initial`, so the capture alone isn't enough —
+           spawn_grace marks them reliably (belt and suspenders). R4: only
+           fresh spawns (same-frame or one-frame-old) are immune — a wave
+           boss 10 frames young should not shrug off the whole blast. */
+        if (e->spawn_grace >= 9) continue;
         e->hp -= dmg;
         e->flash = 14;
         if (e->hp <= 0) kill_enemy(g, r, e);
     }
+}
+
+/* B1: detonate any queued black-heart bursts NOW, in the room the player is
+ * still standing in. Must run before any room switch (door transition or
+ * warp initiation) so the nuke lands where the heart broke, never in the
+ * room being entered. The per-frame drain in STATE_PLAYING still covers
+ * normal combat. */
+static void drain_black_burst(Game *g) {
+    if (g_black_burst_pending <= 0) return;
+    damage_all_enemies(g, 40.0f * (float)g_black_burst_pending);
+    g_black_burst_pending = 0;
+    trigger_shake(g, 6.0f, 24);
+    audio_play(SFX_ENEMY_DEATH);
 }
 
 void place_bomb(Game *g) {
@@ -4431,6 +4522,10 @@ static void bomb_explode_ex(Game *g, float bx, float by, float blast,
     for (int i = 0; i < initial_enemy_count; i++) {
         Enemy *e = &r->enemies[i];
         if (!e->active) continue;
+        /* B5: fresh death-spawns can land in a reused dead slot below the
+           captured count when the array is full — spawn_grace marks them.
+           R4: only fresh spawns (grace >= 9) are blast-immune. */
+        if (e->spawn_grace >= 9) continue;
         float dx = e->x - bx, dy = e->y - by;
         if (dx * dx + dy * dy < blast * blast) {
             float bomb_prev_hp = e->hp;
@@ -4823,14 +4918,15 @@ void enemies_update(Game *g) {
                         r->has_trapdoor = 1;
                     }
                 } else {
-                    /* Spawn the next wave: 2 bosses from the floor's boss pool,
-                       capped by MAX_ENEMIES (always true here since 2 << 20). */
+                    /* Spawn the next wave: 2 bosses from the floor's boss pool.
+                       B2: reset enemy_count BEFORE computing capacity — every
+                       slot is dead here (alive check above found none), and a
+                       minion-filled array must not clamp the wave to 0-1. */
                     float cx = (ROOM_LEFT + ROOM_RIGHT) / 2.0f;
+                    r->enemy_count = 0; /* deactivate stale corpse slots */
                     int to_spawn = 2;
                     if (to_spawn > MAX_ENEMIES - r->enemy_count)
                         to_spawn = MAX_ENEMIES - r->enemy_count;
-
-                    r->enemy_count = 0; /* clear defeated bosses' slots for reuse */
                     /* F5: wave spawn safety — room-entry-style iframes so a
                        boss materialising on top of the player can't land an
                        unavoidable hit. */
@@ -6527,7 +6623,7 @@ void enemies_update(Game *g) {
                     if (r->enemies[mi].active &&
                         !is_boss_type(r->enemies[mi].type)) minions++;
                 }
-                if (minions < 4 && r->enemy_count < MAX_ENEMIES) {
+                if (minions < 4) {
                     float mmx = (ROOM_LEFT + ROOM_RIGHT) / 2.0f;
                     float mmy = (ROOM_TOP + ROOM_BOTTOM) / 2.0f;
                     float doorpos[4][2] = {
@@ -6535,19 +6631,19 @@ void enemies_update(Game *g) {
                         {ROOM_LEFT + 14, mmy}, {ROOM_RIGHT - 14, mmy}
                     };
                     int dpick = randi(0, 3);
-                    Enemy *m = &r->enemies[r->enemy_count];
-                    memset(m, 0, sizeof(Enemy));
-                    m->active = 1;
-                    m->spawn_grace = 10; /* F6: no same-frame contact */
-                    m->type = (randi(0, 1) == 0) ? ENEMY_GAPER : ENEMY_BABY;
-                    /* T5: same difficulty/infinite HP scaling as room spawns */
-                    m->hp = m->max_hp =
-                        ((m->type == ENEMY_GAPER) ? 6.0f : 3.0f) * spawn_hp_mult(g);
-                    m->x = doorpos[dpick][0];
-                    m->y = doorpos[dpick][1];
-                    m->timer = randi(30, 60);
-                    r->enemy_count++;
-                    spawn_tear_pop(g, m->x, m->y, 1);
+                    /* B6: dead-slot reuse so a ratcheted enemy_count can't
+                       starve Mom's pressure (active/spawn_grace preset) */
+                    Enemy *m = alloc_dynamic_enemy(r);
+                    if (m) {
+                        m->type = (randi(0, 1) == 0) ? ENEMY_GAPER : ENEMY_BABY;
+                        /* T5: same difficulty/infinite HP scaling as room spawns */
+                        m->hp = m->max_hp =
+                            ((m->type == ENEMY_GAPER) ? 6.0f : 3.0f) * spawn_hp_mult(g);
+                        m->x = doorpos[dpick][0];
+                        m->y = doorpos[dpick][1];
+                        m->timer = randi(30, 60);
+                        spawn_tear_pop(g, m->x, m->y, 1);
+                    }
                 }
             }
 
@@ -6703,11 +6799,10 @@ void enemies_update(Game *g) {
                     e->timer = 150;
                     if (count_enemies_of_type(r, ENEMY_HOPPER) < 2) {
                         for (int s = 0; s < 2; s++) {
-                            if (r->enemy_count >= MAX_ENEMIES) break;
-                            Enemy *m = &r->enemies[r->enemy_count];
-                            memset(m, 0, sizeof(Enemy));
-                            m->active = 1;
-                            m->spawn_grace = 10; /* F6: no same-frame contact */
+                            /* B6: dead-slot reuse — long fights keep their
+                               pressure (active/spawn_grace preset) */
+                            Enemy *m = alloc_dynamic_enemy(r);
+                            if (!m) break;
                             m->type = ENEMY_HOPPER;
                             /* T5: same difficulty/infinite HP scaling as
                                room spawns */
@@ -6715,7 +6810,6 @@ void enemies_update(Game *g) {
                             m->x = e->x + randf(-30, 30);
                             m->y = e->y + randf(-20, 20);
                             m->timer = randi(20, 50);
-                            r->enemy_count++;
                         }
                         trigger_shake(g, 3.0f, 10);
                     }
@@ -7817,7 +7911,11 @@ static int try_door_unlock(Game *g, Room *r, int dir) {
        player's last half red heart. */
     if (r->door_type[dir] == 4) {
         Player *p = &g->player;
-        if (p->black_hp <= 0 && p->soul_hp <= 0 && p->hp <= 1) {
+        /* B7: Holy Mantle absorbs the toll for free (Rebirth-correct), so
+           refuse entry only when the toll would actually kill: no mantle,
+           no soul/black hearts, and at the last half red heart. */
+        if (!p->holy_mantle_active &&
+            p->black_hp <= 0 && p->soul_hp <= 0 && p->hp <= 1) {
             audio_play(SFX_HURT); /* Feedback: can't afford HP cost */
             return 0;
         }
@@ -7904,6 +8002,11 @@ void do_room_transition(Game *g, Direction dir) {
 
     if (nx < 0 || nx >= DUNGEON_W || ny < 0 || ny >= DUNGEON_H) return;
     if (d->rooms[ny][nx].type == ROOM_NONE) return;
+
+    /* B1: detonate any pending black-heart burst in the room being LEFT
+       (e.g. the curse-door toll broke a black heart this frame) — never
+       let it carry over and nuke the room being entered. */
+    drain_black_burst(g);
 
     /* Curse of the Maze: small chance to redirect the player into a
      * different explored room adjacent to their CURRENT position instead
@@ -8533,6 +8636,9 @@ void game_update(Game *g, u32 kDown, u32 kHeld, circlePosition circlePos) {
                    happened — keep the charge. */
                 int ttries = 0;
                 int warped = 0;
+                /* B1: burst detonates in the room the heart broke in,
+                   before cur_x/cur_y move (do_warp_cleanup runs after) */
+                drain_black_burst(g);
                 while (ttries < 30) {
                     int trx = randi(0, DUNGEON_W - 1);
                     int try2 = randi(0, DUNGEON_H - 1);
@@ -8614,13 +8720,10 @@ void game_update(Game *g, u32 kDown, u32 kHeld, circlePosition circlePos) {
         blood_particles_update(g);
 
         /* E5: each fully depleted black heart nukes the room for 40 (deaths
-           routed through kill_enemy inside damage_all_enemies) */
-        if (g_black_burst_pending > 0) {
-            damage_all_enemies(g, 40.0f * (float)g_black_burst_pending);
-            g_black_burst_pending = 0;
-            trigger_shake(g, 6.0f, 24);
-            audio_play(SFX_ENEMY_DEATH);
-        }
+           routed through kill_enemy inside damage_all_enemies). B1: the same
+           drain also runs before every room switch so it can't misfire in a
+           freshly entered room. */
+        drain_black_burst(g);
 
         check_door_transition(g);
 
@@ -8758,16 +8861,131 @@ static void draw_doodle_chest(float x, float y, u32 col) {
     C2D_DrawRectSolid(x + 6, y + 3, 0, 2, 3, col);
 }
 
+/* ================================================================
+ * Round 7 shared paper-UI helpers
+ * ================================================================ */
+
+/* Aged-paper panel with a rough hand-drawn border. `a` scales all alphas
+ * (255 = fully opaque). `plain` skips blotches/creases/nicks so unselected
+ * list strips stay cheap and quiet. Deterministic — no rand(). */
+static void draw_paper_panel_ex(float x, float y, float w, float h, u8 a, int plain) {
+    /* 1. Drop shadow */
+    C2D_DrawRectSolid(x + 3, y + 4, 0, w, h, C2D_Color32(0, 0, 0, (u8)(45 * a / 255)));
+
+    /* 2. Rough border: 4 edge strips + 4 deterministic 1px "jogs" that break
+     * the silhouette so it reads hand-drawn instead of a CSS box. */
+    u32 border = C2D_Color32(62, 47, 34, a);       /* BORDER_BROWN @ a */
+    C2D_DrawRectSolid(x - 3, y - 3, 0, w + 6, 3, border);   /* top    */
+    C2D_DrawRectSolid(x - 3, y + h, 0, w + 6, 3, border);   /* bottom */
+    C2D_DrawRectSolid(x - 3, y,     0, 3, h,     border);   /* left   */
+    C2D_DrawRectSolid(x + w, y,     0, 3, h,     border);   /* right  */
+    C2D_DrawRectSolid(x + w * 0.22f, y - 4,     0, 10, 2, border);
+    C2D_DrawRectSolid(x + w * 0.68f, y + h + 1, 0, 12, 2, border);
+    C2D_DrawRectSolid(x - 4,     y + h * 0.35f, 0, 2, 9,  border);
+    C2D_DrawRectSolid(x + w + 1, y + h * 0.62f, 0, 2, 8,  border);
+
+    /* 3. Paper fill */
+    C2D_DrawRectSolid(x, y, 0, w, h, C2D_Color32(234, 221, 200, a)); /* PAPER @ a */
+
+    if (plain) return;
+
+    /* 4. Blotches (aged-paper stains) from a fixed table */
+    for (int i = 0; i < 5; i++) {
+        float ex = x + w * (0.18f + 0.31f * ((i * 7) % 3));
+        float ey = y + h * (0.15f + 0.27f * ((i * 5) % 3));
+        float ew = 14 + (i % 3) * 6;
+        float eh = 9 + (i % 2) * 4;
+        if (ex + ew > x + w) ex = x + w - ew;
+        if (ey + eh > y + h) ey = y + h - eh;
+        C2D_DrawEllipseSolid(ex, ey, 0, ew, eh,
+                             C2D_Color32(219, 204, 178, (u8)(35 * a / 255)));
+    }
+
+    /* 5. Creases */
+    u32 crease = C2D_Color32(190, 173, 143, a);    /* PAPER_EDGE @ a */
+    C2D_DrawRectSolid(x + 2, y + h * 0.33f, 0, w - 4, 1, crease);
+    C2D_DrawRectSolid(x + 2, y + h * 0.66f, 0, w - 4, 1, crease);
+
+    /* 6. Corner nicks */
+    u32 nick = C2D_Color32(219, 204, 178, a);      /* PAPER_DARK @ a */
+    C2D_DrawRectSolid(x, y, 0, 2, 2, nick);
+    C2D_DrawRectSolid(x + w - 2, y + h - 2, 0, 2, 2, nick);
+    C2D_DrawRectSolid(x + w - 1, y - 1, 0, 3, 3, border);
+}
+
+static void draw_paper_panel(float x, float y, float w, float h, u8 a) {
+    draw_paper_panel_ex(x, y, w, h, a, 0);
+}
+
+/* Blood-drip selection cursor. Uses the hand-drawn arrow sprite when the
+ * menu-text sheet loaded; otherwise a procedural dripping splat. Bob phase
+ * comes from the caller's timer — deterministic. */
+static void draw_selector(float x, float y, int timer) {
+    if (sheet_menu_text) {
+        spr_draw(sheet_menu_text, menu_text_atlas_menu_arrow_idx,
+                 x + sinf(timer * 0.12f) * 2.5f, y, 0.55f, 0.55f);
+        return;
+    }
+    float bob = sinf(timer * 0.1f) * 1.5f;
+    C2D_DrawCircleSolid(x, y, 0, 4.0f, BLOOD);
+    C2D_DrawTriangle(x - 4, y, BLOOD,
+                     x + 4, y, BLOOD,
+                     x + bob, y + 7, BLOOD, 0);
+    C2D_DrawCircleSolid(x - 1, y + 9, 0, 1.4f, BLOOD_DARK);
+    C2D_DrawCircleSolid(x + 2, y + 12, 0, 1.0f, BLOOD_DARK);
+}
+
+/* Labelled pip row for stats (map page / character select). Filled pips are
+ * solid INK; empty pips are a 1px PAPER_EDGE outline. */
+static void draw_stat_pips(C2D_TextBuf textBuf, float x, float y,
+                           const char *label, int filled, int max) {
+    C2D_Text lt;
+    gtext_parse(&lt, textBuf, label);
+    C2D_TextOptimize(&lt);
+    C2D_DrawText(&lt, C2D_WithColor, x, y, 0, 0.35f, 0.35f, INK_FAINT);
+
+    if (max > 6) max = 6;
+    if (filled > max) filled = max;
+    if (filled < 0) filled = 0;
+    for (int i = 0; i < max; i++) {
+        float px = x + 34 + i * 9;
+        float py = y + 2;
+        if (i < filled) {
+            C2D_DrawRectSolid(px, py, 0, 7, 5, INK);
+        } else {
+            C2D_DrawRectSolid(px,     py,     0, 7, 1, PAPER_EDGE);
+            C2D_DrawRectSolid(px,     py + 4, 0, 7, 1, PAPER_EDGE);
+            C2D_DrawRectSolid(px,     py,     0, 1, 5, PAPER_EDGE);
+            C2D_DrawRectSolid(px + 6, py,     0, 1, 5, PAPER_EDGE);
+        }
+    }
+}
+
+/* Shared sub-menu title: INK text on a small paper strip with a BLOOD
+ * scratch underline. */
+static void draw_menu_title(C2D_TextBuf textBuf, const char *title) {
+    C2D_Text t;
+    gtext_parse(&t, textBuf, title);
+    C2D_TextOptimize(&t);
+    float tw = 0.0f, th = 0.0f;
+    C2D_TextGetDimensions(&t, 0.55f, 0.55f, &tw, &th);
+    float cx = TOP_SCREEN_WIDTH / 2.0f;
+    draw_paper_panel(cx - tw / 2 - 10, 16, tw + 20, 24, 255);
+    C2D_DrawText(&t, C2D_WithColor, cx - tw / 2, 16 + (24 - th) / 2, 0,
+                 0.55f, 0.55f, INK);
+    draw_doodle_scratch(cx - tw / 2, 44, cx + tw / 2, 46, BLOOD);
+}
+
 void render_menu(Game *g, C2D_TextBuf textBuf) {
     g->menu_timer++;
 
     /* ===== 1. PARCHMENT/CREAM BACKGROUND ===== */
-    /* Warm beige base colour like an aged notebook page */
-    u32 bg_col      = C2D_Color32(235, 220, 200, 255);
+    /* Warm beige base colour like an aged notebook page (shared palette) */
+    u32 bg_col      = PAPER;
     u32 doodle_col  = C2D_Color32(160, 140, 120, 200);  /* sketchy gray-brown */
     u32 doodle_dim  = C2D_Color32(180, 165, 145, 180);
-    u32 text_col    = C2D_Color32(50,  35,  25, 255);   /* dark brown/black */
-    u32 text_disabled = C2D_Color32(170, 150, 130, 255);
+    u32 text_col    = INK;
+    u32 text_disabled = INK_DISABLED;
     u32 note_col    = C2D_Color32(225, 210, 215, 255);  /* light pink/lavender pinned note */
     u32 note_edge   = C2D_Color32(180, 165, 170, 255);  /* darker note edge */
     u32 note_corner = C2D_Color32(225, 200, 175, 255);  /* folded corner */
@@ -8781,7 +8999,7 @@ void render_menu(Game *g, C2D_TextBuf textBuf) {
     for (int i = 0; i < 24; i++) {
         float gx = (i * 53) % TOP_SCREEN_WIDTH;
         float gy = (i * 37) % TOP_SCREEN_HEIGHT;
-        C2D_DrawRectSolid(gx, gy, 0, 1, 1, C2D_Color32(210, 195, 175, 120));
+        C2D_DrawRectSolid(gx, gy, 0, 1, 1, C2D_Color32(219, 204, 178, 120));
     }
 
     /* ===== 2. DOODLE DECORATIONS ===== */
@@ -8972,7 +9190,7 @@ void render_menu(Game *g, C2D_TextBuf textBuf) {
     float hint_alpha = 0.6f + sinf(g->menu_timer * 0.08f) * 0.2f;
     C2D_DrawText(&hint, C2D_WithColor, 60, TOP_SCREEN_HEIGHT - 16, 0,
                  0.42f, 0.42f,
-                 C2D_Color32(100, 80, 60, (int)(hint_alpha * 255)));
+                 C2D_Color32(122, 99, 75, (int)(hint_alpha * 255)));
 
     /* Version text bottom-right */
     C2D_Text version;
@@ -8980,13 +9198,13 @@ void render_menu(Game *g, C2D_TextBuf textBuf) {
     C2D_TextOptimize(&version);
     C2D_DrawText(&version, C2D_WithColor,
                  TOP_SCREEN_WIDTH - 35, TOP_SCREEN_HEIGHT - 16, 0,
-                 0.4f, 0.4f, C2D_Color32(120, 100, 80, 220));
+                 0.4f, 0.4f, C2D_Color32(122, 99, 75, 220));
 
-    /* ==== AUDIO DEBUG OVERLAY ====
-     * Shown on the title screen so audio failures are diagnosable on
-     * real hardware without a debug console.  Press X to play a test
-     * tone, B to play a test SFX. */
-    {
+    /* ==== AUDIO DEBUG OVERLAY (hold SELECT to show) ====
+     * Kept for diagnosing audio failures on real hardware without a
+     * debug console, but hidden during normal play.  Press X to play a
+     * test tone, B to play a test SFX while it is visible. */
+    if (hidKeysHeld() & KEY_SELECT) {
         AudioDebug ad;
         audio_debug_get(&ad);
 
@@ -9034,142 +9252,100 @@ void render_menu(Game *g, C2D_TextBuf textBuf) {
  * Render: Game Mode Select screen
  * ================================================================ */
 
-/* Shared helper: draw the animated gradient background used across menu screens */
+/* Shared helper: aged-paper background used across all sub-menu screens.
+ * Full-screen page + grain + blotches + rough brown frame + corner doodles.
+ * Deterministic — no rand(), no particles. */
 static void draw_menu_background(Game *g) {
     g->menu_timer++;
 
-    /* Initialize particles on first frame */
-    if (!g->particles_init) {
-        for (int i = 0; i < 20; i++) {
-            g->particle_x[i] = randf(0, TOP_SCREEN_WIDTH);
-            g->particle_y[i] = randf(0, TOP_SCREEN_HEIGHT);
-            g->particle_vx[i] = randf(-0.3f, 0.3f);
-            g->particle_vy[i] = randf(-0.5f, -0.1f);
-        }
-        g->particles_init = 1;
+    /* 1. Full-screen paper */
+    C2D_DrawRectSolid(0, 0, 0, TOP_SCREEN_WIDTH, TOP_SCREEN_HEIGHT, PAPER);
+
+    /* 2. Paper grain — faint specks at fixed spots */
+    for (int i = 0; i < 24; i++) {
+        float gx = (i * 53) % TOP_SCREEN_WIDTH;
+        float gy = (i * 37) % TOP_SCREEN_HEIGHT;
+        C2D_DrawRectSolid(gx, gy, 0, 1, 1, C2D_Color32(219, 204, 178, 120));
     }
 
-    /* Animated gradient background */
-    float grad_shift = sinf(g->menu_timer * 0.02f) * 15.0f;
-    for (int y = 0; y < TOP_SCREEN_HEIGHT; y += 4) {
-        float ratio = y / (float)TOP_SCREEN_HEIGHT;
-        int rv = (int)(20 + ratio * 15 + grad_shift);
-        int gv = (int)(10 + ratio * 8 + grad_shift * 0.5f);
-        int bv = (int)(5 + ratio * 5);
-        C2D_DrawRectSolid(0, y, 0, TOP_SCREEN_WIDTH, 4,
-                          C2D_Color32(rv, gv, bv, 255));
+    /* 3. Large blotches (aged stains) at fixed spots */
+    C2D_DrawEllipseSolid(70 - 26, 190 - 16, 0, 52, 32, C2D_Color32(219, 204, 178, 30));
+    C2D_DrawEllipseSolid(330 - 20, 40 - 14, 0, 40, 28, C2D_Color32(219, 204, 178, 30));
+    C2D_DrawEllipseSolid(200 - 34, 120 - 20, 0, 68, 40, C2D_Color32(219, 204, 178, 30));
+
+    /* 4. Rough hand-drawn frame (single, no glow) */
+    {
+        float fx = 6, fy = 6, fw = 388, fh = 228;
+        C2D_DrawRectSolid(fx - 3, fy - 3, 0, fw + 6, 3, BORDER_BROWN);
+        C2D_DrawRectSolid(fx - 3, fy + fh, 0, fw + 6, 3, BORDER_BROWN);
+        C2D_DrawRectSolid(fx - 3, fy,     0, 3, fh,     BORDER_BROWN);
+        C2D_DrawRectSolid(fx + fw, fy,    0, 3, fh,     BORDER_BROWN);
+        C2D_DrawRectSolid(fx + fw * 0.22f, fy - 4,      0, 10, 2, BORDER_BROWN);
+        C2D_DrawRectSolid(fx + fw * 0.68f, fy + fh + 1, 0, 12, 2, BORDER_BROWN);
+        C2D_DrawRectSolid(fx - 4,      fy + fh * 0.35f, 0, 2, 9,  BORDER_BROWN);
+        C2D_DrawRectSolid(fx + fw + 1, fy + fh * 0.62f, 0, 2, 8,  BORDER_BROWN);
     }
 
-    /* Floating particles */
-    for (int i = 0; i < 20; i++) {
-        g->particle_x[i] += g->particle_vx[i];
-        g->particle_y[i] += g->particle_vy[i];
-        if (g->particle_y[i] < -10) {
-            g->particle_y[i] = TOP_SCREEN_HEIGHT + 10;
-            g->particle_x[i] = randf(0, TOP_SCREEN_WIDTH);
-        }
-        if (g->particle_x[i] < -10) g->particle_x[i] = TOP_SCREEN_WIDTH + 10;
-        if (g->particle_x[i] > TOP_SCREEN_WIDTH + 10) g->particle_x[i] = -10;
-        float pulse = sinf(g->menu_timer * 0.05f + i * 0.3f);
-        int alpha = (int)(30 + pulse * 20);
-        int size = (i % 3) + 2;
-        C2D_DrawRectSolid(g->particle_x[i], g->particle_y[i], 0, size, size,
-                          C2D_Color32(200, 150, 100, alpha));
+    /* 5. Corner doodles */
+    {
+        u32 doodle_col = C2D_Color32(160, 140, 120, 180);
+        draw_doodle_scratch(15.0f, 40.0f, 45.0f, 30.0f, doodle_col);
+        draw_doodle_scratch(TOP_SCREEN_WIDTH - 50.0f, 200.0f,
+                            TOP_SCREEN_WIDTH - 20.0f, 210.0f, doodle_col);
+        draw_doodle_bug(24.0f, 214.0f, doodle_col);
     }
-
-    /* Decorative border */
-    u32 borderGlow = C2D_Color32(150, 100, 50, 180);
-    u32 borderMain = C2D_Color32(200, 140, 80, 255);
-    C2D_DrawRectSolid(5, 5, 0, TOP_SCREEN_WIDTH - 10, 2, borderGlow);
-    C2D_DrawRectSolid(5, TOP_SCREEN_HEIGHT - 7, 0, TOP_SCREEN_WIDTH - 10, 2, borderGlow);
-    C2D_DrawRectSolid(5, 5, 0, 2, TOP_SCREEN_HEIGHT - 10, borderGlow);
-    C2D_DrawRectSolid(TOP_SCREEN_WIDTH - 7, 5, 0, 2, TOP_SCREEN_HEIGHT - 10, borderGlow);
-    C2D_DrawRectSolid(8, 8, 0, TOP_SCREEN_WIDTH - 16, 3, borderMain);
-    C2D_DrawRectSolid(8, TOP_SCREEN_HEIGHT - 11, 0, TOP_SCREEN_WIDTH - 16, 3, borderMain);
-    C2D_DrawRectSolid(8, 8, 0, 3, TOP_SCREEN_HEIGHT - 16, borderMain);
-    C2D_DrawRectSolid(TOP_SCREEN_WIDTH - 11, 8, 0, 3, TOP_SCREEN_HEIGHT - 16, borderMain);
 }
 
-/* Helper: draw a selection option row (used by mode and difficulty screens).
-   The "selected" state is intentionally loud — a bright accent rail, a glowing
-   outline, and oversized animated chevrons — so it is always obvious from
-   across the room which option will be picked. Unselected rows are dimmed so
-   the eye is drawn straight to the active one. */
+/* Helper: draw a selection option row (used by mode/challenge/difficulty
+   screens). Rebirth selection is quiet: every row sits on a stacked paper
+   strip; the selected strip nudges left, gets the blood-drip selector and a
+   BLOOD underline scribble under its label. No glow, no chevrons. */
 static void draw_menu_option(C2D_TextBuf textBuf, const char *label, const char *desc,
                              float yPos, int selected, int timer) {
-    if (selected) {
-        float sel_pulse = sinf(timer * 0.15f);
-        float box_width = 300 + sel_pulse * 10;
-        float box_x = (TOP_SCREEN_WIDTH - box_width) / 2;
+    float x = 50.0f, w = 300.0f;
+    /* R6: 40 (was 44) — the panel strip's full extent is yPos-8 (top jog)
+       to yPos+h (drop shadow); at the challenge screen's row pitch the
+       44px strips bled into each other. Desc text ends ~yPos+33, so 40
+       still clears it. */
+    float h = desc ? 40.0f : 28.0f;
+    if (selected) x -= 3.0f;
 
-        /* Outer glow (large soft halo) */
-        C2D_DrawRectSolid(box_x - 10, yPos - 12, 0, box_width + 20, 58,
-                          C2D_Color32(255, 180, 80, 60));
-        C2D_DrawRectSolid(box_x - 6,  yPos - 9,  0, box_width + 12, 52,
-                          C2D_Color32(255, 200, 100, 120));
+    if (selected)
+        draw_paper_panel(x, yPos - 4, w, h, 255);
+    else
+        draw_paper_panel_ex(x, yPos - 4, w, h, 230, 1);
 
-        /* Bright accent border (thick, pulsing) */
-        u8 borderA = (u8)(220 + sinf(timer * 0.18f) * 35);
-        C2D_DrawRectSolid(box_x - 3, yPos - 6, 0, box_width + 6, 46,
-                          C2D_Color32(255, 215, 130, borderA));
-
-        /* Inner fill */
-        C2D_DrawRectSolid(box_x, yPos - 3, 0, box_width, 40,
-                          C2D_Color32(110, 60, 30, 255));
-
-        /* Left vertical accent rail (bright) */
-        C2D_DrawRectSolid(box_x, yPos - 3, 0, 5, 40,
-                          C2D_Color32(255, 230, 150, 255));
-
-        /* Animated chevron arrows (larger and brighter than before) */
-        C2D_Text al, ar;
-        float ao = sinf(timer * 0.22f) * 4.5f;
-        gtext_parse(&al, textBuf, ">>");
-        C2D_TextOptimize(&al);
-        C2D_DrawText(&al, C2D_WithColor, box_x + 14 + ao, yPos - 1, 0,
-                     0.85f, 0.85f, C2D_Color32(255, 240, 170, 255));
-        gtext_parse(&ar, textBuf, "<<");
-        C2D_TextOptimize(&ar);
-        C2D_DrawText(&ar, C2D_WithColor, box_x + box_width - 38 - ao, yPos - 1, 0,
-                     0.85f, 0.85f, C2D_Color32(255, 240, 170, 255));
-    }
-
-    /* Label text — bigger, brighter when selected; dimmer when not */
+    /* Label */
     C2D_Text lbl;
     gtext_parse(&lbl, textBuf, label);
     C2D_TextOptimize(&lbl);
-    float ts = selected ? 0.75f : 0.50f;
-    u32 tc = selected ? C2D_Color32(255, 250, 220, 255)
-                      : C2D_Color32(130, 105, 80,  200);
-    C2D_DrawText(&lbl, C2D_WithColor, TOP_SCREEN_WIDTH / 2.0f - 55, yPos, 0, ts, ts, tc);
+    float ts = selected ? 0.62f : 0.50f;
+    float label_x = x + 26.0f;
+    C2D_DrawText(&lbl, C2D_WithColor, label_x, yPos, 0, ts, ts,
+                 selected ? INK : INK_FAINT);
+
+    if (selected) {
+        float label_w = 0.0f, label_h = 0.0f;
+        C2D_TextGetDimensions(&lbl, ts, ts, &label_w, &label_h);
+        draw_doodle_scratch(label_x, yPos + 16, label_x + label_w, yPos + 17, BLOOD);
+        draw_selector(38, yPos + 8, timer);
+    }
 
     /* Description text (smaller, below label) */
     if (desc) {
         C2D_Text dt;
         gtext_parse(&dt, textBuf, desc);
         C2D_TextOptimize(&dt);
-        u32 dc = selected ? C2D_Color32(220, 200, 170, 240)
-                          : C2D_Color32(110, 90,  75,  150);
-        C2D_DrawText(&dt, C2D_WithColor, TOP_SCREEN_WIDTH / 2.0f - 80, yPos + 21, 0,
-                     0.38f, 0.38f, dc);
+        C2D_DrawText(&dt, C2D_WithColor, label_x, yPos + 21, 0,
+                     0.38f, 0.38f, INK_FAINT);
     }
 }
 
 void render_mode_select(Game *g, C2D_TextBuf textBuf) {
     draw_menu_background(g);
 
-    /* Title */
-    C2D_Text title;
-    gtext_parse(&title, textBuf, "SELECT GAME MODE");
-    C2D_TextOptimize(&title);
-    float tp = sinf(g->menu_timer * 0.04f) * 0.03f;
-    C2D_DrawText(&title, C2D_WithColor, 95, 28, 0, 0.8f + tp, 0.8f + tp,
-                 C2D_Color32(255, 230, 180, 255));
-
-    /* Decorative line under title */
-    float lw = 200 + sinf(g->menu_timer * 0.06f) * 10;
-    C2D_DrawRectSolid((TOP_SCREEN_WIDTH - lw) / 2, 55, 0, lw, 2,
-                      C2D_Color32(200, 140, 80, 200));
+    /* Title on a paper strip with blood scratch underline */
+    draw_menu_title(textBuf, "SELECT GAME MODE");
 
     /* Mode options */
     draw_menu_option(textBuf, "Story Mode",
@@ -9183,9 +9359,7 @@ void render_mode_select(Game *g, C2D_TextBuf textBuf) {
     C2D_Text hint;
     gtext_parse(&hint, textBuf, "A: Select    B: Back");
     C2D_TextOptimize(&hint);
-    float ha = 0.5f + sinf(g->menu_timer * 0.1f) * 0.3f;
-    C2D_DrawText(&hint, C2D_WithColor, 115, 218, 0, 0.48f, 0.48f,
-                 C2D_Color32(150, 130, 110, (int)(ha * 255)));
+    C2D_DrawText(&hint, C2D_WithColor, 115, 218, 0, 0.48f, 0.48f, INK_FAINT);
 }
 
 /* ================================================================
@@ -9195,16 +9369,7 @@ void render_mode_select(Game *g, C2D_TextBuf textBuf) {
 void render_challenge_select(Game *g, C2D_TextBuf textBuf) {
     draw_menu_background(g);
 
-    C2D_Text title;
-    gtext_parse(&title, textBuf, "CHALLENGES");
-    C2D_TextOptimize(&title);
-    float tp = sinf(g->menu_timer * 0.04f) * 0.03f;
-    C2D_DrawText(&title, C2D_WithColor, 130, 28, 0, 0.8f + tp, 0.8f + tp,
-                 C2D_Color32(255, 230, 180, 255));
-
-    float lw = 200 + sinf(g->menu_timer * 0.06f) * 10;
-    C2D_DrawRectSolid((TOP_SCREEN_WIDTH - lw) / 2, 55, 0, lw, 2,
-                      C2D_Color32(200, 140, 80, 200));
+    draw_menu_title(textBuf, "CHALLENGES");
 
     /* 6 challenges shown 3 at a time in a scrolling window centered on the
        selection (the draw_menu_option boxes are too tall for 6 rows). */
@@ -9226,8 +9391,11 @@ void render_challenge_select(Game *g, C2D_TextBuf textBuf) {
         if (first > 3) first = 3;
         for (int ci = 0; ci < 3; ci++) {
             int idx = first + ci;
+            /* R6: pitch 52 + 40px panels = 4px clear gap between strips
+               (extent yPos-8..yPos+40); row 3 bottoms out at 219, above
+               the hint line at 220. */
             draw_menu_option(textBuf, chal_names[idx], chal_descs[idx],
-                             75 + ci * 50, g->chal_sel == idx, g->menu_timer);
+                             75 + ci * 52, g->chal_sel == idx, g->menu_timer);
         }
         /* Position indicator */
         char posBuf[16];
@@ -9236,15 +9404,13 @@ void render_challenge_select(Game *g, C2D_TextBuf textBuf) {
         gtext_parse(&posT, textBuf, posBuf);
         C2D_TextOptimize(&posT);
         C2D_DrawText(&posT, C2D_WithColor, TOP_SCREEN_WIDTH - 52, 30, 0,
-                     0.45f, 0.45f, C2D_Color32(200, 180, 150, 220));
+                     0.45f, 0.45f, INK_FAINT);
     }
 
     C2D_Text hint;
     gtext_parse(&hint, textBuf, "A: Start    B: Back    Up/Down: More");
     C2D_TextOptimize(&hint);
-    float ha = 0.5f + sinf(g->menu_timer * 0.1f) * 0.3f;
-    C2D_DrawText(&hint, C2D_WithColor, 92, 220, 0, 0.48f, 0.48f,
-                 C2D_Color32(150, 130, 110, (int)(ha * 255)));
+    C2D_DrawText(&hint, C2D_WithColor, 92, 220, 0, 0.48f, 0.48f, INK_FAINT);
 }
 
 /* ================================================================
@@ -9255,20 +9421,10 @@ void render_difficulty_select(Game *g, C2D_TextBuf textBuf) {
     draw_menu_background(g);
 
     /* Title with mode indicator */
-    C2D_Text title;
     const char *mode_str = (g->game_mode == MODE_INFINITE) ? "INFINITE" : "STORY";
     char title_buf[48];
     snprintf(title_buf, sizeof(title_buf), "SELECT DIFFICULTY  [%s]", mode_str);
-    gtext_parse(&title, textBuf, title_buf);
-    C2D_TextOptimize(&title);
-    float tp = sinf(g->menu_timer * 0.04f) * 0.02f;
-    C2D_DrawText(&title, C2D_WithColor, 42, 20, 0, 0.65f + tp, 0.65f + tp,
-                 C2D_Color32(255, 230, 180, 255));
-
-    /* Decorative line */
-    float lw = 220 + sinf(g->menu_timer * 0.06f) * 10;
-    C2D_DrawRectSolid((TOP_SCREEN_WIDTH - lw) / 2, 45, 0, lw, 2,
-                      C2D_Color32(200, 140, 80, 200));
+    draw_menu_title(textBuf, title_buf);
 
     /* Difficulty options with descriptions */
     const char *labels[] = { "Easy", "Normal", "Hard" };
@@ -9278,34 +9434,27 @@ void render_difficulty_select(Game *g, C2D_TextBuf textBuf) {
         "125% enemy HP, fewer hearts, pricier shops"
     };
 
-    /* Color-coded difficulty backgrounds */
+    /* Difficulty color coding, kept as a small wax-seal dot per strip */
     u32 diff_colors[] = {
-        C2D_Color32(80, 180, 80, 60),   /* green tint for easy */
-        C2D_Color32(180, 180, 80, 60),  /* yellow tint for normal */
-        C2D_Color32(200, 60, 60, 60)    /* red tint for hard */
+        C2D_Color32(80, 180, 80, 255),   /* green for easy */
+        C2D_Color32(180, 180, 80, 255),  /* yellow for normal */
+        C2D_Color32(200, 60, 60, 255)    /* red for hard */
     };
 
     for (int i = 0; i < DIFF_COUNT; i++) {
         float yPos = 60 + i * 55;
-
-        /* Subtle colored background strip for each difficulty */
-        if (i == g->diff_sel) {
-            float pw = sinf(g->menu_timer * 0.1f) * 4;
-            C2D_DrawRectSolid(30, yPos - 8, 0, TOP_SCREEN_WIDTH - 60 + pw, 48,
-                              diff_colors[i]);
-        }
-
         draw_menu_option(textBuf, labels[i], descs[i], yPos, i == g->diff_sel,
                          g->menu_timer);
+        /* Wax-seal dot at the strip's right edge */
+        float sx = (i == g->diff_sel) ? 47.0f : 50.0f;
+        C2D_DrawCircleSolid(sx + 300 - 14, yPos + 10, 0, 5, diff_colors[i]);
     }
 
     /* Hint */
     C2D_Text hint;
     gtext_parse(&hint, textBuf, "A: Start    B: Back");
     C2D_TextOptimize(&hint);
-    float ha = 0.5f + sinf(g->menu_timer * 0.1f) * 0.3f;
-    C2D_DrawText(&hint, C2D_WithColor, 118, 218, 0, 0.48f, 0.48f,
-                 C2D_Color32(150, 130, 110, (int)(ha * 255)));
+    C2D_DrawText(&hint, C2D_WithColor, 118, 218, 0, 0.48f, 0.48f, INK_FAINT);
 }
 
 /* ================================================================
@@ -9355,17 +9504,7 @@ void render_character_select(Game *g, C2D_TextBuf textBuf) {
     draw_menu_background(g);
 
     /* Title */
-    C2D_Text title;
-    gtext_parse(&title, textBuf, "SELECT CHARACTER");
-    C2D_TextOptimize(&title);
-    float tp = sinf(g->menu_timer * 0.04f) * 0.03f;
-    C2D_DrawText(&title, C2D_WithColor, 95, 18, 0, 0.8f + tp, 0.8f + tp,
-                 C2D_Color32(255, 230, 180, 255));
-
-    /* Decorative line */
-    float lw = 240 + sinf(g->menu_timer * 0.06f) * 10;
-    C2D_DrawRectSolid((TOP_SCREEN_WIDTH - lw) / 2, 45, 0, lw, 2,
-                      C2D_Color32(200, 140, 80, 200));
+    draw_menu_title(textBuf, "SELECT CHARACTER");
 
     /* CHAR_COUNT character cards side-by-side (scales to fit screen width) */
     const float card_w = 52.0f;
@@ -9381,40 +9520,46 @@ void render_character_select(Game *g, C2D_TextBuf textBuf) {
         int unlocked_bit = (g_config.unlocked_chars & (1 << i)) ? 1 : 0;
         u32 tint = character_tint((CharacterType)i);
 
-        /* Card background */
-        u32 card_bg = selected ? C2D_Color32(80, 50, 30, 240)
-                               : C2D_Color32(40, 30, 20, 200);
-        float pulse = selected ? sinf(g->menu_timer * 0.15f) * 4.0f : 0.0f;
-        C2D_DrawRectSolid(cx - 2 - pulse / 2, card_y - 2 - pulse / 2, 0,
-                          card_w + 4 + pulse, card_h + 4 + pulse,
-                          C2D_Color32(120, 80, 40, selected ? 220 : 100));
-        C2D_DrawRectSolid(cx, card_y, 0, card_w, card_h, card_bg);
+        /* Card = mini paper sheet (plain variant when not selected).
+           Selected card keeps a gentle scale pulse. */
+        float pulse = selected
+                    ? (sinf(g->menu_timer * 0.15f) * 2.0f + 2.0f) : 0.0f;
+        draw_paper_panel_ex(cx - pulse / 2, card_y - pulse / 2,
+                            card_w + pulse, card_h + pulse, 255, !selected);
+
+        if (selected) {
+            /* Blood-drip arrow above the card + rough underline below it */
+            draw_selector(cx + card_w / 2, card_y - 10, g->menu_timer);
+            draw_doodle_scratch(cx + 4, card_y + card_h + 8,
+                                cx + card_w - 4, card_y + card_h + 10, BLOOD);
+        }
 
         if (unlocked_bit) {
-            /* === Unlocked: show character preview, name, and HP === */
-            /* Color swatch (character tint preview) */
-            C2D_DrawRectSolid(cx + 5, card_y + 6, 0, card_w - 10, 34, tint);
+            /* === Unlocked: portrait on a PAPER_DARK swatch === */
+            /* Character tint reduced to a thin band at the card top */
+            C2D_DrawRectSolid(cx, card_y, 0, card_w, 3, tint);
+            C2D_DrawRectSolid(cx + 5, card_y + 8, 0, card_w - 10, 34,
+                              PAPER_DARK);
 
             /* Character icon - placeholder circle */
-            C2D_DrawCircleSolid(cx + card_w / 2, card_y + 24, 0, 11, C2D_Color32(255, 240, 220, 255));
+            C2D_DrawCircleSolid(cx + card_w / 2, card_y + 25, 0, 11, C2D_Color32(255, 240, 220, 255));
             /* Eye dots */
-            C2D_DrawCircleSolid(cx + card_w / 2 - 3, card_y + 22, 0, 1.5f, C2D_Color32(0, 0, 0, 255));
+            C2D_DrawCircleSolid(cx + card_w / 2 - 3, card_y + 23, 0, 1.5f, C2D_Color32(0, 0, 0, 255));
             if (i != CHAR_CAIN) {  /* Cain has only one eye */
-                C2D_DrawCircleSolid(cx + card_w / 2 + 3, card_y + 22, 0, 1.5f, C2D_Color32(0, 0, 0, 255));
+                C2D_DrawCircleSolid(cx + card_w / 2 + 3, card_y + 23, 0, 1.5f, C2D_Color32(0, 0, 0, 255));
             } else {
                 /* eye-patch */
-                C2D_DrawRectSolid(cx + card_w / 2, card_y + 20, 0, 6, 3, C2D_Color32(40, 40, 40, 255));
+                C2D_DrawRectSolid(cx + card_w / 2, card_y + 21, 0, 6, 3, C2D_Color32(40, 40, 40, 255));
             }
 
             /* Character name */
             C2D_Text nm;
             gtext_parse(&nm, textBuf, character_name((CharacterType)i));
             C2D_TextOptimize(&nm);
-            u32 tc = selected ? C2D_Color32(255, 240, 200, 255)
-                              : C2D_Color32(180, 160, 130, 255);
-            C2D_DrawText(&nm, C2D_WithColor, cx + 4, card_y + 52, 0, 0.38f, 0.38f, tc);
+            C2D_DrawText(&nm, C2D_WithColor, cx + 4, card_y + 52, 0,
+                         0.38f, 0.38f, selected ? INK : INK_FAINT);
 
-            /* HP indicator */
+            /* HP as a heart row (Rebirth-style) instead of "HP:%d" */
             int hp_disp = 3;
             if (i == CHAR_MAGDALENE) hp_disp = 4;
             else if (i == CHAR_CAIN) hp_disp = 2;
@@ -9422,83 +9567,59 @@ void render_character_select(Game *g, C2D_TextBuf textBuf) {
             else if (i == CHAR_EVE) hp_disp = 3;
             else if (i == CHAR_SAMSON) hp_disp = 3;
             else if (i == CHAR_BLUE_BABY) hp_disp = 2;
-            char hpb[16];
-            snprintf(hpb, sizeof(hpb), "HP:%d", hp_disp);
-            C2D_Text hpt;
-            gtext_parse(&hpt, textBuf, hpb);
-            C2D_TextOptimize(&hpt);
-            C2D_DrawText(&hpt, C2D_WithColor, cx + 6, card_y + 70, 0, 0.34f, 0.34f,
-                         C2D_Color32(220, 100, 100, 255));
+            int hearts_shown = hp_disp > 4 ? 4 : hp_disp;  /* cap 4 per card */
+            for (int h = 0; h < hearts_shown; h++) {
+                float hhx = cx + 10 + h * 10;
+                float hhy = card_y + 74;
+                if (g_sprites_loaded && sheet_ui_items) {
+                    spr_draw(sheet_ui_items,
+                             i == CHAR_BLUE_BABY
+                                 ? ui_items_atlas_heart_soul_full_idx
+                                 : ui_items_atlas_heart_red_full_idx,
+                             hhx, hhy, 0.45f, 0.45f);
+                } else {
+                    draw_heart(hhx, hhy, 8,
+                               i == CHAR_BLUE_BABY
+                                   ? C2D_Color32(120, 160, 220, 255)
+                                   : BLOOD);
+                }
+            }
         } else {
-            /* === Locked: hide all character details === */
-            /* Greyed-out silhouette area (no tint reveal) */
-            C2D_DrawRectSolid(cx + 5, card_y + 6, 0, card_w - 10, 34,
-                              C2D_Color32(25, 20, 18, 255));
-            /* Anonymous silhouette */
-            C2D_DrawCircleSolid(cx + card_w / 2, card_y + 24, 0, 11,
-                                C2D_Color32(60, 50, 45, 255));
-            /* No eyes, no character preview */
-
-            /* Name placeholder */
-            C2D_Text nm;
-            gtext_parse(&nm, textBuf, "?????");
-            C2D_TextOptimize(&nm);
-            C2D_DrawText(&nm, C2D_WithColor, cx + 4, card_y + 52, 0, 0.38f, 0.38f,
-                         C2D_Color32(120, 100, 90, 255));
-            /* HP hidden as well */
-            C2D_Text hpt;
-            gtext_parse(&hpt, textBuf, "HP:?");
-            C2D_TextOptimize(&hpt);
-            C2D_DrawText(&hpt, C2D_WithColor, cx + 6, card_y + 70, 0, 0.34f, 0.34f,
-                         C2D_Color32(120, 90, 90, 255));
-
-            /* Soft dim overlay so the card reads as "disabled" */
+            /* === Locked: dimmed paper + big inked "?" === */
             C2D_DrawRectSolid(cx, card_y, 0, card_w, card_h,
-                              C2D_Color32(0, 0, 0, 140));
-            /* Lock icon: padlock body */
-            float lx = cx + card_w / 2 - 6;
-            float ly = card_y + card_h / 2 - 2;
-            C2D_DrawRectSolid(lx, ly, 0, 12, 10,
-                              C2D_Color32(220, 200, 80, 255));
-            /* Shackle */
-            C2D_DrawRectSolid(lx + 2, ly - 5, 0, 8, 3,
-                              C2D_Color32(220, 200, 80, 255));
-            C2D_DrawRectSolid(lx + 2, ly - 5, 0, 2, 6,
-                              C2D_Color32(220, 200, 80, 255));
-            C2D_DrawRectSolid(lx + 8, ly - 5, 0, 2, 6,
-                              C2D_Color32(220, 200, 80, 255));
-            /* LOCKED text */
-            C2D_Text lk;
-            gtext_parse(&lk, textBuf, "LOCK");
-            C2D_TextOptimize(&lk);
-            C2D_DrawText(&lk, C2D_WithColor, cx + 8, card_y + card_h - 18,
-                         0, 0.34f, 0.34f, C2D_Color32(255, 180, 60, 255));
+                              C2D_Color32(60, 50, 40, 150));
+            C2D_Text qm;
+            gtext_parse(&qm, textBuf, "?");
+            C2D_TextOptimize(&qm);
+            float qw = 0.0f, qh = 0.0f;
+            C2D_TextGetDimensions(&qm, 0.7f, 0.7f, &qw, &qh);
+            C2D_DrawText(&qm, C2D_WithColor, cx + (card_w - qw) / 2,
+                         card_y + (card_h - qh) / 2, 0, 0.7f, 0.7f, INK);
         }
     }
 
-    /* Description of selected character — hide for locked */
-    int sel_unlocked = (g_config.unlocked_chars & (1 << g->char_sel)) ? 1 : 0;
-    if (sel_unlocked) {
+    /* Selected-character blurb on a small paper strip */
+    draw_paper_panel(30, 180, 340, 26, 255);
+    {
+        int sel_unlocked = (g_config.unlocked_chars & (1 << g->char_sel)) ? 1 : 0;
+        const char *blurb = sel_unlocked
+            ? character_blurb((CharacterType)g->char_sel)
+            : "Complete the game with another character to unlock.";
         C2D_Text desc;
-        gtext_parse(&desc, textBuf, character_blurb((CharacterType)g->char_sel));
+        gtext_parse(&desc, textBuf, blurb);
         C2D_TextOptimize(&desc);
-        C2D_DrawText(&desc, C2D_WithColor, 35, 185, 0, 0.45f, 0.45f,
-                     C2D_Color32(220, 200, 160, 255));
-    } else {
-        C2D_Text desc;
-        gtext_parse(&desc, textBuf, "Complete the game with another character to unlock.");
-        C2D_TextOptimize(&desc);
-        C2D_DrawText(&desc, C2D_WithColor, 20, 185, 0, 0.45f, 0.45f,
-                     C2D_Color32(160, 130, 90, 255));
+        float dw = 0.0f, dh = 0.0f;
+        C2D_TextGetDimensions(&desc, 0.42f, 0.42f, &dw, &dh);
+        C2D_DrawText(&desc, C2D_WithColor, 200 - dw / 2,
+                     180 + (26 - dh) / 2, 0, 0.42f, 0.42f,
+                     sel_unlocked ? INK : INK_FAINT);
     }
 
     /* Hint */
     C2D_Text hint;
     gtext_parse(&hint, textBuf, "D-Pad/Stick: Select   A: Confirm   B: Back");
     C2D_TextOptimize(&hint);
-    float ha = 0.5f + sinf(g->menu_timer * 0.1f) * 0.3f;
-    C2D_DrawText(&hint, C2D_WithColor, 65, 218, 0, 0.45f, 0.45f,
-                 C2D_Color32(150, 130, 110, (int)(ha * 255)));
+    C2D_DrawText(&hint, C2D_WithColor, 65, 220, 0, 0.45f, 0.45f, INK_FAINT);
 }
 
 /* ================================================================
@@ -9509,33 +9630,41 @@ void render_stats_overlay(Game *g, C2D_TextBuf textBuf) {
     C2D_TextBufClear(textBuf);
     Player *p = &g->player;
 
-    /* Background */
-    C2D_DrawRectSolid(0, 0, 0, BOT_SCREEN_WIDTH, BOT_SCREEN_HEIGHT,
-                      C2D_Color32(30, 25, 20, 255));
+    /* Background: full-screen paper page + grain (Round 7) */
+    C2D_DrawRectSolid(0, 0, 0, BOT_SCREEN_WIDTH, BOT_SCREEN_HEIGHT, PAPER);
+    for (int i = 0; i < 30; i++) {
+        float gx = (i * 47) % BOT_SCREEN_WIDTH;
+        float gy = (i * 31) % BOT_SCREEN_HEIGHT;
+        C2D_DrawRectSolid(gx, gy, 0, 1, 1, C2D_Color32(219, 204, 178, 120));
+    }
 
-    /* Title */
+    /* Title on a scratch underline */
     C2D_Text title;
     gtext_parse(&title, textBuf, "PLAYER STATS");
     C2D_TextOptimize(&title);
-    C2D_DrawText(&title, C2D_WithColor, 90, 6, 0, 0.65f, 0.65f,
-                 C2D_Color32(255, 230, 180, 255));
+    C2D_DrawText(&title, C2D_WithColor, 90, 6, 0, 0.65f, 0.65f, INK);
+    {
+        float tw = 0.0f, th = 0.0f;
+        C2D_TextGetDimensions(&title, 0.65f, 0.65f, &tw, &th);
+        draw_doodle_scratch(90, 24, 90 + tw, 26, BLOOD);
+    }
 
-    /* Character name */
+    /* Character name (tint kept as a small swatch, text inked) */
     char cb[48];
     snprintf(cb, sizeof(cb), "%s   Floor %d", character_name(p->character),
              g->current_floor + 1);
     C2D_Text ct;
     gtext_parse(&ct, textBuf, cb);
     C2D_TextOptimize(&ct);
-    C2D_DrawText(&ct, C2D_WithColor, 80, 25, 0, 0.5f, 0.5f,
-                 character_tint(p->character));
+    C2D_DrawRectSolid(66, 28, 0, 10, 10, character_tint(p->character));
+    C2D_DrawText(&ct, C2D_WithColor, 80, 27, 0, 0.5f, 0.5f, INK);
 
     /* Stats list */
     char buf[64];
     float y = 50;
     float dy = 16;
-    u32 lc = C2D_Color32(200, 200, 200, 255);
-    u32 vc = C2D_Color32(255, 240, 180, 255);
+    u32 lc = INK_FAINT;
+    u32 vc = INK;
 
     #define STAT_LINE(label, fmt, val) do { \
         C2D_Text lt; \
@@ -9578,8 +9707,7 @@ void render_stats_overlay(Game *g, C2D_TextBuf textBuf) {
     C2D_Text hint;
     gtext_parse(&hint, textBuf, "START or B: Resume");
     C2D_TextOptimize(&hint);
-    C2D_DrawText(&hint, C2D_WithColor, 88, 218, 0, 0.45f, 0.45f,
-                 C2D_Color32(150, 130, 110, 255));
+    C2D_DrawText(&hint, C2D_WithColor, 88, 218, 0, 0.45f, 0.45f, INK_FAINT);
 }
 
 /* ================================================================
@@ -9614,17 +9742,23 @@ void render_pickup_message(Game *g, C2D_TextBuf textBuf) {
         }
     }
 
-    u32 textcol = C2D_Color32(255, 240, 200, alpha);
-    u32 desccol = C2D_Color32(200, 195, 190, alpha);
+    u32 textcol = C2D_Color32(55, 43, 33, alpha);    /* INK, alpha-scaled */
+    u32 desccol = C2D_Color32(122, 99, 75, alpha);   /* INK_FAINT, alpha-scaled */
 
-    /* Neutral dark plate, sized to fit the two lines of text */
+    /* Paper strip, sized to fit the two lines of text */
     float bw = 320;
     float bh = desc_buf[0] ? 34 : 24;
     float bx = (TOP_SCREEN_WIDTH - bw) / 2;
     float by = ROOM_BOTTOM - bh - 4;
-    C2D_DrawRectSolid(bx, by, 0, bw, bh, C2D_Color32(30, 28, 26, (alpha * 220) / 255));
-    C2D_DrawRectSolid(bx, by, 0, bw, 1, C2D_Color32(90, 85, 80, alpha));
-    C2D_DrawRectSolid(bx, by + bh - 1, 0, bw, 1, C2D_Color32(90, 85, 80, alpha));
+    u32 frame = C2D_Color32(62, 47, 34, alpha);      /* BORDER_BROWN, alpha-scaled */
+    C2D_DrawRectSolid(bx + 3, by + 4, 0, bw, bh, C2D_Color32(0, 0, 0, (alpha * 45) / 255));
+    C2D_DrawRectSolid(bx - 2, by - 2, 0, bw + 4, 2, frame);
+    C2D_DrawRectSolid(bx - 2, by + bh, 0, bw + 4, 2, frame);
+    C2D_DrawRectSolid(bx - 2, by, 0, 2, bh, frame);
+    C2D_DrawRectSolid(bx + bw, by, 0, 2, bh, frame);
+    C2D_DrawRectSolid(bx, by, 0, bw, bh, C2D_Color32(234, 221, 200, (alpha * 240) / 255));
+    C2D_DrawEllipseSolid(bx + bw * 0.16f, by + bh * 0.3f, 0, 22, 10,
+                         C2D_Color32(219, 204, 178, (alpha * 35) / 255));
 
     /* Name, larger, centered */
     C2D_Text nameText;
@@ -9657,34 +9791,29 @@ void render_pickup_message(Game *g, C2D_TextBuf textBuf) {
  * Render: Settings screen
  * ================================================================ */
 void render_settings(Game *g, C2D_TextBuf textBuf) {
-    /* Background */
-    C2D_DrawRectSolid(0, 0, 0, TOP_SCREEN_WIDTH, TOP_SCREEN_HEIGHT, COL_MENU_BG);
-
-    /* Title */
-    C2D_Text title;
-    gtext_parse(&title, textBuf, "=== SETTINGS ===");
-    C2D_TextOptimize(&title);
-    C2D_DrawText(&title, C2D_WithColor, 120, 12, 0, 0.7f, 0.7f, COL_MENU_SEL);
+    /* Round 7: shared paper background + title strip */
+    draw_menu_background(g);
+    draw_menu_title(textBuf, "SETTINGS");
 
     /* Audio status indicator */
     C2D_Text status_label, status_val;
     gtext_parse(&status_label, textBuf, "Audio Status:");
     C2D_TextOptimize(&status_label);
-    C2D_DrawText(&status_label, C2D_WithColor, 30, 42, 0, 0.5f, 0.5f,
-                 C2D_Color32(180, 180, 180, 255));
+    C2D_DrawText(&status_label, C2D_WithColor, 30, 54, 0, 0.5f, 0.5f,
+                 INK_FAINT);
 
     const char *status_str = audio_status_string();
     gtext_parse(&status_val, textBuf, status_str);
     C2D_TextOptimize(&status_val);
     u32 status_col;
     if (audio_is_available())
-        status_col = C2D_Color32(80, 220, 80, 255);   /* green */
+        status_col = C2D_Color32(80, 180, 80, 255);    /* green */
     else
-        status_col = C2D_Color32(220, 160, 60, 255);   /* orange */
-    C2D_DrawText(&status_val, C2D_WithColor, 175, 42, 0, 0.5f, 0.5f, status_col);
+        status_col = C2D_Color32(200, 140, 50, 255);   /* orange */
+    C2D_DrawText(&status_val, C2D_WithColor, 175, 54, 0, 0.5f, 0.5f, status_col);
 
-    /* Separator line */
-    C2D_DrawRectSolid(30, 62, 0, 340, 1, C2D_Color32(100, 80, 60, 180));
+    /* Separator crease */
+    C2D_DrawRectSolid(30, 72, 0, 340, 1, PAPER_EDGE);
 
     /* Settings items */
     const char *labels[SETTINGS_COUNT] = {
@@ -9694,23 +9823,24 @@ void render_settings(Game *g, C2D_TextBuf textBuf) {
     };
 
     for (int i = 0; i < SETTINGS_COUNT; i++) {
-        float yPos = 75 + i * 32;
+        float yPos = 84 + i * 34;
         int selected = (i == g->settings_sel);
 
-        /* Selection highlight */
+        /* Paper strip per row; selected row nudges left + gets the
+           blood-drip selector (no pulse highlight). */
         if (selected) {
-            float sel_pulse = sinf(g->menu_timer * 0.15f);
-            int alpha = (int)(80 + sel_pulse * 30);
-            C2D_DrawRectSolid(25, yPos - 3, 0, 350, 26, C2D_Color32(100, 70, 40, alpha));
+            draw_paper_panel(37, yPos - 6, 326, 26, 255);
+            draw_selector(26, yPos + 6, g->menu_timer);
+        } else {
+            draw_paper_panel_ex(40, yPos - 6, 320, 26, 230, 1);
         }
 
         /* Label */
         C2D_Text lbl;
         gtext_parse(&lbl, textBuf, labels[i]);
         C2D_TextOptimize(&lbl);
-        u32 lbl_col = selected ? C2D_Color32(255, 240, 200, 255)
-                               : C2D_Color32(180, 160, 130, 255);
-        C2D_DrawText(&lbl, C2D_WithColor, 40, yPos, 0, 0.5f, 0.5f, lbl_col);
+        C2D_DrawText(&lbl, C2D_WithColor, 48, yPos, 0, 0.5f, 0.5f,
+                     selected ? INK : INK_FAINT);
 
         /* Value */
         char val_buf[32];
@@ -9727,9 +9857,8 @@ void render_settings(Game *g, C2D_TextBuf textBuf) {
         C2D_Text val_txt;
         gtext_parse(&val_txt, textBuf, val_buf);
         C2D_TextOptimize(&val_txt);
-        u32 val_col = selected ? C2D_Color32(255, 220, 150, 255)
-                               : C2D_Color32(200, 180, 140, 255);
-        C2D_DrawText(&val_txt, C2D_WithColor, 250, yPos, 0, 0.5f, 0.5f, val_col);
+        C2D_DrawText(&val_txt, C2D_WithColor, 252, yPos, 0, 0.5f, 0.5f,
+                     selected ? BLOOD : BLOOD_DARK);
     }
 
     /* Restart notice if audio toggle changed */
@@ -9739,24 +9868,25 @@ void render_settings(Game *g, C2D_TextBuf textBuf) {
         C2D_TextOptimize(&notice);
         float blink = sinf(g->menu_timer * 0.1f);
         int alpha = (int)(150 + blink * 80);
-        C2D_DrawText(&notice, C2D_WithColor, 50, 175, 0, 0.42f, 0.42f,
-                     C2D_Color32(255, 200, 100, alpha));
+        C2D_DrawText(&notice, C2D_WithColor, 50, 196, 0, 0.42f, 0.42f,
+                     C2D_Color32(110, 12, 16, alpha));
     }
 
     /* Hint at bottom (audio backend implementation detail no longer shown) */
     C2D_Text hint;
     gtext_parse(&hint, textBuf, "D-Pad: Navigate   A/L/R: Change   B: Save & Back");
     C2D_TextOptimize(&hint);
-    C2D_DrawText(&hint, C2D_WithColor, 45, 228, 0, 0.38f, 0.38f,
-                 C2D_Color32(120, 100, 80, 200));
+    C2D_DrawText(&hint, C2D_WithColor, 45, 226, 0, 0.38f, 0.38f, INK_FAINT);
 }
 
-void render_controls(C2D_TextBuf textBuf) {
-    C2D_DrawRectSolid(0, 0, 0, TOP_SCREEN_WIDTH, TOP_SCREEN_HEIGHT, COL_MENU_BG);
+void render_controls(Game *g, C2D_TextBuf textBuf) {
+    /* Round 7: shared paper background + title strip */
+    draw_menu_background(g);
+    draw_menu_title(textBuf, "CONTROLS");
 
     C2D_Text lines[12];
     const char *text[] = {
-        "=== CONTROLS ===",
+        "",   /* title handled by draw_menu_title */
         "",
         "D-Pad / Circle Pad : Move",
         "X / B / Y / A : Shoot U / D / L / R",
@@ -9769,16 +9899,15 @@ void render_controls(C2D_TextBuf textBuf) {
         "Use trapdoor after boss to descend!",
         "Press A/B to go back"
     };
-    float ypos[] = { 12, 0, 38, 58, 78, 98, 118, 0, 145, 162, 179, 200 };
+    float ypos[] = { 0, 0, 56, 74, 92, 110, 128, 0, 152, 168, 184, 206 };
 
     for (int i = 0; i < 12; i++) {
         if (strlen(text[i]) == 0) continue;
         gtext_parse(&lines[i], textBuf, text[i]);
         C2D_TextOptimize(&lines[i]);
-        float scale = (i == 0) ? 0.7f : 0.42f;
-        u32 col = (i == 0) ? COL_MENU_SEL : (i == 11 ? C2D_Color32(120, 120, 120, 255) : COL_TEXT);
-        float xoff = (i == 0) ? 100 : 40;
-        C2D_DrawText(&lines[i], C2D_WithColor, xoff, ypos[i], 0, scale, scale, col);
+        float scale = 0.42f;
+        u32 col = (i == 11) ? INK_FAINT : INK;
+        C2D_DrawText(&lines[i], C2D_WithColor, 40, ypos[i], 0, scale, scale, col);
     }
 }
 
@@ -9787,23 +9916,24 @@ void render_controls(C2D_TextBuf textBuf) {
  * ================================================================ */
 
 void render_unlocks_screen(Game *g, C2D_TextBuf textBuf) {
-    C2D_DrawRectSolid(0, 0, 0, TOP_SCREEN_WIDTH, TOP_SCREEN_HEIGHT, COL_MENU_BG);
-
-    /* Title */
-    C2D_Text title;
-    gtext_parse(&title, textBuf, "=== UNLOCKS & STATS ===");
-    C2D_TextOptimize(&title);
-    C2D_DrawText(&title, C2D_WithColor, 80, 8, 0, 0.62f, 0.62f, COL_MENU_SEL);
+    /* Round 7: shared paper background + title strip */
+    draw_menu_background(g);
+    draw_menu_title(textBuf, "UNLOCKS & STATS");
 
     /* Build all the lines. Sized to hold the character list + stats + the
        full 20-boss roster (headers/stats 14 + 20 bosses = 34 < 36). buf is
-       static to keep the ~2KB scratch off the per-frame render stack. */
+       static to keep the ~2KB scratch off the per-frame render stack.
+       is_header/marker are presentation-only parallel flags — the
+       line-count/window/scroll math below is untouched. */
     static char buf[36][64];
     const char *lines_text[36];
+    u8 is_header[36] = {0};
+    u8 marker[36] = {0};   /* 0 none, 1 = defeated X, 2 = pending dash */
     int line_count = 0;
 
     /* Header section: characters */
-    snprintf(buf[line_count], 64, "-- CHARACTERS --");
+    snprintf(buf[line_count], 64, "CHARACTERS");
+    is_header[line_count] = 1;
     lines_text[line_count] = buf[line_count]; line_count++;
 
     /* Character unlocks */
@@ -9822,7 +9952,8 @@ void render_unlocks_screen(Game *g, C2D_TextBuf textBuf) {
     }
 
     /* Stats */
-    snprintf(buf[line_count], 64, "-- STATS --");
+    snprintf(buf[line_count], 64, "STATS");
+    is_header[line_count] = 1;
     lines_text[line_count] = buf[line_count]; line_count++;
 
     snprintf(buf[line_count], 64, "Total Wins: %d", g_config.total_wins);
@@ -9840,7 +9971,8 @@ void render_unlocks_screen(Game *g, C2D_TextBuf textBuf) {
     lines_text[line_count] = buf[line_count]; line_count++;
 
     /* Boss list */
-    snprintf(buf[line_count], 64, "-- BOSSES --");
+    snprintf(buf[line_count], 64, "BOSSES");
+    is_header[line_count] = 1;
     lines_text[line_count] = buf[line_count]; line_count++;
 
     /* Must stay in exact EnemyType enum order (ENEMY_BOSS_DUKE..ENEMY_BOSS_SATAN)
@@ -9855,9 +9987,9 @@ void render_unlocks_screen(Game *g, C2D_TextBuf textBuf) {
     /* Pack two columns - we'll show ones we have seen vs ???  */
     for (int b = 0; b < 20 && line_count < 36; b++) {
         int defeated = (g_config.bosses_defeated & (1 << b)) != 0;
-        snprintf(buf[line_count], 64, "  %c %s",
-                defeated ? 'X' : '-',
+        snprintf(buf[line_count], 64, "    %s",
                 defeated ? boss_names[b] : "???");
+        marker[line_count] = defeated ? 1 : 2;
         lines_text[line_count] = buf[line_count]; line_count++;
     }
 
@@ -9866,27 +9998,54 @@ void render_unlocks_screen(Game *g, C2D_TextBuf textBuf) {
     if (max_scroll < 0) max_scroll = 0;
     if (g->unlocks_scroll > max_scroll) g->unlocks_scroll = max_scroll;
 
-    /* Render visible lines */
+    /* Boss defeat markers: parse once, stamp per visible boss line */
+    C2D_Text mkX, mkDash;
+    gtext_parse(&mkX, textBuf, "X");
+    C2D_TextOptimize(&mkX);
+    gtext_parse(&mkDash, textBuf, "-");
+    C2D_TextOptimize(&mkDash);
+
+    /* Render visible lines (window math unchanged: 11 lines from scroll) */
     C2D_Text txt[16];
-    float y = 32.0f;
+    float y = 52.0f;
+    const float pitch = 15.0f;
     int start = g->unlocks_scroll;
     int end = start + 11;
     if (end > line_count) end = line_count;
     for (int i = start; i < end; i++) {
         gtext_parse(&txt[i - start], textBuf, lines_text[i]);
         C2D_TextOptimize(&txt[i - start]);
-        u32 col = COL_TEXT;
-        if (lines_text[i][0] == '-' && lines_text[i][1] == '-') col = COL_MENU_SEL;
+        u32 col = is_header[i] ? BLOOD : INK;
         C2D_DrawText(&txt[i - start], C2D_WithColor, 30, y, 0, 0.42f, 0.42f, col);
-        y += 16;
+        if (marker[i] == 1)
+            C2D_DrawText(&mkX, C2D_WithColor, 32, y, 0, 0.42f, 0.42f, BLOOD);
+        else if (marker[i] == 2)
+            C2D_DrawText(&mkDash, C2D_WithColor, 32, y, 0, 0.42f, 0.42f,
+                         INK_FAINT);
+        y += pitch;
+    }
+
+    /* Thin paper scroll-track on the right edge: PAPER_EDGE rail + INK
+       thumb sized/positioned from the existing scroll state. */
+    {
+        const float track_y = 52.0f;
+        const float track_h = 11 * pitch;
+        C2D_DrawRectSolid(384, track_y, 0, 2, track_h, PAPER_EDGE);
+        if (line_count > 11) {
+            float thumb_h = track_h * 11.0f / (float)line_count;
+            float ty = track_y;
+            if (max_scroll > 0)
+                ty += (track_h - thumb_h) *
+                      (float)g->unlocks_scroll / (float)max_scroll;
+            C2D_DrawRectSolid(382, ty, 0, 6, thumb_h, INK);
+        }
     }
 
     /* Footer hint */
     C2D_Text hint;
     gtext_parse(&hint, textBuf, "Up/Down: Scroll   B: Back");
     C2D_TextOptimize(&hint);
-    C2D_DrawText(&hint, C2D_WithColor, 60, 220, 0, 0.38f, 0.38f,
-                C2D_Color32(160, 160, 160, 255));
+    C2D_DrawText(&hint, C2D_WithColor, 60, 224, 0, 0.38f, 0.38f, INK_FAINT);
 }
 
 /* ================================================================
@@ -9894,15 +10053,35 @@ void render_unlocks_screen(Game *g, C2D_TextBuf textBuf) {
  * ================================================================ */
 
 void render_hud(Game *g, C2D_TextBuf textBuf) {
-    /* HUD background only covers the area above the wall (y=0 to WALL_THICKNESS)
-     * so it does not obscure the top door which sits at y=WALL_THICKNESS */
-    C2D_DrawRectSolid(0, 0, 0, TOP_SCREEN_WIDTH, WALL_THICKNESS, COL_HUD_BG);
+    /* Round 7: opaque HUD strip deleted — hearts float over the wall art.
+     * A soft two-band top gradient keeps the heart row readable against
+     * bright wall tiles without boxing the HUD in. */
+    C2D_DrawRectSolid(0, 0, 0, TOP_SCREEN_WIDTH, 10, C2D_Color32(0, 0, 0, 70));
+    C2D_DrawRectSolid(0, 10, 0, TOP_SCREEN_WIDTH, 8, C2D_Color32(0, 0, 0, 30));
 
     /* Hearts – compact layout fitting within 16px tall HUD strip. Wraps to
        a second row (see wrap logic below) instead of hard-hiding extras,
        so raise the display cap enough for that to matter. */
     int maxHearts = g->player.stats.max_hp / 2;
     if (maxHearts > 12) maxHearts = 12;
+
+    /* R2: total displayed heart slots (red containers + soul + black —
+       mirror of the row math below). More than 12 slots wraps onto a 3rd
+       heart row (y 30-42), which lands on the active-item box frame at
+       WALL_THICKNESS+4 — shift the ENTIRE left HUD stack (active box,
+       counter column, pill/card/trinket doodads) down one heart row so
+       nothing overlaps and they can't drift apart. */
+    float hudShift = 0.0f;
+    if (g->active_curse != CURSE_UNKNOWN) {
+        int slotsSoul = (g->player.soul_hp + 1) / 2;
+        if (maxHearts + slotsSoul > 18) slotsSoul = 18 - maxHearts;
+        if (slotsSoul < 0) slotsSoul = 0;
+        int slotsBlack = (g->player.black_hp + 1) / 2;
+        if (maxHearts + slotsSoul + slotsBlack > 18)
+            slotsBlack = 18 - maxHearts - slotsSoul;
+        if (slotsBlack < 0) slotsBlack = 0;
+        if (maxHearts + slotsSoul + slotsBlack > 12) hudShift = 14.0f;
+    }
 
     /* Curse of the Unknown: hide the heart row entirely (render-only —
      * underlying HP state is untouched). Draw a single '?' where the
@@ -10006,62 +10185,49 @@ void render_hud(Game *g, C2D_TextBuf textBuf) {
         }
     }
 
-    /* Consumable counts (coin/bomb/key) — bottom-left vertical stack. Moved
-       out of the cramped top strip (which was overlapping the floor/room
-       name text) into free space above the pill/card row. */
+    /* Consumable counts (coin/bomb/key) — Rebirth layout: top-left column
+       under the hearts / active-item box. Zero-padded bone-white text with
+       a 1px black drop shadow so it reads over the room art. */
     {
-        float cx = 10;
-        float cy = TOP_SCREEN_HEIGHT - 42;
+        float cx = 12;
+        float cy = WALL_THICKNESS + 34 + hudShift; /* R2: track heart rows */
         float iconSc = 0.45f;
+        u32 boneWhite = C2D_Color32(232, 224, 208, 255);
+        u32 shadowCol = C2D_Color32(0, 0, 0, 255);
+        const int counts[3] = { g->player.coins, g->player.bombs, g->player.keys };
 
-        if (g_sprites_loaded) {
-            spr_draw(sheet_ui_items, ui_items_atlas_item_coin_idx, cx, cy, iconSc, iconSc);
-        } else {
-            C2D_DrawCircleSolid(cx, cy, 0, 4, C2D_Color32(255, 215, 0, 255));
+        for (int ci = 0; ci < 3; ci++) {
+            float ly = cy + ci * 12;
+            if (g_sprites_loaded) {
+                int icon = (ci == 0) ? ui_items_atlas_item_coin_idx
+                         : (ci == 1) ? ui_items_atlas_item_bomb_idx
+                                     : ui_items_atlas_item_key_idx;
+                spr_draw(sheet_ui_items, icon, cx, ly, iconSc, iconSc);
+            } else if (ci == 0) {
+                C2D_DrawCircleSolid(cx, ly, 0, 4, C2D_Color32(255, 215, 0, 255));
+            } else if (ci == 1) {
+                C2D_DrawCircleSolid(cx, ly, 0, 4, C2D_Color32(80, 80, 80, 255));
+            } else {
+                C2D_DrawRectSolid(cx - 3, ly - 5, 0, 6, 10, C2D_Color32(255, 215, 0, 255));
+            }
+            C2D_Text ct;
+            char cb[8];
+            snprintf(cb, sizeof(cb), "%02d", counts[ci]);
+            gtext_parse(&ct, textBuf, cb);
+            C2D_TextOptimize(&ct);
+            C2D_DrawText(&ct, C2D_WithColor, cx + 10, ly - 4, 0, 0.42f, 0.42f,
+                         shadowCol);
+            C2D_DrawText(&ct, C2D_WithColor, cx + 9, ly - 5, 0, 0.42f, 0.42f,
+                         boneWhite);
         }
-        C2D_Text ct;
-        char cb[8];
-        snprintf(cb, sizeof(cb), "%d", g->player.coins);
-        gtext_parse(&ct, textBuf, cb);
-        C2D_TextOptimize(&ct);
-        C2D_DrawText(&ct, C2D_WithColor, cx + 8, cy - 4, 0, 0.45f, 0.45f,
-                     C2D_Color32(255, 255, 255, 255));
-
-        cy += 13;
-        if (g_sprites_loaded) {
-            spr_draw(sheet_ui_items, ui_items_atlas_item_bomb_idx, cx, cy, iconSc, iconSc);
-        } else {
-            C2D_DrawCircleSolid(cx, cy, 0, 4, C2D_Color32(80, 80, 80, 255));
-        }
-        C2D_Text bt;
-        char bb[8];
-        snprintf(bb, sizeof(bb), "%d", g->player.bombs);
-        gtext_parse(&bt, textBuf, bb);
-        C2D_TextOptimize(&bt);
-        C2D_DrawText(&bt, C2D_WithColor, cx + 8, cy - 4, 0, 0.45f, 0.45f,
-                     C2D_Color32(255, 255, 255, 255));
-
-        cy += 13;
-        if (g_sprites_loaded) {
-            spr_draw(sheet_ui_items, ui_items_atlas_item_key_idx, cx, cy, iconSc, iconSc);
-        } else {
-            C2D_DrawRectSolid(cx - 3, cy - 5, 0, 6, 10, C2D_Color32(255, 215, 0, 255));
-        }
-        C2D_Text kt;
-        char kb[8];
-        snprintf(kb, sizeof(kb), "%d", g->player.keys);
-        gtext_parse(&kt, textBuf, kb);
-        C2D_TextOptimize(&kt);
-        C2D_DrawText(&kt, C2D_WithColor, cx + 8, cy - 4, 0, 0.45f, 0.45f,
-                     C2D_Color32(255, 255, 255, 255));
     }
 
-    /* ── Held pill / card slot (Rebirth-style, bottom-left of top screen)
-       plus Yum Heart recharge pips. Previously the player had no way to
-       see what single-use consumable they were carrying. Shifted right of
-       the coin/bomb/key stack above so the two groups don't overlap. ── */
+    /* ── Held pill / card slot plus trinket charm. Round 7: moved with the
+       consumable counters into the Rebirth top-left column (they sit just
+       below the coin/bomb/key stack); hint letters get a 1px black shadow
+       for readability over the room. ── */
     {
-        float px = 55, py = TOP_SCREEN_HEIGHT - 12;
+        float px = 14, py = WALL_THICKNESS + 76 + hudShift; /* R2 */
         if (g->player.has_pill) {
             /* two-tone capsule */
             C2D_DrawCircleSolid(px - 3, py, 0, 3.5f, C2D_Color32(240, 240, 240, 255));
@@ -10071,8 +10237,10 @@ void render_hud(Game *g, C2D_TextBuf textBuf) {
             C2D_Text lt;
             gtext_parse(&lt, textBuf, "L");
             C2D_TextOptimize(&lt);
+            C2D_DrawText(&lt, C2D_WithColor, px + 10, py - 6, 0, 0.4f, 0.4f,
+                         C2D_Color32(0, 0, 0, 220));
             C2D_DrawText(&lt, C2D_WithColor, px + 9, py - 7, 0, 0.4f, 0.4f,
-                         C2D_Color32(180, 180, 180, 220));
+                         C2D_Color32(232, 224, 208, 220));
         }
         if (g->player.has_card) {
             float ccx = px + 30;
@@ -10082,8 +10250,10 @@ void render_hud(Game *g, C2D_TextBuf textBuf) {
             C2D_Text rt;
             gtext_parse(&rt, textBuf, "R");
             C2D_TextOptimize(&rt);
+            C2D_DrawText(&rt, C2D_WithColor, ccx + 8, py - 6, 0, 0.4f, 0.4f,
+                         C2D_Color32(0, 0, 0, 220));
             C2D_DrawText(&rt, C2D_WithColor, ccx + 7, py - 7, 0, 0.4f, 0.4f,
-                         C2D_Color32(180, 180, 180, 220));
+                         C2D_Color32(232, 224, 208, 220));
         }
         /* Held trinket charm, right of the pill/card slots */
         if (g->player.trinket != TRINKET_NONE) {
@@ -10098,15 +10268,21 @@ void render_hud(Game *g, C2D_TextBuf textBuf) {
     if (g->player.active_item != ITEM_NONE) {
         Player *p = &g->player;
         float bx = 8;                    /* box left */
-        float by = WALL_THICKNESS + 4;   /* just under the HUD heart strip */
+        float by = WALL_THICKNESS + 4 + hudShift; /* just under the HUD
+                                            heart strip (R2: +1 row when
+                                            hearts wrap to a 3rd row) */
         float bs = 20;                   /* box size */
         int ready = (p->active_charge >= p->active_max_charge);
 
-        /* Dark framed box */
-        C2D_DrawRectSolid(bx - 1, by - 1, 0, bs + 2, bs + 2,
-                          ready ? C2D_Color32(255, 210, 70, 255)
-                                : C2D_Color32(90, 90, 90, 255));
-        C2D_DrawRectSolid(bx, by, 0, bs, bs, C2D_Color32(24, 20, 28, 235));
+        /* Layered brown frame (Round 7); gold when ready with a gentle
+           pulse ring behind the box (deterministic, gated on g->frame). */
+        if (ready && ((g->frame >> 3) & 1)) {
+            C2D_DrawCircleSolid(bx + bs / 2, by + bs / 2, 0, bs * 0.75f,
+                                C2D_Color32(255, 220, 120, 40));
+        }
+        C2D_DrawRectSolid(bx - 2, by - 2, 0, bs + 4, bs + 4,
+                          ready ? GOLD_CHARGE : BORDER_BROWN);
+        C2D_DrawRectSolid(bx, by, 0, bs, bs, C2D_Color32(28, 24, 20, 200));
 
         /* Item icon inside */
         if (g_sprites_loaded) {
@@ -10125,10 +10301,9 @@ void render_hud(Game *g, C2D_TextBuf textBuf) {
             int filledFromBottom = p->active_charge;
             int segIndexFromBottom = mx - 1 - si;
             u32 sc = (segIndexFromBottom < filledFromBottom)
-                     ? (ready ? C2D_Color32(255, 200, 60, 240)
-                              : C2D_Color32(120, 180, 255, 230))
-                     : C2D_Color32(60, 60, 60, 200);
-            C2D_DrawRectSolid(bx - 4, by + si * (segH + segGap), 0, 3, segH, sc);
+                     ? (ready ? GOLD_CHARGE : BLOOD)
+                     : C2D_Color32(40, 34, 28, 220);
+            C2D_DrawRectSolid(bx - 6, by + si * (segH + segGap), 0, 3, segH, sc);
         }
     }
 
@@ -10148,12 +10323,13 @@ void render_hud(Game *g, C2D_TextBuf textBuf) {
                      0.45f, 0.45f, tcol);
     }
 
-    /* Floor name and room type */
+    /* Floor name and room type — Round 7: demoted to the bottom-left corner
+       as a single faint line (the HUD strip is gone). */
     const FloorInfo *fi = get_floor_info(g->current_floor);
     Room *r = current_room(g);
 
-    C2D_Text floorText, roomText;
-    char floorBuf[48], roomBuf[32];
+    C2D_Text floorText;
+    char floorBuf[48], roomBuf[32], hudLineBuf[96];
     const char *roomNames[] = { "???", "Start", "Room", "Treasure", "BOSS", "Exit",
                                 "Shop", "Secret", "Curse", "DEVIL", "Angel", "Sacrifice",
                                 "Boss Rush", "Arcade", "Library" };
@@ -10167,34 +10343,21 @@ void render_hud(Game *g, C2D_TextBuf textBuf) {
     }
     snprintf(roomBuf, sizeof(roomBuf), "%s",
              r->type < 15 ? roomNames[r->type] : "???");
+    snprintf(hudLineBuf, sizeof(hudLineBuf), "%s - %s", floorBuf, roomBuf);
 
-    gtext_parse(&floorText, textBuf, floorBuf);
+    gtext_parse(&floorText, textBuf, hudLineBuf);
     C2D_TextOptimize(&floorText);
-    C2D_DrawText(&floorText, C2D_WithColor, 155, 3, 0, 0.4f, 0.4f,
-                 C2D_Color32(200, 200, 200, 255));
+    C2D_DrawText(&floorText, C2D_WithColor, 10, TOP_SCREEN_HEIGHT - 12, 0,
+                 0.34f, 0.34f, C2D_Color32(200, 190, 170, 160));
 
-    u32 roomCol = (r->type == ROOM_BOSS) ? COL_HEART_FULL :
-                  (r->type == ROOM_TREASURE) ? COL_TREASURE :
-                  (r->type == ROOM_SHOP) ? C2D_Color32(100, 200, 255, 255) :
-                  (r->type == ROOM_SECRET) ? C2D_Color32(180, 180, 180, 255) :
-                  (r->type == ROOM_CURSE) ? C2D_Color32(180, 60, 180, 255) :
-                  (r->type == ROOM_DEVIL) ? C2D_Color32(220, 30, 30, 255) :
-                  (r->type == ROOM_ANGEL) ? C2D_Color32(255, 245, 200, 255) :
-                  (r->type == ROOM_SACRIFICE) ? C2D_Color32(200, 40, 40, 255) :
-                  (r->type == ROOM_BOSSRUSH) ? C2D_Color32(230, 100, 30, 255) :
-                  (r->type == ROOM_ARCADE) ? C2D_Color32(255, 100, 200, 255) :
-                  (r->type == ROOM_LIBRARY) ? C2D_Color32(140, 100, 220, 255) : COL_TEXT;
-    gtext_parse(&roomText, textBuf, roomBuf);
-    C2D_TextOptimize(&roomText);
-    C2D_DrawText(&roomText, C2D_WithColor, 230, 3, 0, 0.4f, 0.4f, roomCol);
-
-    /* Difficulty / Mode indicator (top-right corner) */
+    /* Difficulty / Mode indicator — Round 7: shrunk and tucked under the
+       top-right minimap frame. */
     {
         const char *diff_labels[] = { "EASY", "NORM", "HARD" };
         u32 diff_cols[] = {
-            C2D_Color32(100, 220, 100, 200),  /* green */
-            C2D_Color32(200, 200, 100, 200),  /* yellow */
-            C2D_Color32(255, 80, 80, 200)     /* red */
+            C2D_Color32(100, 220, 100, 140),  /* green */
+            C2D_Color32(200, 200, 100, 140),  /* yellow */
+            C2D_Color32(255, 80, 80, 140)     /* red */
         };
         char mode_buf[16];
         if (g->game_mode == MODE_INFINITE) {
@@ -10208,24 +10371,19 @@ void render_hud(Game *g, C2D_TextBuf textBuf) {
         gtext_parse(&modeText, textBuf, mode_buf);
         C2D_TextOptimize(&modeText);
         u32 mc = diff_cols[g->difficulty < DIFF_COUNT ? g->difficulty : 1];
-        C2D_DrawText(&modeText, C2D_WithColor, TOP_SCREEN_WIDTH - 55, 14, 0,
-                     0.3f, 0.3f, mc);
+        /* Position derived from the minimap geometry below (5x5 grid,
+           11x8 cells, 3px pad, 2px inset from the right edge). */
+        float tagX = TOP_SCREEN_WIDTH - (DUNGEON_W * 11.0f + 6.0f) - 2 + 3;
+        float tagY = WALL_THICKNESS + 2 + (DUNGEON_H * 8.0f + 6.0f) + 6;
+        C2D_DrawText(&modeText, C2D_WithColor, tagX, tagY, 0,
+                     0.28f, 0.28f, mc);
     }
 
-    /* Item count */
-    if (g->player.item_count > 0) {
-        C2D_Text itemText;
-        char itemBuf[24];
-        snprintf(itemBuf, sizeof(itemBuf), "Items:%d", g->player.item_count);
-        gtext_parse(&itemText, textBuf, itemBuf);
-        C2D_TextOptimize(&itemText);
-        C2D_DrawText(&itemText, C2D_WithColor, 300, 3, 0, 0.35f, 0.35f,
-                     C2D_Color32(180, 180, 255, 255));
-    }
-
-    /* Active ability indicators – fit within 16px HUD */
-    float indX = 360;
-    float indY = 8;
+    /* Active ability indicators – shifted left so they clear the minimap
+       frame. R3: the Time Attack / Speed! countdown occupies x342-377 y2-13,
+       so those challenges drop the dots to y16, below the timer. */
+    float indX = 352;
+    float indY = (g->challenge == 3 || g->challenge == 4) ? 16.0f : 8.0f;
     if (g->player.stats.flags & ITEM_FLAG_HOMING) {
         C2D_DrawCircleSolid(indX, indY, 0, 3, COL_HOMING_TEAR);
         indX += 8;
@@ -10259,13 +10417,10 @@ void render_hud(Game *g, C2D_TextBuf textBuf) {
         float mX = TOP_SCREEN_WIDTH - mW - 2;  /* top-right corner */
         float mY = WALL_THICKNESS + 2;          /* just below HUD strip */
 
-        /* Semi-transparent background panel */
-        C2D_DrawRectSolid(mX, mY, 0, mW, mH, C2D_Color32(0, 0, 0, 140));
-        /* Subtle border */
-        C2D_DrawRectSolid(mX, mY, 0, mW, 1, C2D_Color32(80, 80, 80, 180));
-        C2D_DrawRectSolid(mX, mY + mH - 1, 0, mW, 1, C2D_Color32(80, 80, 80, 180));
-        C2D_DrawRectSolid(mX, mY, 0, 1, mH, C2D_Color32(80, 80, 80, 180));
-        C2D_DrawRectSolid(mX + mW - 1, mY, 0, 1, mH, C2D_Color32(80, 80, 80, 180));
+        /* Parchment frame (Round 7): drop shadow, brown frame, aged-paper fill */
+        C2D_DrawRectSolid(mX, mY, 0, mW + 4, mH + 4, C2D_Color32(0, 0, 0, 50));
+        C2D_DrawRectSolid(mX - 2, mY - 2, 0, mW + 4, mH + 4, BORDER_BROWN);
+        C2D_DrawRectSolid(mX, mY, 0, mW, mH, C2D_Color32(226, 213, 190, 215));
 
         for (int ry = 0; ry < DUNGEON_H; ry++) {
             for (int rx = 0; rx < DUNGEON_W; rx++) {
@@ -10289,39 +10444,26 @@ void render_hud(Game *g, C2D_TextBuf textBuf) {
                     if (rm->type == ROOM_SECRET && !rm->secret_revealed) adjVisible = 0;
 
                     if (adjVisible) {
-                        /* Dim question-mark style outline */
-                        C2D_DrawRectSolid(cx + 1, cy + 1, 0, mCellW - 2, mCellH - 2,
-                                         C2D_Color32(50, 50, 50, 120));
+                        /* 1px faint-ink outline (Rebirth "unknown room") */
+                        u32 oc = INK_FAINT;
+                        C2D_DrawRectSolid(cx + 1, cy + 1, 0, mCellW - 2, 1, oc);
+                        C2D_DrawRectSolid(cx + 1, cy + mCellH - 2, 0, mCellW - 2, 1, oc);
+                        C2D_DrawRectSolid(cx + 1, cy + 1, 0, 1, mCellH - 2, oc);
+                        C2D_DrawRectSolid(cx + mCellW - 2, cy + 1, 0, 1, mCellH - 2, oc);
                     }
                     continue;
                 }
 
-                /* Visited room - color by type */
-                u32 rmCol;
-                switch (rm->type) {
-                    case ROOM_START:    rmCol = C2D_Color32(80, 160, 80, 200); break;
-                    case ROOM_BOSS:     rmCol = C2D_Color32(200, 50, 50, 220); break;
-                    case ROOM_TREASURE: rmCol = C2D_Color32(220, 180, 30, 220); break;
-                    case ROOM_SHOP:     rmCol = C2D_Color32(80, 150, 220, 220); break;
-                    case ROOM_SECRET:   rmCol = C2D_Color32(140, 140, 140, 200); break;
-                    case ROOM_CURSE:    rmCol = C2D_Color32(160, 50, 160, 220); break;
-                    case ROOM_DEVIL:    rmCol = C2D_Color32(170, 20, 20, 220); break;
-                    case ROOM_ANGEL:    rmCol = C2D_Color32(230, 220, 170, 220); break;
-                    case ROOM_SACRIFICE: rmCol = C2D_Color32(180, 40, 40, 220); break;
-                    case ROOM_BOSSRUSH: rmCol = C2D_Color32(230, 100, 30, 220); break;
-                    case ROOM_ARCADE:   rmCol = C2D_Color32(230, 90, 180, 220); break;
-                    case ROOM_LIBRARY:  rmCol = C2D_Color32(120, 90, 200, 220); break;
-                    default:
-                        rmCol = rm->cleared
-                              ? C2D_Color32(90, 90, 90, 180)
-                              : C2D_Color32(110, 100, 90, 200);
-                        break;
-                }
+                /* Visited room — Round 7: uniform dark-ink cell on parchment;
+                   the current room is bone-white. Type identity comes from
+                   the micro-glyphs below. */
+                u32 rmCol = isCurrent ? C2D_Color32(238, 228, 206, 255)
+                                      : C2D_Color32(60, 48, 38, 230);
 
                 C2D_DrawRectSolid(cx + 1, cy + 1, 0, mCellW - 2, mCellH - 2, rmCol);
 
                 /* Door connections - thin lines between rooms */
-                u32 doorCol = C2D_Color32(120, 120, 120, 160);
+                u32 doorCol = C2D_Color32(122, 99, 75, 160);   /* INK_FAINT @160 */
                 if (rm->doors[0] && ry > 0 && d->rooms[ry-1][rx].visited)
                     C2D_DrawRectSolid(cx + mCellW/2 - 1, cy, 0, 2, 1, doorCol);
                 if (rm->doors[1] && ry < DUNGEON_H-1 && d->rooms[ry+1][rx].visited)
@@ -10336,12 +10478,12 @@ void render_hud(Game *g, C2D_TextBuf textBuf) {
                 float icy = cy + mCellH / 2;
 
                 if (rm->type == ROOM_BOSS && !isCurrent) {
-                    /* Skull icon: tiny red dot */
-                    C2D_DrawRectSolid(icx - 1, icy - 1, 0, 3, 2, C2D_Color32(255, 200, 200, 255));
+                    /* Skull icon: tiny blood dot */
+                    C2D_DrawRectSolid(icx - 1, icy - 1, 0, 3, 2, BLOOD);
                 } else if (rm->type == ROOM_TREASURE && !isCurrent) {
                     /* Star/sparkle */
-                    C2D_DrawRectSolid(icx, icy - 1, 0, 1, 3, C2D_Color32(255, 255, 180, 255));
-                    C2D_DrawRectSolid(icx - 1, icy, 0, 3, 1, C2D_Color32(255, 255, 180, 255));
+                    C2D_DrawRectSolid(icx, icy - 1, 0, 1, 3, GOLD_CHARGE);
+                    C2D_DrawRectSolid(icx - 1, icy, 0, 3, 1, GOLD_CHARGE);
                 } else if (rm->type == ROOM_SHOP && !isCurrent) {
                     /* $ coin icon */
                     C2D_DrawRectSolid(icx, icy - 1, 0, 1, 3, C2D_Color32(255, 255, 200, 255));
@@ -10361,18 +10503,19 @@ void render_hud(Game *g, C2D_TextBuf textBuf) {
                     C2D_DrawRectSolid(icx, icy, 0, 1, 1, C2D_Color32(100, 255, 100, 200));
                 }
 
-                /* Current room marker - pulsing white outline */
+                /* Current room marker - pulsing bone-white outline (keep the
+                   pulse math; recolored for the parchment frame) */
                 if (isCurrent) {
                     float pulse = sinf((float)g->frame * 0.15f) * 0.4f + 0.6f;
                     u8 a = (u8)(pulse * 255);
-                    u32 markerCol = C2D_Color32(255, 255, 255, a);
+                    u32 markerCol = C2D_Color32(238, 228, 206, a);
                     /* Draw outline */
                     C2D_DrawRectSolid(cx, cy, 0, mCellW, 1, markerCol);
                     C2D_DrawRectSolid(cx, cy + mCellH - 1, 0, mCellW, 1, markerCol);
                     C2D_DrawRectSolid(cx, cy, 0, 1, mCellH, markerCol);
                     C2D_DrawRectSolid(cx + mCellW - 1, cy, 0, 1, mCellH, markerCol);
-                    /* Bright center dot as player position */
-                    C2D_DrawRectSolid(icx, icy, 0, 1, 1, C2D_Color32(255, 255, 255, 255));
+                    /* Dark center dot as player position (cell is bone-white now) */
+                    C2D_DrawRectSolid(icx, icy, 0, 1, 1, C2D_Color32(60, 48, 38, 255));
                 }
             }
         }
@@ -10421,16 +10564,19 @@ void render_hud(Game *g, C2D_TextBuf textBuf) {
                 C2D_DrawRectSolid(inX, inY, 0, inW * hpPct * pulse, 1,
                                   C2D_Color32(255, 120, 100, 200));
             } else {
-                /* Procedural fallback bar */
+                /* Procedural fallback bar — Round 7: brown frame, dark blood
+                   trough, BLOOD fill with a 1px highlight (matches sprite path) */
                 float barW = 160.0f;
                 float barH = 8.0f;
-                C2D_DrawRectSolid(barX - barW / 2 - 1, barY - barH / 2 - 1, 0,
-                                  barW + 2, barH + 2, C2D_Color32(20, 20, 20, 220));
+                C2D_DrawRectSolid(barX - barW / 2 - 2, barY - barH / 2 - 2, 0,
+                                  barW + 4, barH + 4, BORDER_BROWN);
                 C2D_DrawRectSolid(barX - barW / 2, barY - barH / 2, 0,
-                                  barW, barH, C2D_Color32(60, 60, 60, 200));
+                                  barW, barH, C2D_Color32(35, 8, 10, 255));
                 C2D_DrawRectSolid(barX - barW / 2, barY - barH / 2, 0,
-                                  barW * hpPct * pulse, barH,
-                                  C2D_Color32(220, 40, 40, 255));
+                                  barW * hpPct * pulse, barH, BLOOD);
+                C2D_DrawRectSolid(barX - barW / 2, barY - barH / 2, 0,
+                                  barW * hpPct * pulse, 1,
+                                  C2D_Color32(255, 120, 100, 200));
             }
         }
     }
@@ -12020,16 +12166,9 @@ void render_floor_transition(Game *g, C2D_TextBuf textBuf) {
     if (alpha > 1) alpha = 1;
     u8 a8 = (u8)(alpha * 255);
 
-    /* ── Parchment note (same look as the game-over last will) ── */
+    /* ── Parchment note (shared paper panel, alpha follows the fade) ── */
     float ppx = 108, ppy = 26, ppw = 184, pph = 176;
-    C2D_DrawRectSolid(ppx - 4, ppy - 4, 0, ppw + 8, pph + 8,
-                      C2D_Color32(60, 45, 30, a8));              /* border */
-    C2D_DrawRectSolid(ppx, ppy, 0, ppw, pph,
-                      C2D_Color32(222, 209, 172, a8));           /* paper */
-    C2D_DrawRectSolid(ppx, ppy + pph * 0.33f, 0, ppw, 1,
-                      C2D_Color32(190, 175, 138, a8));           /* creases */
-    C2D_DrawRectSolid(ppx, ppy + pph * 0.66f, 0, ppw, 1,
-                      C2D_Color32(190, 175, 138, a8));
+    draw_paper_panel(ppx, ppy, ppw, pph, a8);
 
     /* Floor name, inked at the top of the note */
     C2D_Text t1;
@@ -12037,7 +12176,7 @@ void render_floor_transition(Game *g, C2D_TextBuf textBuf) {
     C2D_TextOptimize(&t1);
     float nw = t1.width * 0.7f;
     C2D_DrawText(&t1, C2D_WithColor, TOP_SCREEN_WIDTH / 2.0f - nw / 2,
-                 ppy + 10, 0, 0.7f, 0.7f, C2D_Color32(90, 60, 40, a8));
+                 ppy + 10, 0, 0.7f, 0.7f, C2D_Color32(55, 43, 33, a8));
 
     /* Isaac descending, centered on the note */
     if (g_sprites_loaded && alpha > 0.5f) {
@@ -12058,7 +12197,7 @@ void render_floor_transition(Game *g, C2D_TextBuf textBuf) {
     C2D_TextOptimize(&t2);
     float fw = t2.width * 0.55f;
     C2D_DrawText(&t2, C2D_WithColor, TOP_SCREEN_WIDTH / 2.0f - fw / 2,
-                 ppy + 116, 0, 0.55f, 0.55f, C2D_Color32(120, 90, 60, a8));
+                 ppy + 116, 0, 0.55f, 0.55f, C2D_Color32(122, 99, 75, a8));
 
     /* Row of pickup counters carried down the ladder */
     if (g_sprites_loaded && sheet_ui_items) {
@@ -12078,7 +12217,7 @@ void render_floor_transition(Game *g, C2D_TextBuf textBuf) {
             gtext_parse(&ct, textBuf, cb);
             C2D_TextOptimize(&ct);
             C2D_DrawText(&ct, C2D_WithColor, ix + 8, iy - 6, 0, 0.5f, 0.5f,
-                         C2D_Color32(90, 70, 50, a8));
+                         C2D_Color32(55, 43, 33, a8));
         }
     }
 }
@@ -12091,28 +12230,25 @@ void render_gameover(Game *g, C2D_TextBuf textBuf) {
     /* ── Rebirth-style "last will" death note on parchment ── */
     C2D_Text t1, t2, t3;
 
-    /* Parchment panel */
+    /* Deterministic pulse phase for the hint (render-side counter) */
+    g->menu_timer++;
+
+    /* Parchment panel (shared paper helper) */
     float ppx = 64, ppy = 14, ppw = 272, pph = 196;
-    C2D_DrawRectSolid(ppx - 4, ppy - 4, 0, ppw + 8, pph + 8,
-                      C2D_Color32(60, 45, 30, 255));           /* border */
-    C2D_DrawRectSolid(ppx, ppy, 0, ppw, pph,
-                      C2D_Color32(222, 209, 172, 255));         /* paper */
-    /* fold creases */
-    C2D_DrawRectSolid(ppx, ppy + pph * 0.33f, 0, ppw, 1,
-                      C2D_Color32(190, 175, 138, 255));
-    C2D_DrawRectSolid(ppx, ppy + pph * 0.66f, 0, ppw, 1,
-                      C2D_Color32(190, 175, 138, 255));
+    draw_paper_panel(ppx, ppy, ppw, pph, 255);
 
     gtext_parse(&t1, textBuf, "YOU DIED");
     C2D_TextOptimize(&t1);
-    C2D_DrawText(&t1, C2D_WithColor, 148, ppy + 6, 0, 0.85f, 0.85f,
-                 C2D_Color32(140, 20, 20, 255));
+    C2D_DrawText(&t1, C2D_WithColor, 148, ppy + 6, 0, 0.85f, 0.85f, BLOOD);
 
     /* Dead Isaac drawing, left side of the note */
     if (g_sprites_loaded) {
         spr_draw(sheet_sprites, player_death_sprite_idx(),
                  ppx + 52, ppy + 92, 2.2f, 2.2f);
     }
+    /* Blood scribbles near the corpse */
+    draw_doodle_scratch(ppx + 28, ppy + 112, ppx + 72, ppy + 118, BLOOD_DARK);
+    draw_doodle_scratch(ppx + 36, ppy + 124, ppx + 78, ppy + 118, BLOOD_DARK);
 
     /* Last item held, Rebirth-style, right side of the note */
     if (g->player.item_count > 0 && g_sprites_loaded) {
@@ -12122,7 +12258,7 @@ void render_gameover(Game *g, C2D_TextBuf textBuf) {
         gtext_parse(&liText, textBuf, "Last item:");
         C2D_TextOptimize(&liText);
         C2D_DrawText(&liText, C2D_WithColor, ppx + 150, ppy + 44, 0, 0.45f, 0.45f,
-                     C2D_Color32(90, 70, 50, 255));
+                     INK_FAINT);
         spr_draw(sheet_ui_items, item_sprite_idx(last),
                  ppx + 170, ppy + 74, 1.4f, 1.4f);
         if (ldef && ldef->name) {
@@ -12130,7 +12266,7 @@ void render_gameover(Game *g, C2D_TextBuf textBuf) {
             gtext_parse(&lnText, textBuf, ldef->name);
             C2D_TextOptimize(&lnText);
             C2D_DrawText(&lnText, C2D_WithColor, ppx + 132, ppy + 92, 0,
-                         0.4f, 0.4f, C2D_Color32(90, 70, 50, 255));
+                         0.4f, 0.4f, INK_FAINT);
         }
     }
 
@@ -12149,7 +12285,7 @@ void render_gameover(Game *g, C2D_TextBuf textBuf) {
     gtext_parse(&stText, textBuf, line);
     C2D_TextOptimize(&stText);
     C2D_DrawText(&stText, C2D_WithColor, ppx + 18, ppy + 142, 0, 0.45f, 0.45f,
-                 C2D_Color32(90, 70, 50, 255));
+                 INK_FAINT);
 
     char scoreBuf[48];
     snprintf(scoreBuf, sizeof(scoreBuf), "Score: %d   Items: %d",
@@ -12157,54 +12293,107 @@ void render_gameover(Game *g, C2D_TextBuf textBuf) {
     gtext_parse(&t2, textBuf, scoreBuf);
     C2D_TextOptimize(&t2);
     C2D_DrawText(&t2, C2D_WithColor, ppx + 18, ppy + 162, 0, 0.5f, 0.5f,
-                 C2D_Color32(120, 40, 40, 255));
+                 BLOOD_DARK);
 
     gtext_parse(&t3, textBuf, "Press START for menu");
     C2D_TextOptimize(&t3);
-    C2D_DrawText(&t3, C2D_WithColor, 118, 218, 0, 0.55f, 0.55f,
-                 C2D_Color32(255, 220, 100, 255));
+    {
+        float ga = 0.6f + sinf(g->menu_timer * 0.1f) * 0.3f;
+        if (ga < 0.0f) ga = 0.0f;
+        if (ga > 1.0f) ga = 1.0f;
+        C2D_DrawText(&t3, C2D_WithColor, 118, 218, 0, 0.55f, 0.55f,
+                     C2D_Color32(122, 99, 75, (u8)(ga * 255)));
+    }
 }
 
 void render_win(Game *g, C2D_TextBuf textBuf) {
-    C2D_Text t1, t2, t3;
-    char scoreBuf[32];
-    snprintf(scoreBuf, sizeof(scoreBuf), "Final Score: %d", g->score);
+    /* Round 7: spotlight-in-the-dark ending tableau. Deterministic pulse
+       phase comes from menu_timer (render-side counter, like render_menu). */
+    g->menu_timer++;
 
-    gtext_parse(&t1, textBuf, "YOU ESCAPED!");
+    u32 bone = C2D_Color32(238, 228, 206, 255);
+
+    /* 1. Void */
+    C2D_DrawRectSolid(0, 0, 0, TOP_SCREEN_WIDTH, TOP_SCREEN_HEIGHT,
+                      C2D_Color32(0, 0, 0, 255));
+
+    /* 2. Spotlight: stacked soft ellipses centered on (200,130) */
+    C2D_DrawEllipseSolid(200 - 120, 130 - 90, 0, 240, 180,
+                         C2D_Color32(255, 244, 214, 25));
+    C2D_DrawEllipseSolid(200 - 95, 130 - 72, 0, 190, 144,
+                         C2D_Color32(255, 244, 214, 35));
+    C2D_DrawEllipseSolid(200 - 70, 130 - 54, 0, 140, 108,
+                         C2D_Color32(255, 244, 214, 45));
+    C2D_DrawEllipseSolid(200 - 48, 130 - 38, 0, 96, 76,
+                         C2D_Color32(255, 244, 214, 60));
+
+    /* 3+4. Isaac in the beam, chest at his feet (wood for Ending 1,
+       gold for the full escape). */
+    if (g_sprites_loaded) {
+        spr_draw(sheet_sprites, player_sprite_idx(DIR_DOWN, 0),
+                 200, 128, 2.2f, 2.2f);
+        if (sheet_environment)
+            spr_draw(sheet_environment,
+                     g->win_ending == 1 ? environment_atlas_env_chest_wood_idx
+                                        : environment_atlas_env_chest_gold_idx,
+                     200, 158, 1.4f, 1.4f);
+    }
+
+    /* 5. Title, bone-white with a black offset shadow — the two endings
+       keep their distinct lines. */
+    C2D_Text t1;
+    gtext_parse(&t1, textBuf,
+                g->win_ending == 1 ? "ENDING 1" : "ISAAC ESCAPED.");
     C2D_TextOptimize(&t1);
-    C2D_DrawText(&t1, C2D_WithColor, 110, 40, 0, 0.9f, 0.9f,
-                 C2D_Color32(100, 255, 100, 255));
+    {
+        float tw = 0.0f, th = 0.0f;
+        C2D_TextGetDimensions(&t1, 0.7f, 0.7f, &tw, &th);
+        C2D_DrawText(&t1, C2D_WithColor, 200 - tw / 2 + 2, 36, 0, 0.7f, 0.7f,
+                     C2D_Color32(0, 0, 0, 255));
+        C2D_DrawText(&t1, C2D_WithColor, 200 - tw / 2, 34, 0, 0.7f, 0.7f,
+                     bone);
+    }
 
-    gtext_parse(&t2, textBuf, scoreBuf);
-    C2D_TextOptimize(&t2);
-    C2D_DrawText(&t2, C2D_WithColor, 135, 85, 0, 0.6f, 0.6f, COL_TEXT);
+    /* 6. Stats lines (content kept from the old screen) */
+    {
+        u32 dim = C2D_Color32(190, 180, 160, 220);
+        char lineBuf[64];
+        if (g->win_ending == 1)
+            snprintf(lineBuf, sizeof(lineBuf), "Isaac chose the light.");
+        else
+            snprintf(lineBuf, sizeof(lineBuf), "All %d floors conquered!",
+                     MAX_FLOORS);
+        C2D_Text t4;
+        gtext_parse(&t4, textBuf, lineBuf);
+        C2D_TextOptimize(&t4);
+        float lw = 0.0f, lh = 0.0f;
+        C2D_TextGetDimensions(&t4, 0.45f, 0.45f, &lw, &lh);
+        C2D_DrawText(&t4, C2D_WithColor, 200 - lw / 2, 196, 0,
+                     0.45f, 0.45f, dim);
 
-    C2D_Text t4;
-    char floorBuf[48];
-    /* E2: distinguish the Mom's Heart light-beam finish ("Ending 1") from
-       the full every-floor escape. */
-    if (g->win_ending == 1)
-        snprintf(floorBuf, sizeof(floorBuf), "ENDING 1 - Isaac chose the light.");
-    else
-        snprintf(floorBuf, sizeof(floorBuf), "All %d floors conquered!", MAX_FLOORS);
-    gtext_parse(&t4, textBuf, floorBuf);
-    C2D_TextOptimize(&t4);
-    C2D_DrawText(&t4, C2D_WithColor, 100, 115, 0, 0.55f, 0.55f,
-                 C2D_Color32(200, 200, 200, 255));
+        snprintf(lineBuf, sizeof(lineBuf), "Final Score: %d   Items: %d",
+                 g->score, g->player.item_count);
+        C2D_Text t2;
+        gtext_parse(&t2, textBuf, lineBuf);
+        C2D_TextOptimize(&t2);
+        C2D_TextGetDimensions(&t2, 0.45f, 0.45f, &lw, &lh);
+        C2D_DrawText(&t2, C2D_WithColor, 200 - lw / 2, 210, 0,
+                     0.45f, 0.45f, dim);
+    }
 
-    /* Show items collected */
-    C2D_Text itemsText;
-    char ibuf[48];
-    snprintf(ibuf, sizeof(ibuf), "Items Collected: %d", g->player.item_count);
-    gtext_parse(&itemsText, textBuf, ibuf);
-    C2D_TextOptimize(&itemsText);
-    C2D_DrawText(&itemsText, C2D_WithColor, 120, 145, 0, 0.5f, 0.5f,
-                C2D_Color32(180, 180, 255, 255));
-
-    gtext_parse(&t3, textBuf, "Press START for menu");
-    C2D_TextOptimize(&t3);
-    C2D_DrawText(&t3, C2D_WithColor, 108, 190, 0, 0.55f, 0.55f,
-                 C2D_Color32(255, 220, 100, 255));
+    /* 7. "Press START" pulsing */
+    {
+        float pa = 0.6f + sinf(g->menu_timer * 0.1f) * 0.4f;
+        if (pa < 0.0f) pa = 0.0f;
+        if (pa > 1.0f) pa = 1.0f;
+        C2D_Text t3;
+        gtext_parse(&t3, textBuf, "Press START");
+        C2D_TextOptimize(&t3);
+        float pw = 0.0f, ph = 0.0f;
+        C2D_TextGetDimensions(&t3, 0.45f, 0.45f, &pw, &ph);
+        C2D_DrawText(&t3, C2D_WithColor, 200 - pw / 2, 224, 0, 0.45f, 0.45f,
+                     C2D_Color32(238, 228, 206, (u8)(pa * 255)));
+    }
 }
 
 /* ================================================================
@@ -12265,26 +12454,31 @@ static void render_shop_prices(Game *g, C2D_TextBuf textBuf) {
     for (int i = 0; i < r->shop_count; i++) {
         ShopItem *si = &r->shop_items[i];
         if (si->active) {
-            /* Draw price number next to coin icon */
+            /* Coin icon + price number; unaffordable = 50% alpha on both */
+            int affordable = (g->player.coins >= si->cost);
+            float af = affordable ? 1.0f : 0.5f;
+            if (g_sprites_loaded && sheet_ui_items) {
+                spr_draw_alpha(sheet_ui_items, ui_items_atlas_item_coin_idx,
+                               si->x - 8, si->y + 18, 0.4f, 0.4f, af);
+            }
             char price_str[8];
             snprintf(price_str, sizeof(price_str), "%d", si->cost);
             C2D_Text priceText;
             gtext_parse(&priceText, textBuf, price_str);
             C2D_TextOptimize(&priceText);
-            /* Color: green if affordable, red if not */
-            u32 pcol = (g->player.coins >= si->cost)
-                ? C2D_Color32(100, 255, 100, 255)
-                : C2D_Color32(255, 80, 80, 255);
             C2D_DrawText(&priceText, C2D_WithColor,
-                         si->x - 2, si->y + 14, 0, 0.4f, 0.4f, pcol);
+                         si->x + 2, si->y + 14, 0, 0.4f, 0.4f,
+                         C2D_Color32(238, 228, 206, (u8)(255 * af)));
         } else {
-            /* "SOLD" text on empty pedestal */
+            /* "SOLD" text on empty pedestal: faint ink on a dark tag */
+            C2D_DrawRectSolid(si->x - 12, si->y, 0, 28, 10,
+                              C2D_Color32(20, 16, 14, 160));
             C2D_Text soldText;
             gtext_parse(&soldText, textBuf, "SOLD");
             C2D_TextOptimize(&soldText);
             C2D_DrawText(&soldText, C2D_WithColor,
                          si->x - 10, si->y + 2, 0, 0.35f, 0.35f,
-                         C2D_Color32(180, 80, 80, 200));
+                         INK_FAINT);
         }
     }
 }
@@ -12317,7 +12511,7 @@ void game_render_top(Game *g, C2D_TextBuf textBuf) {
         break;
 
     case STATE_CONTROLS:
-        render_controls(textBuf);
+        render_controls(g, textBuf);
         break;
 
     case STATE_UNLOCKS:
@@ -12518,15 +12712,16 @@ void game_render_top(Game *g, C2D_TextBuf textBuf) {
             C2D_Text ctext;
             gtext_parse(&ctext, textBuf, banner);
             C2D_TextOptimize(&ctext);
-            /* Background panel */
+            /* Paper strip with a BLOOD frame + BLOOD text */
+            u32 cframe = C2D_Color32(171, 22, 26, alpha);  /* BLOOD, alpha-scaled */
+            C2D_DrawRectSolid(53, 64, 0, 300, 30, C2D_Color32(0, 0, 0, (alpha * 45) / 255));
+            C2D_DrawRectSolid(48, 58, 0, 304, 2, cframe);
+            C2D_DrawRectSolid(48, 90, 0, 304, 2, cframe);
+            C2D_DrawRectSolid(48, 60, 0, 2, 30, cframe);
+            C2D_DrawRectSolid(350, 60, 0, 2, 30, cframe);
             C2D_DrawRectSolid(50, 60, 0, 300, 30,
-                              C2D_Color32(40, 0, 0, alpha));
-            C2D_DrawRectSolid(50, 60, 0, 300, 2,
-                              C2D_Color32(200, 40, 40, alpha));
-            C2D_DrawRectSolid(50, 88, 0, 300, 2,
-                              C2D_Color32(200, 40, 40, alpha));
-            C2D_DrawText(&ctext, C2D_WithColor, 80, 68, 0, 0.6f, 0.6f,
-                         C2D_Color32(255, 200, 200, alpha));
+                              C2D_Color32(234, 221, 200, (alpha * 240) / 255));
+            C2D_DrawText(&ctext, C2D_WithColor, 80, 68, 0, 0.6f, 0.6f, cframe);
         }
 
         /* Floor-intro nameplate: Rebirth-style floor title on entry */
@@ -12618,22 +12813,28 @@ void game_render_top(Game *g, C2D_TextBuf textBuf) {
                     spr_draw_alpha(sheet_boss_splash, pidx,
                                    305.0f + slide_off, 115.0f, 1.0f, 1.0f, fade);
                 } else {
+                    /* Fallback: in-game sprite on a dark blood pool circle */
+                    C2D_DrawCircleSolid(305.0f + slide_off, 115.0f, 0, 34.0f,
+                                        C2D_Color32(110, 12, 16, (int)(120 * fade)));
                     spr_draw_alpha(sheet_sprites,
                                    boss_sprite_idx(g->current_boss_type),
                                    305.0f + slide_off, 115.0f, 1.6f, 1.6f, fade);
                 }
             }
 
-            /* "VS" center text, pulsing */
+            /* "VS" center text, pulsing, bone-white with black drop shadow */
             C2D_Text vsText;
             gtext_parse(&vsText, textBuf, "VS");
             C2D_TextOptimize(&vsText);
             float pulseScale = 1.1f + sinf((float)g->frame * 0.3f) * 0.12f;
+            C2D_DrawText(&vsText, C2D_WithColor, 187, 101, 0,
+                         pulseScale, pulseScale,
+                         C2D_Color32(0, 0, 0, (int)(200 * fade)));
             C2D_DrawText(&vsText, C2D_WithColor, 186, 100, 0,
                          pulseScale, pulseScale,
-                         C2D_Color32(255, 60, 60, (int)(240 * fade)));
+                         C2D_Color32(238, 228, 206, (int)(240 * fade)));
 
-            /* Boss name: official art, else HUD name text */
+            /* Boss name: official art, else INK text on a torn paper banner */
             if (nidx >= 0 && sheet_boss_splash && g_sprites_loaded) {
                 spr_draw_alpha(sheet_boss_splash, nidx,
                                TOP_SCREEN_WIDTH / 2.0f, 195.0f, 1.0f, 1.0f, fade);
@@ -12641,8 +12842,14 @@ void game_render_top(Game *g, C2D_TextBuf textBuf) {
                 C2D_Text bnText;
                 gtext_parse(&bnText, textBuf, g->boss_name);
                 C2D_TextOptimize(&bnText);
-                C2D_DrawText(&bnText, C2D_WithColor, 160, 186, 0, 0.7f, 0.7f,
-                             C2D_Color32(255, 230, 230, (int)(240 * fade)));
+                float tw = 0.0f, th = 0.0f;
+                C2D_TextGetDimensions(&bnText, 0.6f, 0.6f, &tw, &th);
+                float cx = TOP_SCREEN_WIDTH / 2.0f;
+                draw_paper_panel(cx - tw / 2 - 14, 182, tw + 28, 24,
+                                 (u8)(fade * 255));
+                C2D_DrawText(&bnText, C2D_WithColor, cx - tw / 2,
+                             182 + (24 - th) / 2, 0, 0.6f, 0.6f,
+                             C2D_Color32(55, 43, 33, (int)(255 * fade)));
             }
         }
 
@@ -12738,18 +12945,64 @@ void game_render_top(Game *g, C2D_TextBuf textBuf) {
         render_hud(g, textBuf);
         /* Dim overlay */
         C2D_DrawRectSolid(0, 0, 0, TOP_SCREEN_WIDTH, TOP_SCREEN_HEIGHT,
-                          C2D_Color32(0, 0, 0, 140));
-        /* Paused label */
+                          DIM_BLACK140);
+
+        /* Round 7: pause note — a small paper card over the dimmed game */
+        draw_paper_panel(120, 52, 160, 130, 255);
+
+        /* "PAUSED" centered with a blood scratch under it */
         C2D_Text pausedText;
         gtext_parse(&pausedText, textBuf, "PAUSED");
         C2D_TextOptimize(&pausedText);
-        C2D_DrawText(&pausedText, C2D_WithColor, 145, 95, 0, 1.1f, 1.1f,
-                     C2D_Color32(255, 230, 180, 255));
+        {
+            float pw = 0.0f, ph = 0.0f;
+            C2D_TextGetDimensions(&pausedText, 0.8f, 0.8f, &pw, &ph);
+            C2D_DrawText(&pausedText, C2D_WithColor, 200 - pw / 2, 62, 0,
+                         0.8f, 0.8f, INK);
+            draw_doodle_scratch(200 - pw / 2, 84, 200 + pw / 2, 86, BLOOD);
+        }
+
+        /* Run stats as note lines */
+        {
+            const FloorInfo *fi = get_floor_info(g->current_floor);
+            int psecs = g->play_time_frames / 60;
+            char pline[48];
+            float py = 94.0f;
+            const float ppitch = 14.0f;
+
+            snprintf(pline, sizeof(pline), "%s", fi->name);
+            for (int li = 0; li < 4; li++) {
+                if (li == 1)
+                    snprintf(pline, sizeof(pline), "Kills: %d", g->kills);
+                else if (li == 2)
+                    snprintf(pline, sizeof(pline), "Items: %d",
+                             g->player.item_count);
+                else if (li == 3)
+                    snprintf(pline, sizeof(pline), "Time: %02d:%02d",
+                             psecs / 60, psecs % 60);
+                C2D_Text plt;
+                gtext_parse(&plt, textBuf, pline);
+                C2D_TextOptimize(&plt);
+                C2D_DrawText(&plt, C2D_WithColor, 134, py, 0, 0.4f, 0.4f,
+                             INK_FAINT);
+                py += ppitch;
+            }
+        }
+
+        /* Resume hint at the panel bottom */
         C2D_Text resumeText;
-        gtext_parse(&resumeText, textBuf, "Press START or B to resume");
+        gtext_parse(&resumeText, textBuf, "START or B: Resume");
         C2D_TextOptimize(&resumeText);
-        C2D_DrawText(&resumeText, C2D_WithColor, 95, 130, 0, 0.5f, 0.5f,
-                     C2D_Color32(200, 180, 150, 255));
+        C2D_DrawText(&resumeText, C2D_WithColor, 132, 164, 0, 0.4f, 0.4f,
+                     INK_FAINT);
+
+        /* Tiny dead-eye doodle face, bottom-right of the card */
+        {
+            float fx = 258.0f, fy = 160.0f;
+            C2D_DrawCircleSolid(fx, fy, 0, 5.0f, PAPER_DARK);
+            C2D_DrawRectSolid(fx - 1.8f, fy - 1.0f, 0, 1.2f, 1.5f, INK);
+            C2D_DrawRectSolid(fx + 0.6f, fy - 1.0f, 0, 1.2f, 1.5f, INK);
+        }
         break;
     }
 
@@ -12777,10 +13030,10 @@ void render_minimap(Game *g, C2D_TextBuf textBuf) {
     /* For the main menu / settings / controls screens we draw a matching
        beige parchment bottom screen with subtitle text. */
     if (g->state == STATE_MENU || g->state == STATE_CONTROLS || g->state == STATE_SETTINGS) {
-        /* Parchment background to match top screen */
-        u32 bg_col      = C2D_Color32(228, 213, 192, 255);
-        u32 text_col    = C2D_Color32(50,  35,  25, 255);
-        u32 text_dim    = C2D_Color32(120, 95,  70, 255);
+        /* Parchment background to match top screen (shared palette) */
+        u32 bg_col      = PAPER;
+        u32 text_col    = INK;
+        u32 text_dim    = INK_FAINT;
         u32 doodle_col  = C2D_Color32(160, 140, 120, 200);
         C2D_DrawRectSolid(0, 0, 0, BOT_SCREEN_WIDTH, BOT_SCREEN_HEIGHT, bg_col);
 
@@ -12788,7 +13041,7 @@ void render_minimap(Game *g, C2D_TextBuf textBuf) {
         for (int i = 0; i < 30; i++) {
             float gx = (i * 47) % BOT_SCREEN_WIDTH;
             float gy = (i * 31) % BOT_SCREEN_HEIGHT;
-            C2D_DrawRectSolid(gx, gy, 0, 1, 1, C2D_Color32(205, 188, 165, 120));
+            C2D_DrawRectSolid(gx, gy, 0, 1, 1, C2D_Color32(219, 204, 178, 120));
         }
 
         /* Decorative scratches at edges */
@@ -12839,16 +13092,27 @@ void render_minimap(Game *g, C2D_TextBuf textBuf) {
         return;
     }
 
-    /* In-game / paused etc: dark background for the minimap */
-    u32 bgCol = C2D_Color32(25, 25, 25, 255);
-    C2D_DrawRectSolid(0, 0, 0, BOT_SCREEN_WIDTH, BOT_SCREEN_HEIGHT, bgCol);
+    /* In-game / paused etc: dark background for the minimap. R5: skipped
+       during the floor transition — that branch repaints the whole screen
+       with PAPER anyway, so the dark rect would be a dead draw. */
+    if (g->state != STATE_FLOOR_TRANSITION) {
+        u32 bgCol = C2D_Color32(25, 25, 25, 255);
+        C2D_DrawRectSolid(0, 0, 0, BOT_SCREEN_WIDTH, BOT_SCREEN_HEIGHT, bgCol);
+    }
 
     if (g->state == STATE_FLOOR_TRANSITION) {
+        /* Round 7: paper page instead of the dark panel */
+        C2D_DrawRectSolid(0, 0, 0, BOT_SCREEN_WIDTH, BOT_SCREEN_HEIGHT, PAPER);
+        for (int i = 0; i < 30; i++) {
+            float gx = (i * 47) % BOT_SCREEN_WIDTH;
+            float gy = (i * 31) % BOT_SCREEN_HEIGHT;
+            C2D_DrawRectSolid(gx, gy, 0, 1, 1,
+                              C2D_Color32(219, 204, 178, 120));
+        }
         C2D_Text info;
         gtext_parse(&info, textBuf, "Descending...");
         C2D_TextOptimize(&info);
-        C2D_DrawText(&info, C2D_WithColor, 100, 110, 0, 0.6f, 0.6f,
-                     C2D_Color32(200, 200, 200, 255));
+        C2D_DrawText(&info, C2D_WithColor, 100, 110, 0, 0.6f, 0.6f, INK);
         return;
     }
 
@@ -12865,36 +13129,69 @@ void render_minimap(Game *g, C2D_TextBuf textBuf) {
        Show only a faint, atmospheric notice instead of a placeholder. */
     if (g->active_curse == CURSE_LOST) {
         C2D_Text lost1, lost2;
-        /* faint scrambled overlay */
-        C2D_DrawRectSolid(0, 18, 0, BOT_SCREEN_WIDTH, 222,
-                          C2D_Color32(8, 0, 8, 255));
+        /* Round 7: paper page with a faint empty map frame, INK notice and
+           a blood scribble where the map should be */
+        C2D_DrawRectSolid(0, 0, 0, BOT_SCREEN_WIDTH, BOT_SCREEN_HEIGHT, PAPER);
+        for (int i = 0; i < 30; i++) {
+            float gx = (i * 47) % BOT_SCREEN_WIDTH;
+            float gy = (i * 31) % BOT_SCREEN_HEIGHT;
+            C2D_DrawRectSolid(gx, gy, 0, 1, 1, C2D_Color32(219, 204, 178, 120));
+        }
+        {
+            float fx = (BOT_SCREEN_WIDTH - DUNGEON_W * 18.0f) / 2 - 8;
+            float fy = 22;
+            float fw = DUNGEON_W * 18.0f + 16;
+            float fh = DUNGEON_H * 18.0f + 12;
+            C2D_DrawRectSolid(fx, fy, 0, fw, 1, PAPER_EDGE);
+            C2D_DrawRectSolid(fx, fy + fh - 1, 0, fw, 1, PAPER_EDGE);
+            C2D_DrawRectSolid(fx, fy, 0, 1, fh, PAPER_EDGE);
+            C2D_DrawRectSolid(fx + fw - 1, fy, 0, 1, fh, PAPER_EDGE);
+        }
         gtext_parse(&lost1, textBuf, "Map Hidden");
         C2D_TextOptimize(&lost1);
-        C2D_DrawText(&lost1, C2D_WithColor, 100, 90, 0, 0.7f, 0.7f,
-                     C2D_Color32(120, 30, 30, 220));
+        C2D_DrawText(&lost1, C2D_WithColor, 100, 90, 0, 0.7f, 0.7f, INK);
+        draw_doodle_scratch(80, 45, 245, 115, BLOOD);
+        draw_doodle_scratch(240, 40, 90, 120, BLOOD_DARK);
         gtext_parse(&lost2, textBuf, "(Curse of the Lost)");
         C2D_TextOptimize(&lost2);
-        C2D_DrawText(&lost2, C2D_WithColor, 80, 130, 0, 0.5f, 0.5f,
-                     C2D_Color32(140, 100, 100, 200));
+        C2D_DrawText(&lost2, C2D_WithColor, 80, 130, 0, 0.5f, 0.5f, INK_FAINT);
         return;
     }
 
     /* === Minimap === */
     Dungeon *d = &g->dungeon;
 
-    C2D_Text mapTitle;
-    const FloorInfo *fi = get_floor_info(g->current_floor);
-    char titleBuf[48];
-    snprintf(titleBuf, sizeof(titleBuf), "= %s =", fi->name);
-    gtext_parse(&mapTitle, textBuf, titleBuf);
-    C2D_TextOptimize(&mapTitle);
-    C2D_DrawText(&mapTitle, C2D_WithColor, 105, 3, 0, 0.5f, 0.5f,
-                 C2D_Color32(200, 200, 200, 255));
+    /* Round 7: full paper page — grain + two blotches */
+    C2D_DrawRectSolid(0, 0, 0, BOT_SCREEN_WIDTH, BOT_SCREEN_HEIGHT, PAPER);
+    for (int i = 0; i < 30; i++) {
+        float gx = (i * 47) % BOT_SCREEN_WIDTH;
+        float gy = (i * 31) % BOT_SCREEN_HEIGHT;
+        C2D_DrawRectSolid(gx, gy, 0, 1, 1, C2D_Color32(219, 204, 178, 120));
+    }
+    C2D_DrawEllipseSolid(24, 168, 0, 44, 26, C2D_Color32(219, 204, 178, 30));
+    C2D_DrawEllipseSolid(236, 18, 0, 36, 22, C2D_Color32(219, 204, 178, 30));
 
     float cellW = 18;
     float cellH = 18;
     float mapOffX = (BOT_SCREEN_WIDTH - DUNGEON_W * cellW) / 2;
-    float mapOffY = 20;
+    float mapOffY = 28;
+
+    /* Inner paper panel around the map area */
+    draw_paper_panel(mapOffX - 8, mapOffY - 6, DUNGEON_W * cellW + 16,
+                     DUNGEON_H * cellH + 12, 255);
+
+    /* Floor title: INK with a blood scratch underline (no more '=' signs) */
+    C2D_Text mapTitle;
+    const FloorInfo *fi = get_floor_info(g->current_floor);
+    char titleBuf[48];
+    snprintf(titleBuf, sizeof(titleBuf), "%s", fi->name);
+    gtext_parse(&mapTitle, textBuf, titleBuf);
+    C2D_TextOptimize(&mapTitle);
+    float titleW = 0.0f, titleH = 0.0f;
+    C2D_TextGetDimensions(&mapTitle, 0.5f, 0.5f, &titleW, &titleH);
+    float titleX = (BOT_SCREEN_WIDTH - titleW) / 2;
+    C2D_DrawText(&mapTitle, C2D_WithColor, titleX, 1, 0, 0.5f, 0.5f, INK);
+    draw_doodle_scratch(titleX, 16, titleX + titleW, 17, BLOOD);
 
     for (int ry = 0; ry < DUNGEON_H; ry++) {
         for (int rx = 0; rx < DUNGEON_W; rx++) {
@@ -12918,7 +13215,7 @@ void render_minimap(Game *g, C2D_TextBuf textBuf) {
                 if (rm->type == ROOM_SECRET && !rm->secret_revealed) adjVis = 0;
 
                 if (adjVis) {
-                    u32 dimOutline = C2D_Color32(90, 90, 90, 160);
+                    u32 dimOutline = INK_FAINT;
                     C2D_DrawRectSolid(x + 2, y + 2, 0, cellW - 4, 1, dimOutline);
                     C2D_DrawRectSolid(x + 2, y + cellH - 3, 0, cellW - 4, 1, dimOutline);
                     C2D_DrawRectSolid(x + 2, y + 2, 0, 1, cellH - 4, dimOutline);
@@ -12929,35 +13226,20 @@ void render_minimap(Game *g, C2D_TextBuf textBuf) {
 
             u32 roomCol;
             if (isCurrent) {
-                /* Pulsing bright fill for current room */
+                /* Pulsing bright fill for current room (kept math; biased
+                   warm so it reads bone-white on the paper page) */
                 float pulse = sinf((float)g->frame * 0.12f) * 30.0f;
                 int v = 225 + (int)pulse;
-                roomCol = C2D_Color32(v, v, v, 255);
+                roomCol = C2D_Color32(v, v - 10, v - 30, 255);
             } else {
-                switch (rm->type) {
-                    case ROOM_START:    roomCol = C2D_Color32(100, 200, 100, 255); break;
-                    case ROOM_BOSS:     roomCol = C2D_Color32(150, 40, 40, 255); break;
-                    case ROOM_TREASURE: roomCol = C2D_Color32(150, 125, 20, 255); break;
-                    case ROOM_SHOP:     roomCol = C2D_Color32(60, 100, 150, 255); break;
-                    case ROOM_SECRET:   roomCol = C2D_Color32(110, 110, 110, 255); break;
-                    case ROOM_CURSE:    roomCol = C2D_Color32(110, 40, 110, 255); break;
-                    case ROOM_DEVIL:    roomCol = C2D_Color32(90, 15, 15, 255); break;
-                    case ROOM_ANGEL:    roomCol = C2D_Color32(200, 195, 165, 255); break;
-                    case ROOM_SACRIFICE: roomCol = C2D_Color32(130, 30, 30, 255); break;
-                    case ROOM_BOSSRUSH: roomCol = C2D_Color32(200, 90, 20, 255); break;
-                    case ROOM_ARCADE:   roomCol = C2D_Color32(200, 80, 160, 255); break;
-                    case ROOM_LIBRARY:  roomCol = C2D_Color32(100, 80, 170, 255); break;
-                    default:
-                        roomCol = rm->cleared
-                                ? C2D_Color32(90, 90, 90, 255)
-                                : C2D_Color32(110, 110, 110, 255);
-                        break;
-                }
+                /* Round 7: uniform dark-ink cell — type identity comes from
+                   the marker glyphs below */
+                roomCol = C2D_Color32(64, 52, 40, 235);
             }
 
             /* Square-ish cell: dark outline rect behind, fill inset inside it —
                gives a slightly rounded, tightened-up look versus a flat rect. */
-            u32 outlineCol = isCurrent ? C2D_Color32(255, 255, 255, 255)
+            u32 outlineCol = isCurrent ? C2D_Color32(238, 228, 206, 255)
                                         : C2D_Color32(15, 15, 15, 255);
             C2D_DrawRectSolid(x + 1, y + 1, 0, cellW - 2, cellH - 2, outlineCol);
             C2D_DrawRectSolid(x + 2, y + 2, 0, cellW - 4, cellH - 4, roomCol);
@@ -12967,13 +13249,13 @@ void render_minimap(Game *g, C2D_TextBuf textBuf) {
             float icy = y + cellH / 2;
 
             if (rm->type == ROOM_BOSS && !isCurrent) {
-                /* Red skull-ish marker: multi-rect */
-                C2D_DrawRectSolid(icx - 2, icy - 2, 0, 4, 3, C2D_Color32(255, 80, 80, 255));
-                C2D_DrawRectSolid(icx - 1, icy + 1, 0, 1, 1, C2D_Color32(255, 80, 80, 255));
-                C2D_DrawRectSolid(icx,     icy + 1, 0, 1, 1, C2D_Color32(255, 80, 80, 255));
+                /* Blood skull-ish marker: multi-rect */
+                C2D_DrawRectSolid(icx - 2, icy - 2, 0, 4, 3, BLOOD);
+                C2D_DrawRectSolid(icx - 1, icy + 1, 0, 1, 1, BLOOD);
+                C2D_DrawRectSolid(icx,     icy + 1, 0, 1, 1, BLOOD);
             } else if (rm->type == ROOM_TREASURE && !isCurrent) {
                 /* Gold dot */
-                C2D_DrawCircleSolid(icx, icy, 0, 2.5f, C2D_Color32(255, 215, 0, 255));
+                C2D_DrawCircleSolid(icx, icy, 0, 2.5f, GOLD_CHARGE);
             } else if (rm->type == ROOM_SHOP && !isCurrent) {
                 /* Blue dot */
                 C2D_DrawCircleSolid(icx, icy, 0, 2.5f, C2D_Color32(100, 180, 255, 255));
@@ -12981,11 +13263,11 @@ void render_minimap(Game *g, C2D_TextBuf textBuf) {
                 /* Purple dot */
                 C2D_DrawCircleSolid(icx, icy, 0, 2.5f, C2D_Color32(220, 100, 220, 255));
             } else if (rm->type == ROOM_DEVIL && !isCurrent) {
-                /* Dark red dot */
-                C2D_DrawCircleSolid(icx, icy, 0, 2.5f, C2D_Color32(180, 20, 20, 255));
+                /* Dark blood dot */
+                C2D_DrawCircleSolid(icx, icy, 0, 2.5f, BLOOD_DARK);
             } else if (rm->type == ROOM_ANGEL && !isCurrent) {
-                /* White/gold dot */
-                C2D_DrawCircleSolid(icx, icy, 0, 2.5f, C2D_Color32(255, 250, 210, 255));
+                /* Bone-white dot */
+                C2D_DrawCircleSolid(icx, icy, 0, 2.5f, C2D_Color32(238, 228, 206, 255));
             } else if (rm->type == ROOM_SACRIFICE && !isCurrent) {
                 /* Small red cross marker */
                 C2D_DrawRectSolid(icx - 2, icy, 0, 4, 1, C2D_Color32(230, 60, 60, 255));
@@ -13008,11 +13290,11 @@ void render_minimap(Game *g, C2D_TextBuf textBuf) {
                 C2D_DrawCircleSolid(icx, icy, 0, 1.5f, C2D_Color32(80, 220, 80, 200));
             }
 
-            /* Current room: bright pulsing outline on top of the cell */
+            /* Current room: pulsing bone-white outline on top of the cell */
             if (isCurrent) {
                 float pulse = sinf((float)g->frame * 0.12f) * 0.4f + 0.6f;
                 u8 a = (u8)(pulse * 255);
-                u32 markerCol = C2D_Color32(255, 255, 255, a);
+                u32 markerCol = C2D_Color32(238, 228, 206, a);
                 C2D_DrawRectSolid(x, y, 0, cellW, 1, markerCol);
                 C2D_DrawRectSolid(x, y + cellH - 1, 0, cellW, 1, markerCol);
                 C2D_DrawRectSolid(x, y, 0, 1, cellH, markerCol);
@@ -13020,7 +13302,7 @@ void render_minimap(Game *g, C2D_TextBuf textBuf) {
             }
 
             /* Door connections */
-            u32 connCol = C2D_Color32(80, 80, 80, 255);
+            u32 connCol = INK_FAINT;
             if (rm->doors[0] && ry > 0 && d->rooms[ry - 1][rx].type != ROOM_NONE)
                 C2D_DrawRectSolid(x + cellW / 2 - 2, y - 2, 0, 4, 3, connCol);
             if (rm->doors[1] && ry < DUNGEON_H - 1 && d->rooms[ry + 1][rx].type != ROOM_NONE)
@@ -13032,82 +13314,48 @@ void render_minimap(Game *g, C2D_TextBuf textBuf) {
         }
     }
 
-    /* Player stats section */
+    /* Player stats section — Round 7: 2x2 pip-row grid with tiny doodle
+       icons instead of colored bars */
     float statsY = mapOffY + DUNGEON_H * cellH + 16;
     C2D_Text statsTitle;
     gtext_parse(&statsTitle, textBuf, "STATS");
     C2D_TextOptimize(&statsTitle);
-    C2D_DrawText(&statsTitle, C2D_WithColor, 10, statsY, 0, 0.4f, 0.4f,
-                C2D_Color32(200, 200, 200, 255));
+    C2D_DrawText(&statsTitle, C2D_WithColor, 10, statsY, 0, 0.4f, 0.4f, INK);
 
-    /* Stat bars */
     Player *p = &g->player;
     statsY += 14;
-    float barMaxW = 50.0f;
     float statX = 10;
+    float col2X = 150;
 
-    /* DMG */
-    {
-        C2D_Text lbl;
-        gtext_parse(&lbl, textBuf, "DMG");
-        C2D_TextOptimize(&lbl);
-        C2D_DrawText(&lbl, C2D_WithColor, statX, statsY, 0, 0.35f, 0.35f,
-                    C2D_Color32(255, 100, 100, 255));
-        float pct = p->stats.damage / 5.0f;
-        if (pct > 1) pct = 1;
-        C2D_DrawRectSolid(statX + 28, statsY + 2, 0, barMaxW, 6,
-                         C2D_Color32(60, 60, 60, 255));
-        C2D_DrawRectSolid(statX + 28, statsY + 2, 0, barMaxW * pct, 6,
-                         C2D_Color32(255, 80, 80, 255));
-    }
+    /* DMG: tiny blood heart icon + pips */
+    draw_heart(statX + 3, statsY + 3, 7, BLOOD);
+    draw_stat_pips(textBuf, statX + 10, statsY, "DMG",
+                   (int)(p->stats.damage / 5.0f * 6), 6);
 
-    /* SPD */
-    {
-        C2D_Text lbl;
-        gtext_parse(&lbl, textBuf, "SPD");
-        C2D_TextOptimize(&lbl);
-        C2D_DrawText(&lbl, C2D_WithColor, statX + 90, statsY, 0, 0.35f, 0.35f,
-                    C2D_Color32(100, 255, 100, 255));
-        float pct = p->stats.speed / 4.0f;
-        if (pct > 1) pct = 1;
-        C2D_DrawRectSolid(statX + 118, statsY + 2, 0, barMaxW, 6,
-                         C2D_Color32(60, 60, 60, 255));
-        C2D_DrawRectSolid(statX + 118, statsY + 2, 0, barMaxW * pct, 6,
-                         C2D_Color32(80, 255, 80, 255));
-    }
-
-    /* RATE */
-    {
-        C2D_Text lbl;
-        gtext_parse(&lbl, textBuf, "RATE");
-        C2D_TextOptimize(&lbl);
-        C2D_DrawText(&lbl, C2D_WithColor, statX + 180, statsY, 0, 0.35f, 0.35f,
-                    C2D_Color32(100, 100, 255, 255));
-        float pct = (p->stats.fire_rate + 2.0f) / 6.0f;  /* normalize */
-        if (pct > 1) pct = 1;
-        if (pct < 0) pct = 0;
-        C2D_DrawRectSolid(statX + 212, statsY + 2, 0, barMaxW, 6,
-                         C2D_Color32(60, 60, 60, 255));
-        C2D_DrawRectSolid(statX + 212, statsY + 2, 0, barMaxW * pct, 6,
-                         C2D_Color32(80, 80, 255, 255));
-    }
+    /* SPD: tiny ink triangle + pips */
+    C2D_DrawTriangle(col2X,     statsY + 7, INK,
+                     col2X + 6, statsY + 7, INK,
+                     col2X + 3, statsY + 1, INK, 0);
+    draw_stat_pips(textBuf, col2X + 10, statsY, "SPD",
+                   (int)(p->stats.speed / 4.0f * 6), 6);
 
     statsY += 14;
 
-    /* RANGE */
-    {
-        C2D_Text lbl;
-        gtext_parse(&lbl, textBuf, "RNG");
-        C2D_TextOptimize(&lbl);
-        C2D_DrawText(&lbl, C2D_WithColor, statX, statsY, 0, 0.35f, 0.35f,
-                    C2D_Color32(255, 200, 100, 255));
-        float pct = p->stats.range / 300.0f;
-        if (pct > 1) pct = 1;
-        C2D_DrawRectSolid(statX + 28, statsY + 2, 0, barMaxW, 6,
-                         C2D_Color32(60, 60, 60, 255));
-        C2D_DrawRectSolid(statX + 28, statsY + 2, 0, barMaxW * pct, 6,
-                         C2D_Color32(255, 200, 80, 255));
-    }
+    /* RATE: tiny tear circle + pips */
+    C2D_DrawCircleSolid(statX + 3, statsY + 4, 0, 3.0f,
+                        C2D_Color32(90, 140, 190, 255));
+    draw_stat_pips(textBuf, statX + 10, statsY, "RATE",
+                   (int)((p->stats.fire_rate + 2.0f) / 6.0f * 6), 6);
+
+    /* RNG: tiny ink arrow (shaft + tip) + pips */
+    C2D_DrawRectSolid(col2X - 1, statsY + 3, 0, 7, 2, INK);
+    C2D_DrawTriangle(col2X + 6, statsY + 1, INK,
+                     col2X + 6, statsY + 7, INK,
+                     col2X + 9, statsY + 4, INK, 0);
+    draw_stat_pips(textBuf, col2X + 10, statsY, "RNG",
+                   (int)(p->stats.range / 300.0f * 6), 6);
+
+    statsY += 14;
 
     /* Last item collected */
     if (p->item_count > 0) {
@@ -13118,8 +13366,8 @@ void render_minimap(Game *g, C2D_TextBuf textBuf) {
             snprintf(ibuf, sizeof(ibuf), "Last: %s", last->name);
             gtext_parse(&itemLbl, textBuf, ibuf);
             C2D_TextOptimize(&itemLbl);
-            C2D_DrawText(&itemLbl, C2D_WithColor, statX + 90, statsY, 0, 0.35f, 0.35f,
-                        C2D_Color32(255, 215, 0, 255));
+            C2D_DrawText(&itemLbl, C2D_WithColor, statX, statsY, 0, 0.35f, 0.35f,
+                        INK);
         }
     }
 
@@ -13129,7 +13377,7 @@ void render_minimap(Game *g, C2D_TextBuf textBuf) {
     gtext_parse(&ctrl, textBuf, "ABXY: Shoot | D-Pad: Move | SELECT: Bomb");
     C2D_TextOptimize(&ctrl);
     C2D_DrawText(&ctrl, C2D_WithColor, 15, statsY, 0, 0.35f, 0.35f,
-                 C2D_Color32(100, 100, 100, 255));
+                 C2D_Color32(122, 99, 75, 160));
 }
 
 /* ================================================================
@@ -13368,7 +13616,10 @@ void apply_pill_effect(Game *g, PillEffect e) {
             p->hp = p->stats.max_hp;
             break;
         case PILL_TELEPILLS: {
-            /* Teleport to random room */
+            /* Teleport to random room. B1: detonate any pending black-heart
+               burst here, before cur_x/cur_y move (do_warp_cleanup is only
+               called after the switch). */
+            drain_black_burst(g);
             int tries = 0;
             while (tries < 30) {
                 int rx = randi(0, DUNGEON_W - 1);
@@ -13423,7 +13674,9 @@ void apply_tarot_card(Game *g, TarotCard c) {
     Room *r = current_room(g);
     switch (c) {
         case TAROT_FOOL:
-            /* Teleport back to starting room */
+            /* Teleport back to starting room. B1: pending burst fires in
+               the room being left, before the switch. */
+            drain_black_burst(g);
             g->dungeon.cur_x = g->dungeon.start_x;
             g->dungeon.cur_y = g->dungeon.start_y;
             do_warp_cleanup(g);
@@ -13441,6 +13694,8 @@ void apply_tarot_card(Game *g, TarotCard c) {
             int by = g->dungeon.boss_y;
             if (bx >= 0 && bx < DUNGEON_W && by >= 0 && by < DUNGEON_H &&
                 g->dungeon.rooms[by][bx].type != ROOM_NONE) {
+                /* B1: pending burst fires in the room being left */
+                drain_black_burst(g);
                 g->dungeon.cur_x = bx;
                 g->dungeon.cur_y = by;
                 do_warp_cleanup(g);
