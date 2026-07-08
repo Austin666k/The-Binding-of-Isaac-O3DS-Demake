@@ -1,3 +1,4 @@
 --atlas
+--border edge
 --format rgba8888
-/home/ubuntu/binding_of_isaac_3ds/gfx/menu_logo.png
+menu_logo.png

@@ -56,15 +56,14 @@ typedef enum {
 #define PLAYER_BASE_SPEED  2.2f     /* slightly higher base; Isaac feels quick */
 #define PLAYER_BASE_HP     6        /* 3 full hearts (each heart = 2 hp) */
 #define PLAYER_IFRAMES     60
-#define BASE_TEAR_COOLDOWN 12
 #define PLAYER_MAX_HP_CAP  16       /* max 8 hearts */
 
 /* Isaac-style momentum physics tuning */
 #define PLAYER_ACCEL       0.38f    /* how fast velocity approaches target (lower = more slide) */
 #define PLAYER_FRICTION    0.82f    /* velocity decay when no input (higher = more slide) */
 #define PLAYER_STOP_THRESH 0.08f   /* below this speed, snap to zero */
-#define PLAYER_KB_FORCE    4.5f    /* knockback impulse magnitude when hit */
-#define PLAYER_KB_FRAMES   12      /* frames of lost control during knockback */
+#define PLAYER_KB_FORCE    1.5f    /* flinch impulse magnitude when hit (no input lockout) */
+#define PLAYER_KB_FRAMES   12      /* legacy knockback stun length (no longer applied on hits) */
 #define CIRCLE_PAD_DEADZONE 20     /* center deadzone for analog stick */
 #define CIRCLE_PAD_MAX     155.0f  /* max analog value for normalization */
 
@@ -75,19 +74,23 @@ typedef enum {
 #define TEAR_BASE_RANGE    120.0f
 #define TEAR_GRAVITY       0.15f    /* gravity applied to tear vz per frame */
 #define TEAR_ARC_VEL      -2.0f     /* initial upward velocity (negative = up) */
-#define TEAR_SPREAD        0.12f    /* random spread angle in radians */
-#define TEAR_KNOCKBACK     1.4f     /* knockback impulse magnitude */
+#define TEAR_SPREAD        0.0f     /* random spread angle in radians (Rebirth tears
+                                       are dead accurate; a future item can re-enable) */
+#define TEAR_KNOCKBACK     1.4f     /* knockback impulse magnitude (scaled by tear dmg) */
 
 /* ---------- Enemies ---------- */
 #define MAX_ENEMIES        20       /* increased for death-spawns */
 #define ENEMY_SIZE         10.0f
 #define ENEMY_KB_FRICTION  0.85f    /* knockback decay per frame */
 #define ENEMY_SEPARATION   0.4f     /* separation push strength */
+#define BOSSRUSH_TOTAL_WAVES 6      /* number of boss waves in a Boss Rush room */
 
 /* ---------- Polish ---------- */
 #define SCREEN_SHAKE_MAX   8.0f
 #define BOSS_INTRO_FRAMES  90       /* frames to pause on boss room entry */
 #define PICKUP_FLASH_FRAMES 40
+#define SLIDE_FRAMES       22       /* Rebirth-style room slide transition length */
+#define HURT_FLASH_FRAMES  24       /* red vignette pulse after taking damage */
 
 /* ---------- Boss System ---------- */
 #define MAX_LARRY_SEGMENTS 5        /* Larry Jr. segmented body */
@@ -99,10 +102,10 @@ typedef enum {
 #define GEMINI_TETHER_DIST 50.0f    /* max distance before tether breaks */
 #define FAMINE_CHARGE_SPEED 5.0f    /* horizontal charge velocity */
 #define BOSS_SHOT_SPEED    2.5f     /* boss projectile speed */
-#define BOSS_SHOT_DMG      1        /* boss projectile damage */
+#define BOSS_SHOT_DMG      2        /* boss projectile damage (bosses hit for a full heart) */
 
 /* ---------- Obstacles ---------- */
-#define MAX_OBSTACLES      8
+#define MAX_OBSTACLES      12
 #define OBSTACLE_SIZE      16.0f
 
 /* ---------- Consumable Pickups ---------- */
@@ -118,7 +121,12 @@ typedef enum {
 
 /* ---------- Items ---------- */
 #define MAX_ITEMS_HELD     32       /* max items player can collect */
-#define MAX_ITEM_POOL      40       /* total unique items in the game */
+#define MAX_ITEM_POOL      85       /* total unique items in the game */
+
+/* ---------- Familiars ---------- */
+#define MAX_FAMILIARS      2        /* follower slots (Phase E6) */
+#define FAM_TRAIL_LEN      64       /* player position history ring buffer */
+#define FAM_TRAIL_DELAY    20       /* frames each follower trails behind */
 
 /* ---------- Characters ---------- */
 typedef enum {
@@ -126,6 +134,9 @@ typedef enum {
     CHAR_MAGDALENE,
     CHAR_CAIN,
     CHAR_JUDAS,
+    CHAR_EVE,
+    CHAR_SAMSON,
+    CHAR_BLUE_BABY,
     CHAR_COUNT
 } CharacterType;
 
@@ -141,6 +152,9 @@ typedef enum {
     PILL_LUCK_UP,
     PILL_FULL_HEALTH,
     PILL_TELEPILLS,
+    PILL_BAD_TRIP,            /* lose 1 heart (damage self) */
+    PILL_BOMBS_ARE_KEY,      /* swap bomb and key counts */
+    PILL_EXPLOSIVE_DIARRHEA, /* drop a spread of bombs */
     PILL_EFFECT_COUNT
 } PillEffect;
 
@@ -154,6 +168,10 @@ typedef enum {
     TAROT_LOVERS,           /* spawn two full hearts */
     TAROT_TOWER,            /* spawn 6 troll bombs (damages player too) */
     TAROT_WORLD,            /* full map reveal */
+    TAROT_DEATH,            /* damage all enemies in room heavily */
+    TAROT_STAR,             /* full map reveal + spawn a heart */
+    TAROT_SUN,              /* full heal + full map reveal */
+    TAROT_HANGED_MAN,       /* spawn two soul hearts */
     TAROT_COUNT
 } TarotCard;
 
@@ -166,6 +184,17 @@ typedef enum {
     CHAMP_BLACK      /* 2x HP, splits into 2 enemies on death */
 } ChampionType;
 
+/* ---------- Active bombs ---------- */
+#define MAX_BOMBS 4
+typedef struct {
+    float x, y;      /* placed bomb position */
+    float vx, vy;    /* slide velocity (Dr./Epic Fetus tear-bombs) */
+    int   timer;     /* frames until explosion */
+    int   flash;     /* visual flash counter */
+    int   active;
+    int   is_epic;   /* Epic Fetus bomb: x1.5 blast radius and damage */
+} ActiveBomb;
+
 /* ---------- Creep / hazard tile ---------- */
 #define MAX_CREEP 32
 typedef struct {
@@ -177,12 +206,13 @@ typedef struct {
 } CreepTile;
 
 /* ---------- Floors ---------- */
-#define MAX_FLOORS         7
+#define MAX_FLOORS         8
 
 /* ---------- Game States ---------- */
 typedef enum {
     STATE_MENU,
     STATE_MODE_SELECT,         /* choose Story vs Infinite */
+    STATE_CHALLENGE_SELECT,    /* choose a challenge run */
     STATE_CHARACTER_SELECT,    /* choose playable character */
     STATE_DIFFICULTY_SELECT,   /* choose Easy / Normal / Hard */
     STATE_CONTROLS,
@@ -242,6 +272,16 @@ typedef enum {
     ENEMY_RED_MAW,        /* stationary turret, shoots rapidly in player dir */
     ENEMY_LEAPER,         /* jumps toward player in high arcs */
     ENEMY_VIS,            /* floats, shoots double projectiles */
+    /* --- New enemies (batch: extra variety) --- */
+    ENEMY_TRITE,          /* fast leaping spider - quick, low arc */
+    ENEMY_FATTY,          /* slow tanky gaper - ~2x HP, sluggish */
+    ENEMY_CHARGER,        /* pacer variant that charges straight when aligned */
+    /* --- New enemies (batch: more variety) --- */
+    ENEMY_KEEPER,         /* moves erratically, drops coins on death */
+    ENEMY_SUCKER,         /* floats and shoots like a Vis but weaker */
+    /* --- New enemies (batch: more enemies + boss) --- */
+    ENEMY_ROUND_WORM,     /* burrows underground, emerges near player to attack */
+    ENEMY_SPITTY,         /* stationary, periodically spits projectiles */
     /* --- Bosses --- */
     ENEMY_BOSS_DUKE,      /* Duke of Flies - spawns flies */
     ENEMY_BOSS_MONSTRO,   /* Monstro - jumps and shoots */
@@ -254,10 +294,22 @@ typedef enum {
     ENEMY_BOSS_PIN,       /* Pin - worm boss, burrows and emerges */
     ENEMY_BOSS_HAUNT,     /* The Haunt - ghost boss with 2 phases */
     ENEMY_BOSS_WIDOW,     /* Widow - spider boss, jumps and spawns spiders */
-    ENEMY_BOSS_MEGA_SATAN,/* Mega Satan - Sheol final boss */
+    ENEMY_BOSS_GISH,      /* Gish - jumps + shoots like Monstro, leaves creep on landing */
+    ENEMY_BOSS_LOKI,      /* Loki - blinks/teleports and fires 4-way then 8-way spreads */
+    /* --- Batch: more bosses for under-served tiers --- */
+    ENEMY_BOSS_STEVEN,    /* Steven - Basement twin-head, Gemini-lite */
+    ENEMY_BOSS_CHUB,      /* Chub - Caves segmented boss, fatter Larry */
+    ENEMY_BOSS_FISTULA,   /* Fistula - Depths boss, splits into smaller balls on hit */
+    ENEMY_BOSS_SCOLEX,    /* Scolex - Womb segmented worm boss, burrows and emerges */
+    ENEMY_BOSS_MEGA_SATAN,/* Mega Satan - The Chest fixed final boss */
+    /* --- Round 6 (Phase E) story-arc fixed bosses --- */
+    ENEMY_BOSS_MOM,       /* Mom - fixed Depths boss (stomping foot + door hands) */
+    ENEMY_BOSS_MOMS_HEART,/* Mom's Heart - fixed Womb boss (stationary + waves) */
+    ENEMY_BOSS_SATAN,     /* Satan - fixed Sheol boss, 3 phases */
     /* --- Phase 2 minor enemies (boss minions) --- */
     ENEMY_EYE,            /* Peep's detached eyes */
     ENEMY_LIL_HAUNT,      /* Haunt's minions */
+    ENEMY_FISTULA_BALL,   /* Fistula's split-off balls */
 } EnemyType;
 
 /* ---------- Enemy Projectile (for clotty blood shots) ---------- */
@@ -280,7 +332,13 @@ typedef enum {
     ROOM_TRAPDOOR,    /* appears after boss is defeated */
     ROOM_SHOP,        /* buy items with coins */
     ROOM_SECRET,      /* hidden room revealed by bombing adjacent wall */
-    ROOM_CURSE        /* costs 1 heart to enter, contains good loot */
+    ROOM_CURSE,       /* costs 1 heart to enter, contains good loot */
+    ROOM_DEVIL,       /* devil deal: items bought with heart containers */
+    ROOM_ANGEL,       /* free item pedestal + soul hearts, no enemies */
+    ROOM_SACRIFICE,   /* central spikes; hitting them repeatedly grants a reward */
+    ROOM_BOSSRUSH,    /* gauntlet of boss waves; clears + rewards after final wave */
+    ROOM_ARCADE,      /* slot machine: pay a coin, roll a reward */
+    ROOM_LIBRARY      /* 1-2 free item pedestals biased toward active items */
 } RoomType;
 
 /* ---------- Consumable Types ---------- */
@@ -292,8 +350,33 @@ typedef enum {
     PICKUP_BOMB2,     /* double bomb pickup */
     PICKUP_PILL,      /* pill (single-use, scrambled color) */
     PICKUP_CARD,      /* tarot card (single-use) */
+    PICKUP_CHEST,     /* wooden chest: opens into a small loot burst */
+    PICKUP_CHEST_GOLD,/* gold chest: costs a key, better loot */
+    PICKUP_TRINKET,   /* trinket (sub_type = TrinketType); swaps with held */
+    PICKUP_KEY5,      /* 5-key pickup (charged key ring) */
+    PICKUP_BATTERY,   /* refills active item charge to full */
     PICKUP_TYPE_COUNT
 } PickupType;
+
+/* ---------- Trinkets (one held at a time, passive while held) ---------- */
+typedef enum {
+    TRINKET_NONE = 0,
+    TRINKET_SWALLOWED_PENNY,  /* drop a coin when you take damage */
+    TRINKET_PETRIFIED_POOP,   /* poop drops pickups far more often */
+    TRINKET_CHILDS_HEART,     /* higher heart drop chance from kills */
+    TRINKET_RUSTED_KEY,       /* higher key drop chance from kills */
+    TRINKET_MATCH_STICK,      /* higher bomb drop chance from kills */
+    TRINKET_LUCKY_TOE,        /* +1 luck */
+    TRINKET_CRACKED_CROWN,    /* +0.3 damage */
+    TRINKET_CANCER,           /* +0.5 tears (fire rate) */
+    TRINKET_TICK,             /* +0.4 damage */
+    TRINKET_BROKEN_MAGNET,    /* higher coin drop chance from kills */
+    TRINKET_UMBILICAL_CORD,   /* +1 max HP */
+    TRINKET_CURVED_HORN,      /* +0.4 damage */
+    TRINKET_COUNT
+} TrinketType;
+
+const char *trinket_name(int t);
 
 /* ---------- Consumable Pickup ---------- */
 typedef struct {
@@ -343,6 +426,42 @@ typedef enum {
     ITEM_YUM_HEART,       /* Magdalene starter: spawn heart on use */
     ITEM_LUCKY_FOOT,      /* Cain starter: +1 luck */
     ITEM_BOOK_OF_BELIAL,  /* Judas starter: +1.5 dmg this room on use */
+    /* New expansion items (Phase 3) — passive stat/flag items */
+    ITEM_CRICKETS_HEAD,   /* +1.0 damage */
+    ITEM_ODD_MUSHROOM,    /* +0.3 dmg, +0.1 spd, +0.3 fire */
+    ITEM_ROID_RAGE,       /* +0.6 speed */
+    ITEM_MARKED,          /* +0.5 fire, +0.1 dmg */
+    ITEM_ANEMIC,          /* piercing + range */
+    ITEM_CAT_O_NINE,      /* +0.5 damage */
+    ITEM_LORD_OF_PIT,     /* +0.3 spd, +0.2 dmg */
+    ITEM_TOUGH_LOVE,      /* +0.3 dmg, +0.3 fire */
+    ITEM_SYNTHOIL,        /* +0.4 dmg, +0.5 range */
+    ITEM_DEAD_EYE,        /* +0.6 damage */
+    ITEM_THE_POOP,        /* active: spawn a poop obstacle in front of player */
+    /* New expansion items (Phase 5) — passive stat/flag items */
+    ITEM_SACRED_ORB,      /* +0.8 dmg, +0.3 range (Sacred Orb-ish) */
+    ITEM_DEATHS_TOUCH,    /* piercing + big damage (Death's Touch) */
+    ITEM_MUTANT_SPIDER,   /* +1.2 fire rate, -0.3 dmg (Mutant Spider-ish) */
+    ITEM_TAMMYS_HEAD,     /* +0.7 dmg, +0.5 range, -0.5 fire (Tammy's Head-ish) */
+    ITEM_A_PONY,          /* +0.5 speed (A Pony) */
+    ITEM_CRICKETS_BODY,   /* +0.5 dmg, +1.0 range (Cricket's Body-ish) */
+    ITEM_SACRIFICIAL_DAGGER, /* +0.8 dmg, spectral (Sacrificial Dagger-ish) */
+    ITEM_IPECAC_LITE,     /* explosive tears, smaller than Ipecac (Ipecac-lite) */
+    ITEM_MAGIC_FINGERS,   /* +0.4 dmg, +0.3 fire (Magic Fingers-ish) */
+    ITEM_STEVEN,          /* homing + piercing, +0.2 dmg (Steven-ish) */
+    /* --- Round 6 (Phase E) items --- */
+    ITEM_THE_PACT,        /* +0.5 dmg, +0.7 fire rate (devil-pool biased) */
+    ITEM_NECRONOMICON,    /* active: 40 dmg to whole room, 4-room charge */
+    ITEM_TELEPORT,        /* active: random warp, 2-room charge */
+    ITEM_DECK_OF_CARDS,   /* active: spawn a tarot card, 6-room charge */
+    ITEM_BIBLE,           /* active: kills Mom/Mom's Heart; Satan kills YOU */
+    ITEM_20_20,           /* double shot */
+    ITEM_TORN_PHOTO,      /* +0.7 fire rate */
+    ITEM_BLUE_CAP,        /* +0.7 fire rate, +2 max HP */
+    ITEM_SQUEEZY,         /* +0.4 fire rate, +2 soul hearts on pickup */
+    ITEM_BROTHER_BOBBY,   /* familiar: plain tears in aim direction */
+    ITEM_GHOST_BABY,      /* familiar: spectral tears in aim direction */
+    ITEM_DEMON_BABY,      /* familiar: auto-aims the nearest enemy */
     ITEM_COUNT
 } ItemType;
 
@@ -366,6 +485,8 @@ typedef struct {
 #define ITEM_FLAG_EXPLOSIVE    (1 << 8)   /* Ipecac: explosive tears */
 #define ITEM_FLAG_MANTLE       (1 << 9)   /* Holy Mantle: absorb one hit */
 #define ITEM_FLAG_FIRE_IMMUNE  (1 << 10)  /* Pyromaniac: immune+heal from blasts */
+#define ITEM_FLAG_ACTIVE       (1 << 11)  /* Active item: usable with charge bar (KEY_X) */
+#define ITEM_FLAG_DOUBLE       (1 << 12)  /* 20/20: two parallel tears */
 
 /* ---------- Item Definition ---------- */
 typedef struct {
@@ -396,6 +517,7 @@ typedef struct {
     int   piercing;
     int   spectral;
     int   homing;
+    int   explosive;     /* Ipecac: detonate on any impact (enemy/wall/landing) */
     float dmg;           /* damage this tear deals */
     float z;             /* vertical offset (for arc rendering) */
     float vz;            /* vertical velocity */
@@ -431,8 +553,8 @@ typedef struct {
 typedef struct {
     float     x, y;
     float     dx, dy;
-    int       hp;
-    int       max_hp;    /* for boss HP bar */
+    float     hp;        /* float so fractional tear damage counts */
+    float     max_hp;    /* for boss HP bar */
     int       active;
     int       timer;
     int       flash;
@@ -467,12 +589,24 @@ typedef struct {
     ChampionType champion;      /* CHAMP_NONE if not a champion */
     int       creep_drop_timer; /* yellow champion: drops creep periodically */
     int       split_pending;    /* black champion: deferred split on death */
+    int       spawn_grace;      /* frames of no contact damage after a
+                                   mid-combat dynamic spawn (splits, waves);
+                                   zero-init covers normal room spawns */
 } Enemy;
 
-/* ---------- Obstacle (rocks/pots) ---------- */
+/* ---------- Obstacle (rocks / poop / spikes) ---------- */
+typedef enum {
+    OBST_ROCK = 0,
+    OBST_POOP,        /* destructible by tears; may drop a pickup */
+    OBST_SPIKES,      /* blocks nothing; damages the player on contact */
+    OBST_SLOT_MACHINE /* Arcade room: pay a coin, roll a reward */
+} ObstacleType;
+
 typedef struct {
     float x, y;
     int   active;
+    int   type;       /* ObstacleType */
+    int   hp;         /* poop: tear hits remaining (3 -> gone) */
 } Obstacle;
 
 /* ---------- Player Stats ---------- */
@@ -513,6 +647,10 @@ typedef struct {
     PillEffect held_pill;
     int       has_card;
     TarotCard held_card;
+    /* Held trinket (TRINKET_NONE = none) */
+    int       trinket;
+    /* Active challenge id (0 = normal run), mirrored from Game for recalc */
+    int       challenge;
     /* Character + special states */
     CharacterType character;
     int   lives;            /* extra lives from Dead Cat etc. */
@@ -522,13 +660,33 @@ typedef struct {
     int   yum_heart_cd;
     /* Soul hearts */
     int   soul_hp;          /* extra "soul" HP (consumed before red HP) */
+    /* Black hearts (Phase E5): absorbed BEFORE soul hearts; each depleted
+       black heart (2 units) deals 40 damage to every enemy in the room */
+    int   black_hp;
+    /* Familiar slots (Phase E6): item ids, ITEM_NONE = empty */
+    ItemType familiar[MAX_FAMILIARS];
     /* Persistent pill stat bonuses (applied during recalc_player_stats) */
     float pill_speed_bonus;
     float pill_fire_rate_bonus;
     float pill_range_bonus;
     float pill_luck_bonus;
     int   pill_max_hp_bonus;
+    /* Active item system (charge-based, KEY_X to use) */
+    ItemType active_item;      /* ITEM_NONE = no active item held */
+    int   active_charge;       /* current charge */
+    int   active_max_charge;   /* charge required to use */
 } Player;
+
+/* ---------- Blood Decal (permanent floor stain, persists per room) ---------- */
+#define MAX_BLOOD_DECALS 24
+
+typedef struct {
+    float x, y;
+    float scale;
+    float rotation;
+    int   sprite_idx;    /* index into bullet atlas (blood_splat_*) */
+    int   active;
+} BloodDecal;
 
 /* ---------- Heart Pickup ---------- */
 #define MAX_HEART_PICKUPS 16
@@ -536,7 +694,9 @@ typedef struct {
 typedef enum {
     HEART_RED_FULL = 0,   /* heals 2 HP */
     HEART_RED_HALF,       /* heals 1 HP */
-    HEART_SOUL            /* adds 2 soul hearts (TODO: implement soul hearts) */
+    HEART_SOUL,           /* adds 2 soul-heart units (consumed before red HP) */
+    HEART_BLACK           /* adds 2 black-heart units; absorbed BEFORE soul
+                             hearts; depleting one damages the whole room */
 } HeartType;
 
 typedef struct {
@@ -572,6 +732,21 @@ typedef struct {
     ShopItem shop_items[MAX_SHOP_ITEMS];
     /* Secret room state */
     int      secret_revealed; /* 1 if adjacent wall was bombed to reveal this room */
+    /* Permanent blood stains (gore persists between room visits) */
+    int        decal_next;    /* ring-buffer write cursor */
+    BloodDecal decals[MAX_BLOOD_DECALS];
+    /* Sacrifice room: counts player spike hits toward the reward */
+    int      sacrifice_hits;
+    int      sacrifice_rewarded;
+    /* Secret room upgraded into a paid "black market" (shop_items/shop_count
+       reused, purchase code extended to accept this flag alongside ROOM_SHOP) */
+    int      is_black_market;
+    /* Arcade room: slot machine obstacle (reuses obstacles[]); tracks whether
+       it has been paid-for/used this visit so it can't be spammed for free. */
+    int      arcade_slot_used;
+    /* Phase E2: Mom's Heart kill spawns a "beam of light" end-run object
+       next to the trapdoor; touching it wins the run with Ending 1. */
+    int      has_ending_beam;
 } Room;
 
 /* ---------- Dungeon / Floor ---------- */
@@ -584,7 +759,7 @@ typedef struct {
 } Dungeon;
 
 /* ---------- Boss Pool System ---------- */
-#define MAX_BOSS_POOL     6        /* max bosses in any floor's pool */
+#define MAX_BOSS_POOL     8        /* max bosses in any floor's pool */
 #define BOSS_POOL_TIERS   5        /* number of difficulty tiers */
 #define BOSS_HISTORY_SIZE 2        /* how many recent bosses to avoid repeating */
 
@@ -594,7 +769,7 @@ typedef enum {
     BOSS_TIER_CAVES    = 1,   /* Floors 2-3: Caves I & II */
     BOSS_TIER_DEPTHS   = 2,   /* Floor 4:    Depths */
     BOSS_TIER_WOMB     = 3,   /* Floor 5:    Womb (fleshy red) */
-    BOSS_TIER_SHEOL    = 4    /* Floor 6:    Sheol (final, dark) */
+    BOSS_TIER_SHEOL    = 4    /* Floors 6-7: Sheol / The Chest (final, dark) */
 } BossTier;
 
 /* ---------- Curses ---------- */
@@ -603,6 +778,9 @@ typedef enum {
     CURSE_DARKNESS,    /* dark vignette across screen */
     CURSE_LOST,        /* minimap hidden all floor */
     CURSE_BLIND,       /* item pedestals show ? icon */
+    CURSE_UNKNOWN,     /* heart row hidden in HUD */
+    CURSE_MAZE,        /* room transitions may misdirect */
+    CURSE_LABYRINTH,   /* bigger floor layouts */
     CURSE_COUNT
 } CurseType;
 
@@ -645,12 +823,27 @@ typedef struct {
     int        boss_active;      /* 1 if a boss is alive in the current room */
     const char *boss_name;       /* name of current boss for HUD display */
     int        boss_death_anim;  /* timer for boss death explosion effect */
+    float      boss_death_x;     /* where the boss died (death anim anchor) */
+    float      boss_death_y;
     EnemyType  boss_history[BOSS_HISTORY_SIZE]; /* recently fought bosses */
     int        boss_history_count; /* how many entries in history (0 to BOSS_HISTORY_SIZE) */
     EnemyType  current_boss_type; /* which boss was selected for this floor */
     int        pickup_flash;     /* flash timer for item pickup */
     ItemType   last_pickup;      /* last item picked up (for flash text) */
     int        room_fade;        /* fade-in counter on room enter */
+    /* Rebirth-style sliding room transition */
+    int        slide_timer;      /* >0 = camera pan between rooms in progress */
+    Direction  slide_dir;        /* direction of travel for the slide */
+    int        slide_from_x, slide_from_y; /* grid coords of the room being left */
+    /* Red vignette pulse when the player takes damage */
+    int        hurt_flash_timer;
+    /* Devil deal: set when the player loses red HP this floor (blocks deal) */
+    int        floor_red_dmg;
+    /* Challenge runs (0 = normal; see CHAL_* in main.c) */
+    int        challenge;
+    int        chal_sel;         /* selection on challenge select screen */
+    /* Floor-intro nameplate timer (Rebirth-style floor title on entry) */
+    int        floor_intro_timer;
     /* AAA Menu animation state */
     int        menu_timer;       /* animation timer for menu effects */
     float      particle_x[20];   /* floating particle positions */
@@ -660,10 +853,8 @@ typedef struct {
     int        particles_init;   /* 1 if particles have been initialized */
     /* Blood splatter particles */
     BloodParticle blood[MAX_BLOOD_PARTICLES];
-    /* Active bomb */
-    float bomb_x, bomb_y;    /* placed bomb position */
-    int   bomb_timer;        /* frames until explosion (0 = no bomb) */
-    int   bomb_flash;        /* visual flash counter */
+    /* Active bombs (small pool: player-placed + troll bombs) */
+    ActiveBomb bombs[MAX_BOMBS];
     /* Shop feedback */
     int   shop_deny_timer;   /* cooldown timer for "can't afford" feedback */
     /* Settings menu state */
@@ -689,6 +880,15 @@ typedef struct {
     int   laser_active;
     float laser_dx, laser_dy;
     int   laser_timer;
+    int   laser_charge;       /* Brimstone: frames of fire held (fires at 15) */
+    int   laser_is_tech;      /* 1 = Technology thin beam, 0 = Brimstone */
+    float laser_ex, laser_ey; /* computed beam endpoint (Spoon Bender bend) */
+    /* Mom's Knife single entity (0 = held, 1 = thrown, 2 = returning) */
+    int   knife_state;
+    float knife_x, knife_y;
+    float knife_dx, knife_dy; /* unit flight direction */
+    float knife_dist;         /* distance traveled while thrown */
+    int   knife_hit_cd;       /* frames until the knife can damage again */
     /* Map reveal flag (World card) */
     int   map_revealed;
     /* Magician card homing remaining frames */
@@ -700,6 +900,30 @@ typedef struct {
     int   unlocks_scroll;        /* unlocks screen scroll position */
     /* Phase 2 boss tracking for unlocks */
     int   characters_completed_run; /* runtime bitmask of chars who beat a run */
+    /* Game-feel: hitstop freeze frames (skips sim updates while > 0) */
+    int   hitstop;
+    /* Boss Rush room wave state */
+    int   bossrush_active;       /* 1 while the wave machine is running in this room */
+    int   bossrush_wave;         /* current wave number (0-based) */
+    int   bossrush_spawn_timer;  /* frames until next wave spawns (grace period) */
+    /* Enemy Brimstone beam (Phase E3 - Satan). Kept fully separate from the
+       player's laser_* fields. 0 = off, 1 = telegraph (thin red line, 30f),
+       2 = firing (thick beam, 10f, damages the player on line overlap). */
+    int   ebeam_state;
+    int   ebeam_timer;
+    float ebeam_x, ebeam_y;      /* beam origin (boss muzzle) */
+    float ebeam_dx, ebeam_dy;    /* unit aim direction (frozen at telegraph) */
+    float ebeam_ex, ebeam_ey;    /* wall-clipped endpoint */
+    /* Familiar system (Phase E6): player position history ring buffer the
+       followers trail behind, plus per-slot fire cooldowns. Static sizes,
+       zero-state valid (head 0 / cds 0; trail refilled on room entry). */
+    float fam_hist_x[FAM_TRAIL_LEN];
+    float fam_hist_y[FAM_TRAIL_LEN];
+    int   fam_hist_head;
+    int   fam_cd[MAX_FAMILIARS];
+    /* Phase E2: which ending the win screen shows (0 = full escape,
+       1 = "Ending 1" chosen at the Mom's Heart light beam) */
+    int   win_ending;
 } Game;
 
 /* ---------- Function Declarations ---------- */
@@ -732,6 +956,7 @@ void trigger_shake(Game *g, float intensity, int frames);
 void game_render_top(Game *g, C2D_TextBuf textBuf);
 void render_menu(Game *g, C2D_TextBuf textBuf);
 void render_mode_select(Game *g, C2D_TextBuf textBuf);
+void render_challenge_select(Game *g, C2D_TextBuf textBuf);
 void render_character_select(Game *g, C2D_TextBuf textBuf);
 void render_difficulty_select(Game *g, C2D_TextBuf textBuf);
 void render_controls(C2D_TextBuf textBuf);

@@ -1,0 +1,13 @@
+--atlas
+--border edge
+--format rgba8888
+../gfx_clean/resized/boss_splash/portrait_gemini.png
+../gfx_clean/resized/boss_splash/portrait_larry.png
+../gfx_clean/resized/boss_splash/portrait_famine.png
+../gfx_clean/resized/boss_splash/portrait_peep.png
+../gfx_clean/resized/boss_splash/portrait_gurdy.png
+../gfx_clean/resized/boss_splash/name_gemini.png
+../gfx_clean/resized/boss_splash/name_larry.png
+../gfx_clean/resized/boss_splash/name_famine.png
+../gfx_clean/resized/boss_splash/name_peep.png
+../gfx_clean/resized/boss_splash/name_gurdy.png

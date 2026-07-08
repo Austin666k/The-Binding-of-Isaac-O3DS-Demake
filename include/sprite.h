@@ -10,6 +10,7 @@
 #include "environment_atlas.h"
 #include "ui_items_atlas.h"
 #include "menu_text_atlas.h"
+#include "boss_splash_atlas.h"
 
 /* ---- Sprite Atlas Handles ---- */
 extern C2D_SpriteSheet sheet_sprites;     /* entities: player, enemies, bosses, projectiles */
@@ -19,6 +20,7 @@ extern C2D_SpriteSheet sheet_menu_logo;   /* menu logo image */
 extern C2D_SpriteSheet sheet_menu_text;   /* hand-drawn menu option text sprites */
 extern C2D_SpriteSheet sheet_bullets;     /* tears, blood splatters, impacts */
 extern C2D_SpriteSheet sheet_enemies;    /* clotty, pacer animated sprites */
+extern C2D_SpriteSheet sheet_boss_splash; /* boss intro portraits + name art */
 
 /* ---- Lifecycle ---- */
 int  sprites_init(void);   /* Load all sprite sheets; returns 0 on success */

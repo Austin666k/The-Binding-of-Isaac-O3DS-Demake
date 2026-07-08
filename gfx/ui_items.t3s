@@ -1,4 +1,5 @@
 --atlas
+--border edge
 --format rgba8888
 ../gfx_clean/resized/ui_hearts/heart_red_full.png
 ../gfx_clean/resized/ui_hearts/heart_red_half.png

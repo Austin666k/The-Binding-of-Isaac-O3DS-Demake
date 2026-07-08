@@ -41,3 +41,9 @@
 #define environment_atlas_env_door_shop_bottom_idx 37
 #define environment_atlas_env_door_shop_left_idx 38
 #define environment_atlas_env_door_shop_right_idx 39
+#define environment_atlas_env_poop_1_idx 40
+#define environment_atlas_env_poop_2_idx 41
+#define environment_atlas_env_poop_3_idx 42
+#define environment_atlas_env_spikes_idx 43
+#define environment_atlas_env_chest_wood_idx 44
+#define environment_atlas_env_chest_gold_idx 45

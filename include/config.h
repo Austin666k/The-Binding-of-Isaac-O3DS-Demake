@@ -14,11 +14,12 @@ typedef struct {
     float sfx_volume;       /* 0.0 - 1.0 */
     float music_volume;     /* 0.0 - 1.0 */
     /* Unlocks / Achievements (Phase 2) */
-    int unlocked_chars;          /* bitmask: bit 0=Isaac, 1=Magdalene, 2=Cain, 3=Judas */
+    int unlocked_chars;          /* bitmask: bit 0=Isaac, 1=Magdalene, 2=Cain, 3=Judas,
+                                     4=Eve, 5=Samson, 6=Blue Baby (???) */
     int total_wins;              /* total runs completed successfully */
     int bosses_defeated;         /* bitmask of bosses defeated (by enum index) */
     int characters_completed;    /* bitmask of characters who beat a run */
-    int floors_reached;          /* deepest floor index ever reached (0-6) */
+    int floors_reached;          /* deepest floor index ever reached (0-7) */
     int total_runs_started;      /* total number of runs ever started */
 } GameConfig;
 

@@ -29,9 +29,41 @@
 /* Global flag: 1 if sprites loaded successfully, 0 = fallback to procedural */
 static int g_sprites_loaded = 0;
 
+/* Optional custom bitmap font. NULL = use citro2d's built-in system font
+ * (the original, always-working behavior). Loaded (best-effort) in main();
+ * if loading fails for any reason it simply stays NULL and every text call
+ * silently keeps using the default font — text can never disappear. */
+static C2D_Font g_font = NULL;
+
+/* Route text through g_font when available, else fall back to the default
+ * system font exactly like the original C2D_TextParse call did. Safe to
+ * call even if g_font is NULL (that's the normal/original code path). */
+static inline void gtext_parse(C2D_Text *t, C2D_TextBuf b, const char *s) {
+    if (g_font) {
+        C2D_TextFontParse(t, g_font, b, s);
+    } else {
+        C2D_TextParse(t, b, s);
+    }
+}
+
+/* Curse of the Labyrinth: set by roll_curse() before dungeon_generate() runs
+ * (call order was adjusted so the curse for the upcoming floor is known
+ * ahead of generation) so dungeon_generate can enlarge the room target
+ * without needing a signature change. */
+static int g_curse_labyrinth_pending = 0;
+
 /* Early forward declarations needed before definitions appear later */
 static int is_boss_type(EnemyType t);
 static void spawn_heart(Room *r, float x, float y, HeartType type);
+static void spawn_tear_pop(Game *g, float x, float y, int is_blood);
+/* Familiar system (Phase E6) */
+static void familiars_reset_trail(Game *g);
+static void familiar_pos(Game *g, int slot, float *fx, float *fy);
+/* Warp path (E7 Teleport! uses it from the active-item switch) */
+static void do_warp_cleanup(Game *g);
+/* Parameterized explosion core (bombs, Epic Fetus, Ipecac tears) */
+static void bomb_explode_ex(Game *g, float bx, float by, float blast,
+                            float enemy_dmg, float boss_dmg, int player_dmg);
 
 /* Global config (loaded from SD card on startup) */
 static GameConfig g_config;
@@ -55,11 +87,145 @@ float randf(float lo, float hi) {
     return lo + ((float)rand() / (float)RAND_MAX) * (hi - lo);
 }
 
+/* Luck-driven boolean roll: base_pct improved by luck_weight per point of
+ * p->stats.luck, clamped to [0,95] so nothing is ever guaranteed. */
+static int luck_roll(Game *g, int base_pct, int luck_weight) {
+    int pct = base_pct + (int)(luck_weight * g->player.stats.luck);
+    if (pct < 0) pct = 0;
+    if (pct > 95) pct = 95;
+    return randi(0, 99) < pct;
+}
+
 /* ================================================================
  * Item definitions
  * ================================================================ */
 
 static ItemDef item_pool[ITEM_COUNT];
+
+/* ================================================================
+ * Trinkets — one held at a time, passive effect while held
+ * ================================================================ */
+
+const char *trinket_name(int t) {
+    switch (t) {
+    case TRINKET_SWALLOWED_PENNY: return "Swallowed Penny";
+    case TRINKET_PETRIFIED_POOP:  return "Petrified Poop";
+    case TRINKET_CHILDS_HEART:    return "Child's Heart";
+    case TRINKET_RUSTED_KEY:      return "Rusted Key";
+    case TRINKET_MATCH_STICK:     return "Match Stick";
+    case TRINKET_LUCKY_TOE:       return "Lucky Toe";
+    case TRINKET_CRACKED_CROWN:   return "Cracked Crown";
+    case TRINKET_CANCER:          return "Cancer";
+    case TRINKET_TICK:            return "Tick";
+    case TRINKET_BROKEN_MAGNET:   return "Broken Magnet";
+    case TRINKET_UMBILICAL_CORD:  return "Umbilical Cord";
+    case TRINKET_CURVED_HORN:     return "Curved Horn";
+    default:                      return "???";
+    }
+}
+
+/* Spawn a trinket pickup on the floor */
+static void spawn_trinket_pickup(Room *r, float x, float y, int trinket) {
+    for (int i = 0; i < MAX_CONSUMABLE_PICKUPS; i++) {
+        if (!r->consumables[i].active) {
+            ConsumablePickup *c = &r->consumables[i];
+            c->x = clampf(x, ROOM_LEFT + 12, ROOM_RIGHT - 12);
+            c->y = clampf(y, ROOM_TOP + 12, ROOM_BOTTOM - 12);
+            c->type = PICKUP_TRINKET;
+            c->sub_type = trinket;
+            c->active = 1;
+            c->anim_timer = 0;
+            r->consumable_count++;
+            return;
+        }
+    }
+}
+
+/* Tiny procedural charm glyph per trinket (world pickup + HUD slot) */
+static void draw_trinket_icon(float x, float y, int t, float sc) {
+    switch (t) {
+    case TRINKET_SWALLOWED_PENNY:
+        C2D_DrawCircleSolid(x, y, 0, 5 * sc, C2D_Color32(210, 170, 60, 255));
+        C2D_DrawRectSolid(x - 2 * sc, y - 1 * sc, 0, 4 * sc, 2 * sc,
+                          C2D_Color32(120, 90, 25, 255));
+        break;
+    case TRINKET_PETRIFIED_POOP:
+        C2D_DrawEllipseSolid(x - 5 * sc, y - 1 * sc, 0, 10 * sc, 5 * sc,
+                             C2D_Color32(130, 130, 135, 255));
+        C2D_DrawEllipseSolid(x - 3 * sc, y - 5 * sc, 0, 6 * sc, 4 * sc,
+                             C2D_Color32(160, 160, 165, 255));
+        break;
+    case TRINKET_CHILDS_HEART:
+        C2D_DrawCircleSolid(x - 2 * sc, y - 2 * sc, 0, 3 * sc,
+                            C2D_Color32(230, 110, 150, 255));
+        C2D_DrawCircleSolid(x + 2 * sc, y - 2 * sc, 0, 3 * sc,
+                            C2D_Color32(230, 110, 150, 255));
+        C2D_DrawRectSolid(x - 4 * sc, y - 1 * sc, 0, 8 * sc, 5 * sc,
+                          C2D_Color32(230, 110, 150, 255));
+        break;
+    case TRINKET_RUSTED_KEY:
+        C2D_DrawCircleSolid(x, y - 3 * sc, 0, 3 * sc, C2D_Color32(170, 110, 50, 255));
+        C2D_DrawCircleSolid(x, y - 3 * sc, 0, 1.5f * sc, C2D_Color32(60, 40, 20, 255));
+        C2D_DrawRectSolid(x - 1 * sc, y - 1 * sc, 0, 2 * sc, 7 * sc,
+                          C2D_Color32(170, 110, 50, 255));
+        C2D_DrawRectSolid(x, y + 4 * sc, 0, 3 * sc, 2 * sc,
+                          C2D_Color32(170, 110, 50, 255));
+        break;
+    case TRINKET_MATCH_STICK:
+        C2D_DrawRectSolid(x - 1 * sc, y - 4 * sc, 0, 2 * sc, 10 * sc,
+                          C2D_Color32(200, 170, 120, 255));
+        C2D_DrawCircleSolid(x, y - 5 * sc, 0, 2.5f * sc, C2D_Color32(220, 60, 40, 255));
+        break;
+    case TRINKET_LUCKY_TOE:
+        C2D_DrawEllipseSolid(x - 4 * sc, y - 5 * sc, 0, 8 * sc, 11 * sc,
+                             C2D_Color32(235, 195, 170, 255));
+        C2D_DrawEllipseSolid(x - 2.5f * sc, y - 5 * sc, 0, 5 * sc, 3.5f * sc,
+                             C2D_Color32(255, 240, 230, 255));
+        break;
+    case TRINKET_CRACKED_CROWN:
+        C2D_DrawRectSolid(x - 5 * sc, y - 1 * sc, 0, 10 * sc, 4 * sc,
+                          C2D_Color32(215, 180, 60, 255));
+        C2D_DrawRectSolid(x - 5 * sc, y - 5 * sc, 0, 2 * sc, 4 * sc,
+                          C2D_Color32(215, 180, 60, 255));
+        C2D_DrawRectSolid(x - 1 * sc, y - 6 * sc, 0, 2 * sc, 5 * sc,
+                          C2D_Color32(215, 180, 60, 255));
+        C2D_DrawRectSolid(x + 3 * sc, y - 5 * sc, 0, 2 * sc, 4 * sc,
+                          C2D_Color32(215, 180, 60, 255));
+        /* the crack */
+        C2D_DrawRectSolid(x, y - 1 * sc, 0, 1, 4 * sc, C2D_Color32(90, 70, 20, 255));
+        break;
+    case TRINKET_CANCER:
+        C2D_DrawCircleSolid(x, y, 0, 4.5f * sc, C2D_Color32(225, 225, 230, 255));
+        C2D_DrawCircleSolid(x - 4 * sc, y - 3 * sc, 0, 1.6f * sc,
+                            C2D_Color32(225, 225, 230, 255));
+        C2D_DrawCircleSolid(x + 4 * sc, y - 3 * sc, 0, 1.6f * sc,
+                            C2D_Color32(225, 225, 230, 255));
+        break;
+    case TRINKET_TICK:
+        C2D_DrawCircleSolid(x, y, 0, 4.5f * sc, C2D_Color32(120, 40, 50, 255));
+        C2D_DrawCircleSolid(x, y - 4.5f * sc, 0, 1.3f * sc, C2D_Color32(60, 20, 25, 255));
+        break;
+    case TRINKET_BROKEN_MAGNET:
+        C2D_DrawRectSolid(x - 4 * sc, y - 5 * sc, 0, 3 * sc, 9 * sc,
+                          C2D_Color32(190, 30, 30, 255));
+        C2D_DrawRectSolid(x + 1 * sc, y - 5 * sc, 0, 3 * sc, 9 * sc,
+                          C2D_Color32(200, 200, 200, 255));
+        break;
+    case TRINKET_UMBILICAL_CORD:
+        C2D_DrawEllipseSolid(x - 3 * sc, y, 0, 6 * sc, 3 * sc,
+                             C2D_Color32(220, 180, 170, 255));
+        C2D_DrawEllipseSolid(x + 3 * sc, y - 2 * sc, 0, 5 * sc, 2.5f * sc,
+                             C2D_Color32(220, 180, 170, 255));
+        break;
+    case TRINKET_CURVED_HORN:
+        C2D_DrawRectSolid(x - 1 * sc, y - 5 * sc, 0, 2 * sc, 10 * sc,
+                          C2D_Color32(230, 220, 200, 255));
+        C2D_DrawCircleSolid(x - 1 * sc, y - 5 * sc, 0, 2.2f * sc,
+                            C2D_Color32(230, 220, 200, 255));
+        break;
+    default: break;
+    }
+}
 
 void init_item_pool(void) {
     memset(item_pool, 0, sizeof(item_pool));
@@ -136,12 +302,81 @@ void init_item_pool(void) {
         "Explosive tears");
     DEF(ITEM_SOY_MILK,        "Soy Milk",       -0.5f,  0.0f,  3.0f,  0.0f,  0, 0,
         "Tiny tears, huge fire rate");
-    DEF(ITEM_YUM_HEART,       "Yum Heart",       0.0f,  0.0f,  0.0f,  0.0f,  0, 0,
+    DEF(ITEM_YUM_HEART,       "Yum Heart",       0.0f,  0.0f,  0.0f,  0.0f,  0, ITEM_FLAG_ACTIVE,
         "Active: heal half a heart");
     DEF(ITEM_LUCKY_FOOT,      "Lucky Foot",      0.0f,  0.1f,  0.0f,  0.0f,  0, 0,
         "Luck up, better drops");
-    DEF(ITEM_BOOK_OF_BELIAL,  "Book of Belial",  0.0f,  0.0f,  0.0f,  0.0f,  0, 0,
+    DEF(ITEM_BOOK_OF_BELIAL,  "Book of Belial",  0.0f,  0.0f,  0.0f,  0.0f,  0, ITEM_FLAG_ACTIVE,
         "Active: +damage this room");
+    /* --- Phase 3 passive items --- */
+    DEF(ITEM_CRICKETS_HEAD,   "Cricket's Head",  1.0f,  0.0f,  0.0f,  0.0f,  0, 0,
+        "Damage way up");
+    DEF(ITEM_ODD_MUSHROOM,    "Odd Mushroom",    0.3f,  0.1f,  0.3f,  0.0f,  0, 0,
+        "Tears + damage");
+    DEF(ITEM_ROID_RAGE,       "Roid Rage",       0.0f,  0.6f,  0.0f,  0.0f,  0, 0,
+        "Big speed up");
+    DEF(ITEM_MARKED,          "Marked",          0.1f,  0.0f,  0.5f,  0.0f,  0, 0,
+        "Fire rate up");
+    DEF(ITEM_ANEMIC,          "Anemic",          0.0f,  0.0f,  0.0f,  0.5f,  0, ITEM_FLAG_PIERCING,
+        "Piercing tears");
+    DEF(ITEM_CAT_O_NINE,      "Cat o' Nine Tails",0.5f, 0.0f,  0.0f,  0.0f,  0, 0,
+        "Damage up");
+    DEF(ITEM_LORD_OF_PIT,     "Lord of the Pit", 0.2f,  0.3f,  0.0f,  0.0f,  0, 0,
+        "Speed + damage");
+    DEF(ITEM_TOUGH_LOVE,      "Tough Love",      0.3f,  0.0f,  0.3f,  0.0f,  0, 0,
+        "Damage + tears");
+    DEF(ITEM_SYNTHOIL,        "Synthoil",        0.4f,  0.0f,  0.0f,  0.5f,  0, 0,
+        "Damage + range");
+    DEF(ITEM_DEAD_EYE,        "Dead Eye",        0.6f,  0.0f,  0.0f,  0.0f,  0, 0,
+        "Damage up");
+    DEF(ITEM_THE_POOP,        "The Poop",        0.0f,  0.0f,  0.0f,  0.0f,  0, ITEM_FLAG_ACTIVE,
+        "Active: spawn a poop");
+    /* --- Phase 5 passive items --- */
+    DEF(ITEM_SACRED_ORB,      "Sacred Orb",      0.8f,  0.0f,  0.0f,  0.3f,  0, 0,
+        "Damage + range");
+    DEF(ITEM_DEATHS_TOUCH,    "Death's Touch",   1.3f,  0.0f,  0.0f,  0.0f,  0, ITEM_FLAG_PIERCING,
+        "Piercing, big damage");
+    DEF(ITEM_MUTANT_SPIDER,   "Mutant Spider",  -0.3f,  0.0f,  1.2f,  0.0f,  0, 0,
+        "Huge fire rate, less damage");
+    DEF(ITEM_TAMMYS_HEAD,     "Tammy's Head",    0.7f,  0.0f, -0.5f,  0.5f,  0, 0,
+        "Damage + range, slower fire");
+    DEF(ITEM_A_PONY,          "A Pony",          0.0f,  0.5f,  0.0f,  0.0f,  0, 0,
+        "Speed Up");
+    DEF(ITEM_CRICKETS_BODY,   "Cricket's Body",  0.5f,  0.0f,  0.0f,  1.0f,  0, 0,
+        "Damage + range");
+    DEF(ITEM_SACRIFICIAL_DAGGER, "Sacrificial Dagger", 0.8f, 0.0f, 0.0f, 0.0f, 0, ITEM_FLAG_SPECTRAL,
+        "Spectral tears, damage up");
+    DEF(ITEM_IPECAC_LITE,     "Ipecac Lite",     0.5f,  0.0f, -0.5f,  0.0f,  0, ITEM_FLAG_EXPLOSIVE,
+        "Small explosive tears");
+    DEF(ITEM_MAGIC_FINGERS,   "Magic Fingers",   0.4f,  0.0f,  0.3f,  0.0f,  0, 0,
+        "Damage + tears");
+    DEF(ITEM_STEVEN,          "Steven",          0.2f,  0.0f,  0.0f,  0.0f,  0, ITEM_FLAG_HOMING | ITEM_FLAG_PIERCING,
+        "Homing, piercing tears");
+    /* --- Round 6 (Phase E) items --- */
+    DEF(ITEM_THE_PACT,        "The Pact",        0.5f,  0.0f,  0.7f,  0.0f,  0, 0,
+        "Damage + tears up");
+    DEF(ITEM_NECRONOMICON,    "Necronomicon",    0.0f,  0.0f,  0.0f,  0.0f,  0, ITEM_FLAG_ACTIVE,
+        "Active: damage the whole room");
+    DEF(ITEM_TELEPORT,        "Teleport!",       0.0f,  0.0f,  0.0f,  0.0f,  0, ITEM_FLAG_ACTIVE,
+        "Active: warp to a random room");
+    DEF(ITEM_DECK_OF_CARDS,   "Deck of Cards",   0.0f,  0.0f,  0.0f,  0.0f,  0, ITEM_FLAG_ACTIVE,
+        "Active: draw a tarot card");
+    DEF(ITEM_BIBLE,           "The Bible",       0.0f,  0.0f,  0.0f,  0.0f,  0, ITEM_FLAG_ACTIVE,
+        "Active: smites Mom... usually");
+    DEF(ITEM_20_20,           "20/20",           0.0f,  0.0f,  0.0f,  0.0f,  0, ITEM_FLAG_DOUBLE,
+        "Double shot");
+    DEF(ITEM_TORN_PHOTO,      "Torn Photo",      0.0f,  0.0f,  0.7f,  0.0f,  0, 0,
+        "Tears up");
+    DEF(ITEM_BLUE_CAP,        "Blue Cap",        0.0f,  0.0f,  0.7f,  0.0f,  2, 0,
+        "Tears + health up");
+    DEF(ITEM_SQUEEZY,         "Squeezy",         0.0f,  0.0f,  0.4f,  0.0f,  0, 0,
+        "Tears up + soul hearts");
+    DEF(ITEM_BROTHER_BOBBY,   "Brother Bobby",   0.0f,  0.0f,  0.0f,  0.0f,  0, 0,
+        "A friend that fires with you");
+    DEF(ITEM_GHOST_BABY,      "Ghost Baby",      0.0f,  0.0f,  0.0f,  0.0f,  0, 0,
+        "Spectral familiar");
+    DEF(ITEM_DEMON_BABY,      "Demon Baby",      0.0f,  0.0f,  0.0f,  0.0f,  0, 0,
+        "Auto-targeting familiar");
     #undef DEF
 }
 
@@ -163,6 +398,7 @@ static const FloorInfo floors[MAX_FLOORS] = {
     { "Depths",        4,       50,       1.4f,      1.7f,       1.25f,   BOSS_TIER_DEPTHS   },
     { "The Womb",      6,       65,       1.5f,      1.9f,       1.35f,   BOSS_TIER_WOMB     },
     { "Sheol",         9,       85,       1.6f,      2.2f,       1.5f,    BOSS_TIER_SHEOL    },
+    { "The Chest",     12,      105,      1.7f,      2.5f,       1.65f,   BOSS_TIER_SHEOL    },
 };
 
 const FloorInfo *get_floor_info(int floor_num) {
@@ -183,12 +419,23 @@ float diff_enemy_hp_mult(Difficulty d) {
     }
 }
 
+/* T5: shared difficulty + infinite-loop enemy HP multiplier — the same
+ * scaling the normal room-spawn path applies. Boss-AI minion spawns (Mom's
+ * door-hands, Satan's hoppers) multiply their flat base HP by this once. */
+static float spawn_hp_mult(const Game *g) {
+    float m = diff_enemy_hp_mult(g->difficulty);
+    if (g->game_mode == MODE_INFINITE && g->infinite_loop > 0) {
+        m *= 1.0f + g->infinite_loop * 0.25f;
+    }
+    return m;
+}
+
 /* Heart drop chance threshold out of 100 (higher = more hearts) */
 float diff_heart_drop_rate(Difficulty d) {
     switch (d) {
-        case DIFF_EASY:   return 40.0f;
-        case DIFF_HARD:   return 20.0f;
-        default:          return 30.0f;  /* Normal: full=10, half=30 */
+        case DIFF_EASY:   return 24.0f;
+        case DIFF_HARD:   return 10.0f;
+        default:          return 16.0f;  /* Normal: full<5, half<16 */
     }
 }
 
@@ -215,20 +462,28 @@ typedef struct {
 
 static const BossPool boss_pools[BOSS_POOL_TIERS] = {
     /* BOSS_TIER_BASEMENT (Floors 0-1): Classic Basement bosses + Haunt/Widow/Pin.
-     * Haunt and Widow added here for variety on early floors. */
-    { { ENEMY_BOSS_DUKE, ENEMY_BOSS_MONSTRO, ENEMY_BOSS_LARRY, ENEMY_BOSS_GEMINI, ENEMY_BOSS_HAUNT, ENEMY_BOSS_PIN }, 6 },
+     * Haunt and Widow added here for variety on early floors. Steven (twin-head
+     * Gemini-lite) added for more Basement variety. */
+    { { ENEMY_BOSS_DUKE, ENEMY_BOSS_MONSTRO, ENEMY_BOSS_LARRY, ENEMY_BOSS_GEMINI, ENEMY_BOSS_HAUNT, ENEMY_BOSS_PIN, ENEMY_BOSS_STEVEN }, 7 },
 
-    /* BOSS_TIER_CAVES (Floors 2-3): Mid-tier bosses. Add Peep, Gurdy. */
-    { { ENEMY_BOSS_PEEP, ENEMY_BOSS_GURDY, ENEMY_BOSS_GEMINI, ENEMY_BOSS_LARRY, ENEMY_BOSS_FAMINE, ENEMY_BOSS_WIDOW }, 6 },
+    /* BOSS_TIER_CAVES (Floors 2-3): Mid-tier bosses. Add Peep, Gurdy, Gish, Chub. */
+    { { ENEMY_BOSS_PEEP, ENEMY_BOSS_GURDY, ENEMY_BOSS_GEMINI, ENEMY_BOSS_LARRY, ENEMY_BOSS_FAMINE, ENEMY_BOSS_WIDOW, ENEMY_BOSS_GISH, ENEMY_BOSS_CHUB }, 8 },
 
-    /* BOSS_TIER_DEPTHS (Floor 4): Hardest standard bosses. */
-    { { ENEMY_BOSS_FAMINE, ENEMY_BOSS_GURDY, ENEMY_BOSS_PEEP, ENEMY_BOSS_GEMINI, ENEMY_BOSS_MONSTRO, ENEMY_BOSS_PIN }, 6 },
+    /* BOSS_TIER_DEPTHS (Floor 4): Hardest standard bosses. Add Gish, Fistula. */
+    { { ENEMY_BOSS_FAMINE, ENEMY_BOSS_GURDY, ENEMY_BOSS_PEEP, ENEMY_BOSS_GEMINI, ENEMY_BOSS_MONSTRO, ENEMY_BOSS_PIN, ENEMY_BOSS_GISH, ENEMY_BOSS_FISTULA }, 8 },
 
-    /* BOSS_TIER_WOMB (Floor 5): Late-game bosses with high HP. */
-    { { ENEMY_BOSS_GURDY, ENEMY_BOSS_PEEP, ENEMY_BOSS_FAMINE, ENEMY_BOSS_HAUNT, ENEMY_BOSS_WIDOW, ENEMY_BOSS_PIN }, 6 },
+    /* BOSS_TIER_WOMB (Floor 5): Late-game bosses with high HP. Scolex (segmented
+     * burrowing worm) added for more Womb variety. Loki lives here too so he
+     * stays drawable (Boss Rush waves on floors 5+ use this pool) now that
+     * Sheol has a fixed story boss. */
+    { { ENEMY_BOSS_GURDY, ENEMY_BOSS_PEEP, ENEMY_BOSS_FAMINE, ENEMY_BOSS_HAUNT, ENEMY_BOSS_WIDOW, ENEMY_BOSS_PIN, ENEMY_BOSS_SCOLEX, ENEMY_BOSS_LOKI }, 8 },
 
-    /* BOSS_TIER_SHEOL (Floor 6): Mega Satan only - final boss. */
-    { { ENEMY_BOSS_MEGA_SATAN }, 1 },
+    /* BOSS_TIER_SHEOL (Floors 6-7): INTENTIONALLY UNUSED since Phase E —
+     * floors 6/7 return fixed story bosses (Satan / Mega Satan) from
+     * select_boss_for_floor before any pool lookup, and Boss Rush clamps its
+     * pool floor to 5 (Womb). Kept only so boss_pools[] indexing matches the
+     * BOSS_TIER_* enum. */
+    { { ENEMY_BOSS_MEGA_SATAN, ENEMY_BOSS_LOKI }, 2 },
 };
 
 /* Per-boss base HP values (before floor scaling).
@@ -240,19 +495,29 @@ static const BossPool boss_pools[BOSS_POOL_TIERS] = {
  *   Famine: high (fast charges, projectiles) */
 static int boss_innate_hp(EnemyType boss) {
     switch (boss) {
-    case ENEMY_BOSS_DUKE:       return 18;
-    case ENEMY_BOSS_MONSTRO:    return 22;
-    case ENEMY_BOSS_LARRY:      return 20;
-    case ENEMY_BOSS_GEMINI:     return 20;
-    case ENEMY_BOSS_FAMINE:     return 25;
+    case ENEMY_BOSS_DUKE:       return 36;
+    case ENEMY_BOSS_MONSTRO:    return 44;
+    case ENEMY_BOSS_LARRY:      return 40;
+    case ENEMY_BOSS_GEMINI:     return 40;
+    case ENEMY_BOSS_FAMINE:     return 50;
     /* Phase 2 bosses */
-    case ENEMY_BOSS_PEEP:       return 24;
-    case ENEMY_BOSS_GURDY:      return 35;  /* tanky, stationary */
-    case ENEMY_BOSS_PIN:        return 22;
-    case ENEMY_BOSS_HAUNT:      return 28;  /* two phases */
-    case ENEMY_BOSS_WIDOW:      return 23;
-    case ENEMY_BOSS_MEGA_SATAN: return 60;  /* final boss */
-    default:                    return 20;
+    case ENEMY_BOSS_PEEP:       return 48;
+    case ENEMY_BOSS_GURDY:      return 70;  /* tanky, stationary */
+    case ENEMY_BOSS_PIN:        return 44;
+    case ENEMY_BOSS_HAUNT:      return 56;  /* two phases */
+    case ENEMY_BOSS_WIDOW:      return 46;
+    case ENEMY_BOSS_GISH:       return 60;  /* jumping tar boss, leaves creep */
+    case ENEMY_BOSS_LOKI:       return 64;  /* teleporting spread-shooter */
+    case ENEMY_BOSS_STEVEN:     return 40;  /* twin-head, Gemini-lite: moderate */
+    case ENEMY_BOSS_CHUB:       return 60;  /* segmented + fatter: tanky like Gurdy */
+    case ENEMY_BOSS_FISTULA:    return 48;  /* splits into balls: moderate-high */
+    case ENEMY_BOSS_SCOLEX:     return 64;  /* segmented + burrows: tanky like Chub */
+    case ENEMY_BOSS_MEGA_SATAN: return 120; /* final boss */
+    /* Phase E story-arc fixed bosses */
+    case ENEMY_BOSS_MOM:        return 80;  /* Depths capstone */
+    case ENEMY_BOSS_MOMS_HEART: return 100; /* Womb capstone, tanky + waves */
+    case ENEMY_BOSS_SATAN:      return 120; /* Sheol capstone, 3 phases */
+    default:                    return 40;
     }
 }
 
@@ -264,8 +529,8 @@ int get_boss_base_hp(EnemyType boss, int floor_num) {
     int base = boss_innate_hp(boss);
     int scaled = (int)(base * fi->boss_hp_scale) + fi->enemy_hp_bonus * 2;
     /* Clamp to reasonable range */
-    if (scaled < 15) scaled = 15;
-    if (scaled > 80) scaled = 80;
+    if (scaled < 30) scaled = 30;
+    if (scaled > 220) scaled = 220;
     return scaled;
 }
 
@@ -291,10 +556,11 @@ static int boss_in_history(Game *g, EnemyType boss) {
     return 0;
 }
 
-/* Select a random boss from the appropriate pool for this floor.
- * Avoids repeating recently fought bosses when possible.
- * Returns the selected EnemyType. */
-EnemyType select_boss_for_floor(Game *g, int floor_num) {
+/* Select a random boss from the floor's RANDOM pool, bypassing the fixed
+ * story-boss mapping. Used directly by Boss Rush waves (which want pool
+ * bosses even on story floors) and by select_boss_for_floor below.
+ * Avoids repeating recently fought bosses when possible. */
+static EnemyType select_pool_boss_for_floor(Game *g, int floor_num) {
     const FloorInfo *fi = get_floor_info(floor_num);
     const BossPool *pool = &boss_pools[fi->boss_tier];
 
@@ -348,6 +614,23 @@ EnemyType select_boss_for_floor(Game *g, int floor_num) {
     return candidates[0];
 }
 
+/* Select the boss for a floor's boss room.
+ * Returns the selected EnemyType. */
+EnemyType select_boss_for_floor(Game *g, int floor_num) {
+    /* Phase E: the story-arc floors have FIXED bosses (Rebirth progression).
+       Earlier floors keep their random pools. Mom / Mom's Heart / Satan are
+       never in any random pool. Callers that want pool bosses on a late
+       floor (Boss Rush waves) call select_pool_boss_for_floor directly. */
+    switch (floor_num) {
+    case 4: return ENEMY_BOSS_MOM;        /* Depths */
+    case 5: return ENEMY_BOSS_MOMS_HEART; /* The Womb */
+    case 6: return ENEMY_BOSS_SATAN;      /* Sheol */
+    case 7: return ENEMY_BOSS_MEGA_SATAN; /* The Chest */
+    default: break;
+    }
+    return select_pool_boss_for_floor(g, floor_num);
+}
+
 /* ================================================================
  * Colour palette
  * ================================================================ */
@@ -367,8 +650,8 @@ static void init_colours(void) {
     COL_PLAYER        = C2D_Color32(220, 200, 170, 255);
     COL_PLAYER_HIT    = C2D_Color32(255, 80,  80,  255);
     COL_TEAR          = C2D_Color32(100, 150, 255, 255);
-    COL_HEART_FULL    = C2D_Color32(255, 50,  50,  255);
-    COL_HEART_EMPTY   = C2D_Color32(80,  80,  80,  255);
+    COL_HEART_FULL    = C2D_Color32(193, 18,  31,  255);  /* Rebirth heart red */
+    COL_HEART_EMPTY   = C2D_Color32(90,  20,  25,  255);  /* dark maroon socket */
     COL_ENEMY_FLY     = C2D_Color32(60,  60,  60,  255);
     COL_ENEMY_GAPER   = C2D_Color32(180, 80,  80,  255);
     COL_ENEMY_PACER   = C2D_Color32(100, 180, 80,  255);
@@ -402,11 +685,13 @@ Room *current_room(Game *g) {
  * Player stats calculation
  * ================================================================ */
 
+static int player_has_item(const Player *p, ItemType type);
+
 void recalc_player_stats(Player *p) {
     /* Start from base stats - adjusted per character */
     p->stats.damage    = 1.0f;
     p->stats.speed     = PLAYER_BASE_SPEED;
-    p->stats.fire_rate = 0.0f;   /* modifier; actual cooldown = BASE_TEAR_COOLDOWN - fire_rate*2 */
+    p->stats.fire_rate = 0.0f;   /* modifier; see get_tear_cooldown() for the tears curve */
     p->stats.range     = TEAR_BASE_RANGE;
     p->stats.max_hp    = PLAYER_BASE_HP;
     p->stats.flags     = 0;
@@ -429,6 +714,20 @@ void recalc_player_stats(Player *p) {
             p->stats.max_hp = 2;          /* 1 heart - glass cannon */
             p->stats.damage *= 1.35f;
             break;
+        case CHAR_EVE:
+            p->stats.max_hp = 6;          /* 3 hearts */
+            p->stats.damage *= 1.3f;
+            p->stats.speed  *= 0.9f;
+            break;
+        case CHAR_SAMSON:
+            p->stats.max_hp = PLAYER_BASE_HP;  /* normal HP */
+            p->stats.damage *= 1.2f;
+            p->stats.speed  *= 1.1f;
+            break;
+        case CHAR_BLUE_BABY:
+            p->stats.max_hp = 4;          /* 2 red heart containers (safe option) */
+            p->stats.damage *= 1.1f;
+            break;
         case CHAR_ISAAC:
         default:
             break;
@@ -448,6 +747,51 @@ void recalc_player_stats(Player *p) {
         if (def->type == ITEM_DEAD_CAT)   p->stats.max_hp = 2;  /* Dead Cat: max HP = 1 heart */
     }
 
+    /* Item synergies: hand-authored pairs that grant a bonus when BOTH are held. */
+    if (player_has_item(p, ITEM_INNER_EYE) && player_has_item(p, ITEM_POLYPHEMUS)) {
+        /* Triple shot + big single laser-like tear -> extra damage on the boosted spread */
+        p->stats.damage += 0.5f;
+    }
+    if (player_has_item(p, ITEM_BRIMSTONE) &&
+        (player_has_item(p, ITEM_SPOON_BENDER) || player_has_item(p, ITEM_SACRED_HEART))) {
+        /* Homing item + Brimstone -> laser tracks targets */
+        p->stats.flags |= ITEM_FLAG_HOMING;
+        p->stats.damage += 0.3f;
+    }
+    if (player_has_item(p, ITEM_SAD_ONION) &&
+        (player_has_item(p, ITEM_WIRE_COAT) || player_has_item(p, ITEM_WIRE_HANGER))) {
+        /* Sad Onion + Wire Coat/Hanger -> extra fire rate */
+        p->stats.fire_rate += 0.4f;
+    }
+    if (player_has_item(p, ITEM_SPOON_BENDER) && player_has_item(p, ITEM_CUPIDS_ARROW)) {
+        /* Homing + piercing already granted individually; add a small damage bonus */
+        p->stats.damage += 0.3f;
+    }
+    if (player_has_item(p, ITEM_MAGIC_MUSH) && player_has_item(p, ITEM_CRICKETS_HEAD)) {
+        /* Magic Mushroom + Cricket's Head -> extra damage */
+        p->stats.damage += 0.5f;
+    }
+    if (player_has_item(p, ITEM_SPEED_BALL) &&
+        (player_has_item(p, ITEM_BELT) || player_has_item(p, ITEM_ROID_RAGE))) {
+        /* Speed Ball + Belt/Roid Rage -> extra speed */
+        p->stats.speed += 0.3f;
+    }
+    if (player_has_item(p, ITEM_SACRED_HEART) && player_has_item(p, ITEM_BLOOD_OF_MARTYR)) {
+        /* Sacred Heart + Blood of Martyr -> extra damage */
+        p->stats.damage += 0.5f;
+    }
+    if (player_has_item(p, ITEM_CUPIDS_ARROW) && player_has_item(p, ITEM_ANEMIC)) {
+        /* Cupid's Arrow + Anemic -> extra range */
+        p->stats.range += 20.0f;
+    }
+
+    /* Shot speed: flavor-fit items grant +1 each (+15% tear velocity in
+     * shoot_tear). Speed Ball has +shot speed in Rebirth; Cupid's Arrow is
+     * a swift arrow; Synthoil is slick oil — fast, greased shots. */
+    if (player_has_item(p, ITEM_SPEED_BALL))   p->stats.shot_speed += 1;
+    if (player_has_item(p, ITEM_CUPIDS_ARROW)) p->stats.shot_speed += 1;
+    if (player_has_item(p, ITEM_SYNTHOIL))     p->stats.shot_speed += 1;
+
     /* Book of Belial active damage buff */
     if (p->book_belial_dmg_timer > 0) p->stats.damage += 1.5f;
 
@@ -458,6 +802,14 @@ void recalc_player_stats(Player *p) {
     p->stats.luck      += p->pill_luck_bonus;
     p->stats.max_hp    += p->pill_max_hp_bonus;
 
+    /* Trinket passives */
+    if (p->trinket == TRINKET_LUCKY_TOE)     p->stats.luck      += 1.0f;
+    if (p->trinket == TRINKET_CRACKED_CROWN) p->stats.damage    += 0.3f;
+    if (p->trinket == TRINKET_CANCER)        p->stats.fire_rate += 0.5f;
+    if (p->trinket == TRINKET_TICK)          p->stats.damage    += 0.4f;
+    if (p->trinket == TRINKET_UMBILICAL_CORD) p->stats.max_hp   += 1;
+    if (p->trinket == TRINKET_CURVED_HORN)   p->stats.damage    += 0.4f;
+
     /* Clamp stats */
     if (p->stats.damage < 0.3f) p->stats.damage = 0.3f;
     if (p->stats.speed < 1.0f) p->stats.speed = 1.0f;
@@ -467,14 +819,40 @@ void recalc_player_stats(Player *p) {
     if (p->stats.fire_rate < -3.0f) p->stats.fire_rate = -3.0f;
     if (p->stats.max_hp > PLAYER_MAX_HP_CAP) p->stats.max_hp = PLAYER_MAX_HP_CAP;
     if (p->stats.max_hp < 2) p->stats.max_hp = 2;
+
+    /* Challenge: Glass Cannon — locked to one heart, big damage */
+    if (p->challenge == 1) {
+        p->stats.max_hp = 2;
+        p->stats.damage += 2.0f;
+    }
+
+    /* E9 Challenge: Speed! — the player moves 1.4x too (enemies get their
+       1.4x via the FloorInfo speed multipliers in enemies_update) */
+    if (p->challenge == 4) {
+        p->stats.speed *= 1.4f;
+        if (p->stats.speed > 4.5f) p->stats.speed = 4.5f;
+    }
 }
 
-/* Damage absorption: holy_mantle blocks all, soul hearts absorb first.
- * Returns damage that actually reaches HP. */
+/* E5: number of fully-depleted black hearts awaiting their room-wide 40dmg
+ * burst. Set inside player_absorb_dmg (which has no Game*), processed once
+ * per frame in the STATE_PLAYING update. */
+static int g_black_burst_pending = 0;
+
+/* Damage absorption: holy_mantle blocks all; black hearts absorb first
+ * (Rebirth order: black BEFORE soul), then soul hearts.
+ * Returns damage that actually reaches red HP. */
 static int player_absorb_dmg(Player *p, int dmg) {
     if (p->holy_mantle_active) {
         p->holy_mantle_active = 0;
         return 0;
+    }
+    /* Black hearts (E5): each time a heart's 2 units hit an even boundary,
+       one full black heart has been depleted -> queue a room burst. */
+    while (dmg > 0 && p->black_hp > 0) {
+        p->black_hp--;
+        dmg--;
+        if ((p->black_hp & 1) == 0) g_black_burst_pending++;
     }
     while (dmg > 0 && p->soul_hp > 0) {
         p->soul_hp--;
@@ -504,13 +882,41 @@ static int player_check_death(Player *p) {
 
 void collect_item(Game *g, ItemType item) {
     Player *p = &g->player;
+    const ItemDef *def = get_item_def(item);
+
+    /* Active items are held in the dedicated active slot with a charge bar
+     * instead of the passive items[] list. */
+    if (def && (def->flags & ITEM_FLAG_ACTIVE)) {
+        p->active_item = item;
+        switch (item) {
+        case ITEM_YUM_HEART:      p->active_max_charge = 2; break;
+        case ITEM_BOOK_OF_BELIAL: p->active_max_charge = 3; break;
+        case ITEM_THE_POOP:       p->active_max_charge = 1; break;
+        /* Phase E7 actives */
+        case ITEM_NECRONOMICON:   p->active_max_charge = 4; break;
+        case ITEM_TELEPORT:       p->active_max_charge = 2; break;
+        case ITEM_DECK_OF_CARDS:  p->active_max_charge = 6; break;
+        case ITEM_BIBLE:          p->active_max_charge = 6; break;
+        default:                  p->active_max_charge = 2; break;
+        }
+        p->active_charge = p->active_max_charge;  /* start fully charged */
+
+        /* Show pickup name + description on top screen */
+        if (def->name) {
+            snprintf(g->pickup_msg_text, sizeof(g->pickup_msg_text),
+                     "%s - %s", def->name,
+                     def->description ? def->description : "");
+            g->pickup_msg_timer = 180;
+        }
+        return;
+    }
+
     if (p->item_count >= MAX_ITEMS_HELD) return;
 
     p->items[p->item_count++] = item;
     recalc_player_stats(p);
 
     /* Heal for HP bonus items */
-    const ItemDef *def = get_item_def(item);
     if (def && def->hp_bonus > 0) {
         p->hp += def->hp_bonus;
         if (p->hp > p->stats.max_hp) p->hp = p->stats.max_hp;
@@ -533,12 +939,39 @@ void collect_item(Game *g, ItemType item) {
     if (item == ITEM_HOLY_MANTLE) {
         p->holy_mantle_active = 1;
     }
+    /* E8 Squeezy: +2 soul hearts granted on pickup (4 half-heart units) */
+    if (item == ITEM_SQUEEZY) {
+        p->soul_hp += 4;
+        if (p->soul_hp > 12) p->soul_hp = 12;
+    }
+    /* E6 familiars: occupy the first free follower slot. A 3rd familiar
+       with both slots full converts into +2 soul hearts (like Squeezy)
+       so the pickup is never a silent no-op; the item stays recorded. */
+    if (item == ITEM_BROTHER_BOBBY || item == ITEM_GHOST_BABY ||
+        item == ITEM_DEMON_BABY) {
+        if (p->familiar[0] == ITEM_NONE)      p->familiar[0] = item;
+        else if (p->familiar[1] == ITEM_NONE) p->familiar[1] = item;
+        else {
+            p->soul_hp += 4;
+            if (p->soul_hp > 12) p->soul_hp = 12;
+        }
+    }
 }
 
 static int get_tear_cooldown(Player *p) {
-    float cd = (float)BASE_TEAR_COOLDOWN - p->stats.fire_rate * 2.0f;
-    if (cd < 3.0f) cd = 3.0f;
-    if (cd > 30.0f) cd = 30.0f;
+    /* Rebirth-style diminishing-returns tears curve.
+     * fr >= 0: cd = 6 + 16/(1 + 0.35*fr) — base (fr 0) = 22 (~2.7 tears/s,
+     *          close to Rebirth's ~22f), Soy Milk (+3.0) lands ~14,
+     *          big stacks bottom out near 9-10.
+     * fr <  0: continues UP from the fr=0 value at 6 frames per point so
+     *          slow-fire items are genuinely slower than base
+     *          (Polyphemus -1.0 -> 28). */
+    float fr = p->stats.fire_rate;
+    float cd;
+    if (fr >= 0.0f) cd = 6.0f + 16.0f / (1.0f + 0.35f * fr);
+    else            cd = 22.0f + (-fr) * 6.0f;
+    if (cd < 5.0f) cd = 5.0f;
+    if (cd > 40.0f) cd = 40.0f;
     return (int)cd;
 }
 
@@ -659,11 +1092,12 @@ static int is_on_critical_path(Dungeon *d, int rx, int ry) {
 
 /* Pick a random item that the player doesn't already have */
 static ItemType pick_random_item(Game *g) {
-    /* Build pool of items not yet collected */
+    /* Build pool of items not yet collected (the held active item counts
+       as collected — don't re-offer it on pedestals) */
     ItemType available[ITEM_COUNT];
     int avail_count = 0;
     for (int t = 1; t < ITEM_COUNT; t++) {
-        int has = 0;
+        int has = (g->player.active_item == (ItemType)t);
         for (int j = 0; j < g->player.item_count; j++) {
             if (g->player.items[j] == (ItemType)t) { has = 1; break; }
         }
@@ -671,6 +1105,29 @@ static ItemType pick_random_item(Game *g) {
     }
     if (avail_count == 0) return ITEM_PENTAGRAM; /* fallback */
     return available[randi(0, avail_count - 1)];
+}
+
+/* Library room: bias toward active (book-like, usable-with-charge) items.
+ * Falls back to any uncollected item if no active items remain available. */
+static ItemType pick_random_active_item(Game *g) {
+    ItemType available[ITEM_COUNT];
+    int avail_count = 0;
+    ItemType active_available[ITEM_COUNT];
+    int active_count = 0;
+    for (int t = 1; t < ITEM_COUNT; t++) {
+        int has = (g->player.active_item == (ItemType)t);
+        for (int j = 0; j < g->player.item_count; j++) {
+            if (g->player.items[j] == (ItemType)t) { has = 1; break; }
+        }
+        if (has) continue;
+        available[avail_count++] = (ItemType)t;
+        if (item_pool[t].flags & ITEM_FLAG_ACTIVE) {
+            active_available[active_count++] = (ItemType)t;
+        }
+    }
+    if (active_count > 0) return active_available[randi(0, active_count - 1)];
+    if (avail_count > 0) return available[randi(0, avail_count - 1)];
+    return ITEM_PENTAGRAM; /* fallback */
 }
 
 void dungeon_generate(Dungeon *d, int floor_num) {
@@ -691,6 +1148,15 @@ void dungeon_generate(Dungeon *d, int floor_num) {
 
         int cx = sx, cy = sy;
         int target = randi(MIN_ROOMS, MIN_ROOMS + 3);
+        /* Curse of the Labyrinth: bigger floor layout. Bounded by MAX_ROOMS
+         * and the DUNGEON_W*DUNGEON_H grid so this can never overflow the
+         * fixed rooms[][] array or request more rooms than the grid can
+         * physically hold. */
+        if (g_curse_labyrinth_pending) {
+            target += 5;
+            if (target > MAX_ROOMS) target = MAX_ROOMS;
+            if (target > DUNGEON_W * DUNGEON_H) target = DUNGEON_W * DUNGEON_H;
+        }
         int steps = 0;
         int dxs[] = {0, 0, -1, 1};
         int dys[] = {-1, 1, 0, 0};
@@ -860,19 +1326,83 @@ void dungeon_generate(Dungeon *d, int floor_num) {
                     }
                 }
             }
-            /* Fallback: allow curse on critical path if no other option */
+            /* No safe (non-critical-path) spot: skip the curse room entirely
+               rather than place it on the boss's only path and risk a soft-lock
+               at <=1 HP (curse rooms are optional). */
+            done_curse:;
+        }
+
+        /* ── Place sacrifice room (non-critical path only) ── */
+        if (floor_num >= 1) {
             for (int ry = 0; ry < DUNGEON_H; ry++) {
                 for (int rx = 0; rx < DUNGEON_W; rx++) {
                     if (d->rooms[ry][rx].type == ROOM_NORMAL) {
                         int dist_start = abs(rx - sx) + abs(ry - sy);
-                        if (dist_start >= 2) {
-                            d->rooms[ry][rx].type = ROOM_CURSE;
-                            goto done_curse;
+                        if (dist_start >= 2 && !is_on_critical_path(d, rx, ry)) {
+                            d->rooms[ry][rx].type = ROOM_SACRIFICE;
+                            goto done_sacrifice;
                         }
                     }
                 }
             }
-            done_curse:;
+            /* No safe (non-critical-path) spot: skip the sacrifice room entirely
+               rather than place it on the boss's only path (sacrifice rooms
+               are optional). */
+            done_sacrifice:;
+        }
+
+        /* ── Place Boss Rush room (non-critical path only, floors >= 2) ── */
+        if (floor_num >= 2) {
+            for (int ry = 0; ry < DUNGEON_H; ry++) {
+                for (int rx = 0; rx < DUNGEON_W; rx++) {
+                    if (d->rooms[ry][rx].type == ROOM_NORMAL) {
+                        int dist_start = abs(rx - sx) + abs(ry - sy);
+                        if (dist_start >= 2 && !is_on_critical_path(d, rx, ry)) {
+                            d->rooms[ry][rx].type = ROOM_BOSSRUSH;
+                            goto done_bossrush;
+                        }
+                    }
+                }
+            }
+            /* No safe (non-critical-path) spot: skip the Boss Rush room entirely
+               rather than place it on the boss's only path (optional room). */
+            done_bossrush:;
+        }
+
+        /* ── Place Arcade room (non-critical path only, floors >= 1) ── */
+        if (floor_num >= 1) {
+            for (int ry = 0; ry < DUNGEON_H; ry++) {
+                for (int rx = 0; rx < DUNGEON_W; rx++) {
+                    if (d->rooms[ry][rx].type == ROOM_NORMAL) {
+                        int dist_start = abs(rx - sx) + abs(ry - sy);
+                        if (dist_start >= 2 && !is_on_critical_path(d, rx, ry)) {
+                            d->rooms[ry][rx].type = ROOM_ARCADE;
+                            goto done_arcade;
+                        }
+                    }
+                }
+            }
+            /* No safe (non-critical-path) spot: skip the Arcade room entirely
+               rather than place it on the boss's only path (optional room). */
+            done_arcade:;
+        }
+
+        /* ── Place Library room (non-critical path only, floors >= 1) ── */
+        if (floor_num >= 1) {
+            for (int ry = 0; ry < DUNGEON_H; ry++) {
+                for (int rx = 0; rx < DUNGEON_W; rx++) {
+                    if (d->rooms[ry][rx].type == ROOM_NORMAL) {
+                        int dist_start = abs(rx - sx) + abs(ry - sy);
+                        if (dist_start >= 2 && !is_on_critical_path(d, rx, ry)) {
+                            d->rooms[ry][rx].type = ROOM_LIBRARY;
+                            goto done_library;
+                        }
+                    }
+                }
+            }
+            /* No safe (non-critical-path) spot: skip the Library room entirely
+               rather than place it on the boss's only path (optional room). */
+            done_library:;
         }
 
         /* ── VALIDATE: boss must be reachable without keys ── */
@@ -926,18 +1456,49 @@ void dungeon_generate(Dungeon *d, int floor_num) {
  * Room enemy spawning
  * ================================================================ */
 
-static void place_obstacles(Room *r) {
-    if (r->type == ROOM_START || r->type == ROOM_TREASURE ||
-        r->type == ROOM_SHOP || r->type == ROOM_SECRET) return;
+/* Authored room layouts (Rebirth-style interiors). Logical grid of 9x5
+   cells inside the play area; the middle column (i=4) and middle row (j=2)
+   are always left clear so every door keeps an open lane by construction. */
+typedef struct { unsigned char i, j, t; } ObSpec;
 
-    int count = randi(0, 4);
+static const ObSpec PAT_CORNERS[]   = {{1,1,0},{7,1,0},{1,3,0},{7,3,0}};
+static const ObSpec PAT_RING[]      = {{2,1,0},{3,1,0},{5,1,0},{6,1,0},
+                                       {2,3,0},{3,3,0},{5,3,0},{6,3,0}};
+static const ObSpec PAT_PILLARS[]   = {{2,1,0},{2,3,0},{6,1,0},{6,3,0}};
+static const ObSpec PAT_H_WALLS[]   = {{2,0,0},{2,1,0},{2,3,0},{2,4,0},
+                                       {6,0,0},{6,1,0},{6,3,0},{6,4,0}};
+static const ObSpec PAT_POOP_GRID[] = {{3,1,1},{5,1,1},{3,3,1},{5,3,1}};
+static const ObSpec PAT_POOP_DIAG[] = {{1,0,1},{2,1,1},{6,3,1},{7,4,1}};
+static const ObSpec PAT_MIXED[]     = {{1,1,0},{7,1,0},{1,3,0},{7,3,0},
+                                       {3,1,1},{5,3,1}};
+static const ObSpec PAT_SPIKE_ROW[] = {{2,1,2},{3,1,2},{5,1,2},{6,1,2}};
+static const ObSpec PAT_SPIKE_COR[] = {{1,1,2},{7,1,2},{1,3,2},{7,3,2}};
+static const ObSpec PAT_SPIKE_BOX[] = {{3,1,2},{5,1,2},{3,3,2},{5,3,2},
+                                       {1,2,0},{7,2,0}};
+
+static void place_obstacles(Room *r) {
     r->obstacle_count = 0;
-    for (int i = 0; i < count && i < MAX_OBSTACLES; i++) {
-        Obstacle *o = &r->obstacles[i];
-        o->x = randf(ROOM_LEFT + 50, ROOM_RIGHT - 50);
-        o->y = randf(ROOM_TOP + 50, ROOM_BOTTOM - 50);
+    if (r->type != ROOM_NORMAL) return;   /* boss/special rooms stay open */
+
+    static const struct { const ObSpec *p; int n; } pats[] = {
+        {NULL, 0}, {NULL, 0}, {NULL, 0},           /* open rooms stay common */
+        {PAT_CORNERS,   4}, {PAT_RING,      8},
+        {PAT_PILLARS,   4}, {PAT_H_WALLS,   8},
+        {PAT_POOP_GRID, 4}, {PAT_POOP_DIAG, 4},
+        {PAT_MIXED,     6}, {PAT_SPIKE_ROW, 4},
+        {PAT_SPIKE_COR, 4}, {PAT_SPIKE_BOX, 6},
+    };
+    int pick = randi(0, (int)(sizeof(pats) / sizeof(pats[0])) - 1);
+    const ObSpec *pat = pats[pick].p;
+    int n = pats[pick].n;
+
+    for (int i = 0; i < n && i < MAX_OBSTACLES; i++) {
+        Obstacle *o = &r->obstacles[r->obstacle_count++];
+        o->x = ROOM_LEFT + (pat[i].i + 1) * (ROOM_RIGHT - ROOM_LEFT) / 10.0f;
+        o->y = ROOM_TOP  + (pat[i].j + 1) * (ROOM_BOTTOM - ROOM_TOP) / 6.0f;
+        o->type = pat[i].t;
+        o->hp = (o->type == OBST_POOP) ? 3 : 1;
         o->active = 1;
-        r->obstacle_count++;
     }
 }
 
@@ -966,10 +1527,211 @@ static void spawn_random_consumable(Room *r, float x, float y) {
         spawn_consumable(r, x, y, PICKUP_BOMB);
     } else if (roll < 85) {
         spawn_consumable(r, x, y, PICKUP_KEY);
-    } else if (roll < 95) {
+    } else if (roll < 92) {
         spawn_consumable(r, x, y, PICKUP_COIN5);
-    } else {
+    } else if (roll < 96) {
         spawn_consumable(r, x, y, PICKUP_BOMB2);
+    } else if (roll < 99) {
+        spawn_consumable(r, x, y, PICKUP_KEY5);
+    } else {
+        spawn_consumable(r, x, y, PICKUP_BATTERY);
+    }
+}
+
+/* Initialize an Enemy slot as a boss: selects (or accepts) a boss type,
+ * scales HP for the floor, and runs the per-boss-type init switch.
+ * Reused by both normal boss rooms and the Boss Rush wave controller. */
+static void init_boss_enemy(Game *g, const FloorInfo *fi, Enemy *e, EnemyType selected_boss, float cx) {
+    int boss_hp = get_boss_base_hp(selected_boss, g->current_floor);
+
+    e->type = selected_boss;
+    e->hp = boss_hp;
+    e->max_hp = boss_hp;
+    e->x = cx;
+    e->y = ROOM_TOP + 60;
+    e->timer = randi(60, 120);
+    e->shoot_timer = randi(40, 80);
+
+    /* Boss-specific initialization */
+    switch (selected_boss) {
+    case ENEMY_BOSS_MONSTRO:
+        e->phase = 0;       /* 0=idle, 1=jumping, 2=landing_tear_spread */
+        e->jump_z = 0;
+        e->jump_vz = 0;
+        e->attack_pattern = 0;
+        break;
+    case ENEMY_BOSS_LARRY:
+        e->seg_count = MAX_LARRY_SEGMENTS;
+        e->seg_speed = 1.8f * fi->boss_speed_scale;
+        e->dx = 1.8f * fi->boss_speed_scale;
+        e->dy = 0.5f;
+        for (int s = 0; s < MAX_LARRY_SEGMENTS; s++) {
+            e->segments[s].x = e->x - (s + 1) * LARRY_SEG_DIST;
+            e->segments[s].y = e->y;
+            e->segments[s].prev_x = e->segments[s].x;
+            e->segments[s].prev_y = e->segments[s].y;
+        }
+        break;
+    case ENEMY_BOSS_DUKE:
+        e->orbit_phase = 0;
+        e->timer = DUKE_SPAWN_INTERVAL;
+        break;
+    case ENEMY_BOSS_GEMINI:
+        e->gemini_split = 0;
+        e->gemini_cx = e->x + 35;
+        e->gemini_cy = e->y;
+        e->gemini_cdx = 0;
+        e->gemini_cdy = 0;
+        e->gemini_chp = boss_hp / 3;
+        break;
+    case ENEMY_BOSS_FAMINE:
+        e->phase = 0;       /* 0=galloping, 1=headless */
+        e->famine_shoot_cd = randi(40, 80);
+        e->dx = FAMINE_CHARGE_SPEED * fi->boss_speed_scale;
+        break;
+    /* --- Phase 2 bosses --- */
+    case ENEMY_BOSS_PEEP:
+        e->phase = 0;            /* 0=full, 1=detach phase (below 50% HP) */
+        e->dx = 1.8f * fi->boss_speed_scale;
+        e->dy = 1.5f * fi->boss_speed_scale;
+        e->timer = 120;
+        e->attack_pattern = 0;   /* eye spawn counter */
+        break;
+    case ENEMY_BOSS_GURDY:
+        e->phase = 0;            /* 0=idle, 1=spawn wave, 2=shoot spread */
+        e->dx = 0; e->dy = 0;    /* stationary */
+        e->timer = 60;
+        e->shoot_timer = 60;
+        e->attack_pattern = 0;   /* alternates between attacks */
+        break;
+    case ENEMY_BOSS_PIN:
+        e->phase = 1;            /* 0=above ground (vulnerable) 1=burrowed */
+        e->hidden = 1;           /* burrowed = tear-immune + no contact */
+        e->timer = 90;           /* time burrowed */
+        e->target_x = e->x;
+        e->target_y = e->y;
+        e->dx = 0; e->dy = 0;
+        e->shoot_timer = 30;
+        break;
+    case ENEMY_BOSS_HAUNT:
+        e->phase = 0;            /* 0=Lil Haunts phase, 1=brimstone phase */
+        e->dx = 1.0f * fi->boss_speed_scale;
+        e->dy = 0.8f * fi->boss_speed_scale;
+        e->timer = 60;
+        e->shoot_timer = 120;
+        e->attack_pattern = 0;
+        break;
+    case ENEMY_BOSS_WIDOW:
+        e->phase = 0;            /* 0=idle, 1=jumping */
+        e->jump_z = 0;
+        e->jump_vz = 0;
+        e->target_x = e->x;
+        e->target_y = e->y;
+        e->timer = 60;
+        e->shoot_timer = 90;
+        break;
+    case ENEMY_BOSS_MEGA_SATAN:
+        e->phase = 0;            /* 0=stomp, 1=brimstone, 2=fireball spread */
+        e->dx = 0; e->dy = 0;    /* mostly stationary */
+        e->timer = 90;
+        e->shoot_timer = 60;
+        e->attack_pattern = 0;
+        break;
+    case ENEMY_BOSS_GISH:
+        /* Copies Monstro's jump+shoot loop; adds creep on landing. */
+        e->phase = 0;            /* 0=idle, 1=airborne, 2=landing recovery */
+        e->jump_z = 0;
+        e->jump_vz = 0;
+        e->attack_pattern = 0;
+        break;
+    case ENEMY_BOSS_LOKI:
+        /* Stationary teleporting spread-shooter. */
+        e->phase = 0;            /* 0=idle aim, blinks on a timer */
+        e->dx = 0; e->dy = 0;    /* stationary between blinks */
+        e->timer = 90;           /* blink timer */
+        e->shoot_timer = 60;     /* fire timer */
+        e->attack_pattern = 0;   /* alternates 4-way / 8-way */
+        break;
+    case ENEMY_BOSS_STEVEN:
+        /* Steven: twin-head Gemini-lite. Reuses Gemini's tether/split fields
+           but never fully detaches -- the second head just wanders on a
+           shorter tether and gets a bit more aggressive at low HP. */
+        e->gemini_split = 0;
+        e->gemini_cx = e->x + 28;
+        e->gemini_cy = e->y;
+        e->gemini_cdx = 0;
+        e->gemini_cdy = 0;
+        e->gemini_chp = boss_hp / 3;
+        e->dx = 1.0f * fi->boss_speed_scale;
+        e->dy = 0.8f * fi->boss_speed_scale;
+        break;
+    case ENEMY_BOSS_CHUB:
+        /* Chub: segmented like Larry Jr but fatter/slower/tankier. */
+        e->seg_count = MAX_LARRY_SEGMENTS;
+        e->seg_speed = 1.3f * fi->boss_speed_scale;
+        e->dx = 1.3f * fi->boss_speed_scale;
+        e->dy = 0.4f;
+        for (int s = 0; s < MAX_LARRY_SEGMENTS; s++) {
+            e->segments[s].x = e->x - (s + 1) * LARRY_SEG_DIST;
+            e->segments[s].y = e->y;
+            e->segments[s].prev_x = e->segments[s].x;
+            e->segments[s].prev_y = e->segments[s].y;
+        }
+        break;
+    case ENEMY_BOSS_FISTULA:
+        /* Fistula: splits into smaller balls on hit (handled in the damage/
+           death paths). Slow drifting movement, no ranged attack. */
+        e->phase = 0;
+        e->split_done = 0;
+        e->dx = randf(-0.6f, 0.6f) * fi->boss_speed_scale;
+        e->dy = randf(-0.6f, 0.6f) * fi->boss_speed_scale;
+        e->timer = randi(30, 60);
+        break;
+    case ENEMY_BOSS_SCOLEX:
+        /* Scolex: segmented worm like Chub, but burrows (phase 1) to close
+           distance safely before emerging (phase 0) to chase + collide. */
+        e->seg_count = MAX_LARRY_SEGMENTS;
+        e->seg_speed = 1.6f * fi->boss_speed_scale;
+        e->phase = 1;            /* 0=emerged (vulnerable body collision), 1=burrowed */
+        e->hidden = 1;           /* burrowed = tear-immune + no contact */
+        e->timer = 90;           /* time burrowed */
+        e->dx = 0; e->dy = 0;
+        for (int s = 0; s < MAX_LARRY_SEGMENTS; s++) {
+            e->segments[s].x = e->x - (s + 1) * LARRY_SEG_DIST;
+            e->segments[s].y = e->y;
+            e->segments[s].prev_x = e->segments[s].x;
+            e->segments[s].prev_y = e->segments[s].y;
+        }
+        break;
+    case ENEMY_BOSS_MOM:
+        /* Mom: stomping foot (Monstro jump-target machinery) + periodic
+           door-hand minion spawns on a Duke-style spawn timer. */
+        e->phase = 0;            /* 0=idle, 1=airborne stomp, 2=recovery */
+        e->jump_z = 0;
+        e->jump_vz = 0;
+        e->attack_pattern = 0;
+        e->timer = 90;
+        e->shoot_timer = DUKE_SPAWN_INTERVAL;  /* door-hand spawn timer */
+        break;
+    case ENEMY_BOSS_MOMS_HEART:
+        /* Mom's Heart: stationary tank (Gurdy AI base) + enemy waves. */
+        e->phase = 0;            /* 0=idle, 1=wave spawn, 2=shot spread */
+        e->dx = 0; e->dy = 0;
+        e->timer = 75;
+        e->shoot_timer = 60;
+        e->attack_pattern = 0;
+        break;
+    case ENEMY_BOSS_SATAN:
+        /* Satan: 3 HP-driven phases (e->phase). Movement sub-state lives in
+           e->attack_pattern (0=idle, 1=airborne stomp, 2=recovery) so the
+           HP phase and the stomp state machine don't fight over e->phase. */
+        e->phase = 0;
+        e->attack_pattern = 0;
+        e->dx = 0; e->dy = 0;
+        e->timer = 90;
+        e->shoot_timer = 60;
+        break;
+    default: break;
     }
 }
 
@@ -1001,17 +1763,37 @@ void room_spawn_enemies(Game *g, Room *r) {
     if (r->type == ROOM_TREASURE) {
         r->enemy_count = 0;
         r->cleared = 1;
-        /* Place an item pedestal */
+        /* Place an item pedestal (E9 "The Purist": no pedestals all run) */
         r->pedestal.x = (ROOM_LEFT + ROOM_RIGHT) / 2.0f;
         r->pedestal.y = (ROOM_TOP + ROOM_BOTTOM) / 2.0f;
         r->pedestal.item = pick_random_item(g);
-        r->pedestal.active = 1;
+        r->pedestal.active = (g->challenge != 6);
         return;
     }
 
     if (r->type == ROOM_SHOP) {
         r->enemy_count = 0;
         r->cleared = 1;
+        /* T3 "The Purist": no ITEMS anywhere — the shop stocks no item
+           pedestals; consumables stay available (heart/key/bomb pickups
+           below plus the usual pill/card sprinkles). */
+        if (g->challenge == 6) {
+            r->shop_count = 0;
+            float pcx = (ROOM_LEFT + ROOM_RIGHT) / 2.0f;
+            float pcy = (ROOM_TOP + ROOM_BOTTOM) / 2.0f - 10;
+            spawn_heart(r, pcx - 40, pcy, HEART_RED_FULL);
+            spawn_consumable(r, pcx, pcy, PICKUP_KEY);
+            spawn_consumable(r, pcx + 40, pcy, PICKUP_BOMB);
+            if (randi(0, 100) < 60) {
+                spawn_pill_pickup(r, ROOM_LEFT + 40, ROOM_BOTTOM - 40,
+                                  randi(0, PILL_EFFECT_COUNT - 1));
+            }
+            if (randi(0, 100) < 60) {
+                spawn_card_pickup(r, ROOM_RIGHT - 40, ROOM_BOTTOM - 40,
+                                  randi(0, TAROT_COUNT - 1));
+            }
+            return;
+        }
         /* Populate shop items (no duplicates within same shop) */
         r->shop_count = randi(2, MAX_SHOP_ITEMS);
         float shopX_start = ROOM_LEFT + 60;
@@ -1051,27 +1833,146 @@ void room_spawn_enemies(Game *g, Room *r) {
     if (r->type == ROOM_SECRET) {
         r->enemy_count = 0;
         r->cleared = 1;
-        /* Secret rooms always have good loot */
-        spawn_consumable(r, (ROOM_LEFT + ROOM_RIGHT) / 2.0f - 15,
-                         (ROOM_TOP + ROOM_BOTTOM) / 2.0f, PICKUP_BOMB2);
-        spawn_consumable(r, (ROOM_LEFT + ROOM_RIGHT) / 2.0f + 15,
-                         (ROOM_TOP + ROOM_BOTTOM) / 2.0f, PICKUP_COIN5);
-        spawn_consumable(r, (ROOM_LEFT + ROOM_RIGHT) / 2.0f,
-                         (ROOM_TOP + ROOM_BOTTOM) / 2.0f - 15, PICKUP_KEY);
+        r->is_black_market = 0;
+
+        /* Black market upgrade: low base chance, boosted by luck. Turns the
+           secret room into a mini paid shop (2-3 pedestals at a premium
+           price) instead of the usual free pickups.
+           T3 "The Purist" (challenge 6): never upgrades — items are gated,
+           so keep the consumable loot (hearts/keys/bombs) path below. */
+        if (g->challenge != 6 && luck_roll(g, 16, 2)) {
+            r->is_black_market = 1;
+            r->shop_count = randi(2, MAX_SHOP_ITEMS);
+            float shopX_start = ROOM_LEFT + 60;
+            float shopSpacing = (ROOM_RIGHT - ROOM_LEFT - 120) /
+                                 (float)(r->shop_count > 1 ? r->shop_count - 1 : 1);
+            ItemType shop_used[MAX_SHOP_ITEMS];
+            for (int i = 0; i < r->shop_count; i++) {
+                ShopItem *si = &r->shop_items[i];
+                si->x = shopX_start + i * shopSpacing;
+                si->y = (ROOM_TOP + ROOM_BOTTOM) / 2.0f - 10;
+                int tries = 0;
+                do {
+                    si->item = pick_random_item(g);
+                    int dup = 0;
+                    for (int j = 0; j < i; j++) {
+                        if (shop_used[j] == si->item) { dup = 1; break; }
+                    }
+                    if (!dup) break;
+                    tries++;
+                } while (tries < 20);
+                shop_used[i] = si->item;
+                /* Black market premium: costlier than a normal shop */
+                int base_cost = randi(SHOP_ITEM_COST_MIN + 3, SHOP_ITEM_COST_MAX + 5);
+                si->cost = (int)(base_cost * diff_shop_price_mult(g->difficulty));
+                if (si->cost < 1) si->cost = 1;
+                si->active = 1;
+            }
+            return;
+        }
+
+        /* Secret rooms always have good loot; deeper floors and higher luck
+           add more/better pickups on top of the guaranteed base trio. */
+        float scx = (ROOM_LEFT + ROOM_RIGHT) / 2.0f;
+        float scy = (ROOM_TOP + ROOM_BOTTOM) / 2.0f;
+        spawn_consumable(r, scx - 15, scy, PICKUP_BOMB2);
+        spawn_consumable(r, scx + 15, scy, PICKUP_COIN5);
+        spawn_consumable(r, scx, scy - 15, PICKUP_KEY);
+
+        /* Bonus coins scale with floor depth */
+        if (g->current_floor >= 2) {
+            spawn_consumable(r, scx + 30, scy + 20, PICKUP_COIN5);
+        }
+        if (luck_roll(g, 10 + g->current_floor * 6, 3)) {
+            spawn_random_consumable(r, scx - 30, scy + 20);
+        }
+        /* Chance at a chest, better odds deeper in the run */
+        if (luck_roll(g, g->current_floor * 8, 3)) {
+            if (luck_roll(g, g->current_floor * 5, 2))
+                spawn_consumable(r, scx, scy + 30, PICKUP_CHEST_GOLD);
+            else
+                spawn_consumable(r, scx, scy + 30, PICKUP_CHEST);
+        }
         return;
     }
 
     if (r->type == ROOM_CURSE) {
         r->enemy_count = 0;
         r->cleared = 1;
-        /* Curse rooms have a good item pedestal */
+        /* Curse rooms have a good item pedestal (Purist: none) */
         r->pedestal.x = (ROOM_LEFT + ROOM_RIGHT) / 2.0f;
         r->pedestal.y = (ROOM_TOP + ROOM_BOTTOM) / 2.0f;
         r->pedestal.item = pick_random_item(g);
-        r->pedestal.active = 1;
+        r->pedestal.active = (g->challenge != 6);
         /* Also spawn some pickups */
         spawn_consumable(r, ROOM_LEFT + 60, ROOM_TOP + 60, PICKUP_COIN5);
         spawn_consumable(r, ROOM_RIGHT - 60, ROOM_TOP + 60, PICKUP_KEY);
+        return;
+    }
+
+    if (r->type == ROOM_ANGEL) {
+        r->enemy_count = 0;
+        r->cleared = 1;
+        /* Free item pedestal + 2 soul hearts, no enemies (Purist: none) */
+        r->pedestal.x = (ROOM_LEFT + ROOM_RIGHT) / 2.0f;
+        r->pedestal.y = (ROOM_TOP + ROOM_BOTTOM) / 2.0f;
+        r->pedestal.item = pick_random_item(g);
+        r->pedestal.active = (g->challenge != 6);
+        spawn_heart(r, ROOM_LEFT + 60, ROOM_TOP + 60, HEART_SOUL);
+        spawn_heart(r, ROOM_RIGHT - 60, ROOM_TOP + 60, HEART_SOUL);
+        return;
+    }
+
+    if (r->type == ROOM_SACRIFICE) {
+        r->enemy_count = 0;
+        r->cleared = 1;
+        r->sacrifice_hits = 0;
+        r->sacrifice_rewarded = 0;
+        /* Central spikes obstacle; hitting them repeatedly grants a reward */
+        r->obstacle_count = 0;
+        Obstacle *o = &r->obstacles[r->obstacle_count++];
+        o->x = (ROOM_LEFT + ROOM_RIGHT) / 2.0f;
+        o->y = (ROOM_TOP + ROOM_BOTTOM) / 2.0f;
+        o->type = OBST_SPIKES;
+        o->hp = 1;
+        o->active = 1;
+        return;
+    }
+
+    if (r->type == ROOM_BOSSRUSH) {
+        /* No enemies at spawn time -- the wave controller (in enemies_update)
+           drives spawning wave-by-wave once the player enters. Room starts
+           uncleared; it is guaranteed to clear once the wave machine finishes
+           (see the anti-softlock safety net in enemies_update). */
+        r->enemy_count = 0;
+        r->cleared = 0;
+        return;
+    }
+
+    if (r->type == ROOM_ARCADE) {
+        r->enemy_count = 0;
+        r->cleared = 1;
+        r->arcade_slot_used = 0;
+        /* Central "slot machine" obstacle: pay a coin, roll a reward */
+        r->obstacle_count = 0;
+        Obstacle *slot = &r->obstacles[r->obstacle_count++];
+        slot->x = (ROOM_LEFT + ROOM_RIGHT) / 2.0f;
+        slot->y = (ROOM_TOP + ROOM_BOTTOM) / 2.0f;
+        slot->type = OBST_SLOT_MACHINE;
+        slot->hp = 1;
+        slot->active = 1;
+        return;
+    }
+
+    if (r->type == ROOM_LIBRARY) {
+        r->enemy_count = 0;
+        r->cleared = 1;
+        /* Free item pedestal biased toward active items, plus a second
+           free pedestal (any item) -- both no-cost, no enemies. */
+        r->pedestal.x = (ROOM_LEFT + ROOM_RIGHT) / 2.0f;
+        r->pedestal.y = (ROOM_TOP + ROOM_BOTTOM) / 2.0f;
+        r->pedestal.item = pick_random_active_item(g);
+        r->pedestal.active = (g->challenge != 6);   /* Purist: none */
         return;
     }
 
@@ -1094,11 +1995,30 @@ void room_spawn_enemies(Game *g, Room *r) {
 
         float px, py;
         int safety = 0;
+        int bad_spot;
         do {
             px = randf(ROOM_LEFT + 30, ROOM_RIGHT - 30);
             py = randf(ROOM_TOP + 30, ROOM_BOTTOM - 30);
             safety++;
-        } while (fabsf(px - cx) < 50 && fabsf(py - cy) < 50 && safety < 20);
+            /* Reject spawns near the room centre (warp landing) and near
+               all 4 door mouths (door landing) so entering never means
+               materialising on top of an enemy. */
+            bad_spot = (fabsf(px - cx) < 50 && fabsf(py - cy) < 50);
+            if (!bad_spot) {
+                float doorpt[4][2] = {
+                    {cx, (float)ROOM_TOP},  {cx, (float)ROOM_BOTTOM},
+                    {(float)ROOM_LEFT, cy}, {(float)ROOM_RIGHT, cy}
+                };
+                for (int dpi = 0; dpi < 4; dpi++) {
+                    float ddx = px - doorpt[dpi][0];
+                    float ddy = py - doorpt[dpi][1];
+                    if (ddx * ddx + ddy * ddy < 60.0f * 60.0f) {
+                        bad_spot = 1;
+                        break;
+                    }
+                }
+            }
+        } while (bad_spot && safety < 20);
 
         e->x = px;
         e->y = py;
@@ -1106,115 +2026,25 @@ void room_spawn_enemies(Game *g, Room *r) {
         if (r->type == ROOM_BOSS) {
             /* === Random Boss Selection from Pool === */
             EnemyType selected_boss = select_boss_for_floor(g, g->current_floor);
-            int boss_hp = get_boss_base_hp(selected_boss, g->current_floor);
 
             /* Store the selected boss type and record in history */
             g->current_boss_type = selected_boss;
             push_boss_history(g, selected_boss);
 
-            e->type = selected_boss;
-            e->hp = boss_hp;
-            e->max_hp = boss_hp;
-            e->x = cx;
-            e->y = ROOM_TOP + 60;
-            e->timer = randi(60, 120);
-            e->shoot_timer = randi(40, 80);
-
-            /* Boss-specific initialization */
-            switch (selected_boss) {
-            case ENEMY_BOSS_MONSTRO:
-                e->phase = 0;       /* 0=idle, 1=jumping, 2=landing_tear_spread */
-                e->jump_z = 0;
-                e->jump_vz = 0;
-                e->attack_pattern = 0;
-                break;
-            case ENEMY_BOSS_LARRY:
-                e->seg_count = MAX_LARRY_SEGMENTS;
-                e->seg_speed = 1.8f * fi->boss_speed_scale;
-                e->dx = 1.8f * fi->boss_speed_scale;
-                e->dy = 0.5f;
-                for (int s = 0; s < MAX_LARRY_SEGMENTS; s++) {
-                    e->segments[s].x = e->x - (s + 1) * LARRY_SEG_DIST;
-                    e->segments[s].y = e->y;
-                    e->segments[s].prev_x = e->segments[s].x;
-                    e->segments[s].prev_y = e->segments[s].y;
-                }
-                break;
-            case ENEMY_BOSS_DUKE:
-                e->orbit_phase = 0;
-                e->timer = DUKE_SPAWN_INTERVAL;
-                break;
-            case ENEMY_BOSS_GEMINI:
-                e->gemini_split = 0;
-                e->gemini_cx = e->x + 35;
-                e->gemini_cy = e->y;
-                e->gemini_cdx = 0;
-                e->gemini_cdy = 0;
-                e->gemini_chp = boss_hp / 3;
-                break;
-            case ENEMY_BOSS_FAMINE:
-                e->phase = 0;       /* 0=galloping, 1=headless */
-                e->famine_shoot_cd = randi(40, 80);
-                e->dx = FAMINE_CHARGE_SPEED * fi->boss_speed_scale;
-                break;
-            /* --- Phase 2 bosses --- */
-            case ENEMY_BOSS_PEEP:
-                e->phase = 0;            /* 0=full, 1=detach phase (below 50% HP) */
-                e->dx = 1.8f * fi->boss_speed_scale;
-                e->dy = 1.5f * fi->boss_speed_scale;
-                e->timer = 120;
-                e->attack_pattern = 0;   /* eye spawn counter */
-                break;
-            case ENEMY_BOSS_GURDY:
-                e->phase = 0;            /* 0=idle, 1=spawn wave, 2=shoot spread */
-                e->dx = 0; e->dy = 0;    /* stationary */
-                e->timer = 60;
-                e->shoot_timer = 60;
-                e->attack_pattern = 0;   /* alternates between attacks */
-                break;
-            case ENEMY_BOSS_PIN:
-                e->phase = 1;            /* 0=above ground (vulnerable) 1=burrowed */
-                e->timer = 90;           /* time burrowed */
-                e->target_x = e->x;
-                e->target_y = e->y;
-                e->dx = 0; e->dy = 0;
-                e->shoot_timer = 30;
-                break;
-            case ENEMY_BOSS_HAUNT:
-                e->phase = 0;            /* 0=Lil Haunts phase, 1=brimstone phase */
-                e->dx = 1.0f * fi->boss_speed_scale;
-                e->dy = 0.8f * fi->boss_speed_scale;
-                e->timer = 60;
-                e->shoot_timer = 120;
-                e->attack_pattern = 0;
-                break;
-            case ENEMY_BOSS_WIDOW:
-                e->phase = 0;            /* 0=idle, 1=jumping */
-                e->jump_z = 0;
-                e->jump_vz = 0;
-                e->target_x = e->x;
-                e->target_y = e->y;
-                e->timer = 60;
-                e->shoot_timer = 90;
-                break;
-            case ENEMY_BOSS_MEGA_SATAN:
-                e->phase = 0;            /* 0=stomp, 1=brimstone, 2=fireball spread */
-                e->dx = 0; e->dy = 0;    /* mostly stationary */
-                e->timer = 90;
-                e->shoot_timer = 60;
-                e->attack_pattern = 0;
-                break;
-            default: break;
-            }
+            init_boss_enemy(g, fi, e, selected_boss, cx);
         } else {
             /* Floor-tiered enemy pool selection */
             int t;
             if (g->current_floor >= 3) {
-                t = randi(0, 16);  /* all enemy types available */
+                t = randi(0, 23);  /* all enemy types + Trite/Fatty/Charger (17-19) + Keeper/Sucker (20-21)
+                                       + RoundWorm/Spitty (22-23) */
             } else if (g->current_floor >= 2) {
-                t = randi(0, 10);  /* + tier 2 (Globin, Boom Fly, Maw, Mulligan) */
+                /* Caves I: tiers 0-2 (0-12, incl. Maw/Mulligan) plus the
+                   variants at 17-23 */
+                t = randi(0, 19);
+                if (t > 12) t += 4;  /* 13->17, 14->18, ..., 19->23 */
             } else if (g->current_floor >= 1) {
-                t = randi(0, 6);   /* + tier 1 (Attack Fly, Pooter, Hopper, Baby) */
+                t = randi(0, 8);   /* + tier 1 (Attack Fly, Pooter, Hopper, Baby) */
             } else {
                 t = randi(0, 4);   /* base: Fly, Gaper, Pacer, Spider, Clotty */
             }
@@ -1273,7 +2103,6 @@ void room_spawn_enemies(Game *g, Room *r) {
                 e->timer = randi(60, 120);
                 e->shoot_timer = randi(40, 80);
                 break;
-            /* --- Tier 2: Caves+ --- */
             case 7:
                 e->type = ENEMY_HOPPER;
                 e->hp = 4 + fi->enemy_hp_bonus;
@@ -1286,6 +2115,7 @@ void room_spawn_enemies(Game *g, Room *r) {
                 e->hp = 3 + fi->enemy_hp_bonus;
                 e->max_hp = e->hp;
                 break;
+            /* --- Tier 2: Caves+ --- */
             case 9:
                 e->type = ENEMY_GLOBIN;
                 e->hp = 8 + fi->enemy_hp_bonus;
@@ -1300,7 +2130,6 @@ void room_spawn_enemies(Game *g, Room *r) {
                 e->dx = randf(-0.5f, 0.5f) * fi->enemy_speed_mult;
                 e->dy = randf(-0.5f, 0.5f) * fi->enemy_speed_mult;
                 break;
-            /* --- Tier 3: Caves II / Depths --- */
             case 11:
                 e->type = ENEMY_MAW;
                 e->hp = 6 + fi->enemy_hp_bonus;
@@ -1313,6 +2142,7 @@ void room_spawn_enemies(Game *g, Room *r) {
                 e->max_hp = e->hp;
                 e->shoot_timer = randi(50, 100);
                 break;
+            /* --- Tier 3: Caves II / Depths --- */
             case 13:
                 e->type = ENEMY_HOST;
                 e->hp = 4 + fi->enemy_hp_bonus;
@@ -1340,6 +2170,56 @@ void room_spawn_enemies(Game *g, Room *r) {
                 e->timer = randi(40, 80);
                 e->shoot_timer = randi(60, 120);
                 break;
+            /* --- New variant enemies (reachable floor 2+) --- */
+            case 17:
+                e->type = ENEMY_TRITE;
+                e->hp = 5 + fi->enemy_hp_bonus;
+                e->max_hp = e->hp;
+                e->timer = randi(20, 45);
+                e->jump_arc = 0.0f;
+                break;
+            case 18:
+                e->type = ENEMY_FATTY;
+                e->hp = 8 + fi->enemy_hp_bonus * 2;  /* tanky: ~2x a gaper */
+                e->max_hp = e->hp;
+                break;
+            case 19:
+                e->type = ENEMY_CHARGER;
+                e->hp = 4 + fi->enemy_hp_bonus;
+                e->max_hp = e->hp;
+                e->dx = (randi(0, 1) == 0) ? 1.2f : -1.2f;
+                e->dx *= fi->enemy_speed_mult;
+                e->dy = 0;
+                break;
+            case 20:
+                e->type = ENEMY_KEEPER;
+                e->hp = 5 + fi->enemy_hp_bonus;
+                e->max_hp = e->hp;
+                e->timer = randi(15, 40);
+                break;
+            case 21:
+                e->type = ENEMY_SUCKER;
+                e->hp = 5 + fi->enemy_hp_bonus;
+                e->max_hp = e->hp;
+                e->timer = randi(40, 80);
+                e->shoot_timer = randi(70, 110);
+                break;
+            /* --- New enemies (batch: more enemies + boss) --- */
+            case 22:
+                e->type = ENEMY_ROUND_WORM;
+                e->hp = 5 + fi->enemy_hp_bonus;
+                e->max_hp = e->hp;
+                e->phase = 1;      /* 0=emerged (vulnerable, chasing), 1=burrowed */
+                e->hidden = 1;
+                e->timer = randi(50, 90);
+                e->dx = 0; e->dy = 0;
+                break;
+            case 23:
+                e->type = ENEMY_SPITTY;
+                e->hp = 4 + fi->enemy_hp_bonus;
+                e->max_hp = e->hp;
+                e->shoot_timer = randi(50, 100);
+                break;
             }
         }
 
@@ -1350,7 +2230,7 @@ void room_spawn_enemies(Game *g, Room *r) {
             hp_mult *= 1.0f + g->infinite_loop * 0.25f;
         }
         if (hp_mult != 1.0f) {
-            e->hp = (int)(e->hp * hp_mult);
+            e->hp = e->hp * hp_mult;
             if (e->hp < 1) e->hp = 1;
             e->max_hp = e->hp;
         }
@@ -1374,19 +2254,19 @@ void enemy_make_champion(Enemy *e, ChampionType c) {
     e->champion = c;
     switch (c) {
         case CHAMP_RED:
-            e->hp = e->max_hp = (int)(e->max_hp * 2.0f);
+            e->hp = e->max_hp = e->max_hp * 2.0f;
             break;
         case CHAMP_BLUE:
-            e->hp = e->max_hp = (int)(e->max_hp * 1.5f);
+            e->hp = e->max_hp = e->max_hp * 1.5f;
             e->dx *= 1.3f;
             e->dy *= 1.3f;
             break;
         case CHAMP_YELLOW:
-            e->hp = e->max_hp = (int)(e->max_hp * 1.5f);
+            e->hp = e->max_hp = e->max_hp * 1.5f;
             e->creep_drop_timer = 30;
             break;
         case CHAMP_BLACK:
-            e->hp = e->max_hp = (int)(e->max_hp * 2.0f);
+            e->hp = e->max_hp = e->max_hp * 2.0f;
             e->split_pending = 1;  /* marks split-on-death */
             break;
         case CHAMP_NONE:
@@ -1427,12 +2307,14 @@ void start_new_game(Game *g) {
     GameMode  saved_mode = g->game_mode;
     Difficulty saved_diff = g->difficulty;
     CharacterType saved_char = g->selected_character;
+    int saved_challenge = g->challenge;
 
     memset(g, 0, sizeof(Game));
 
     g->game_mode = saved_mode;
     g->difficulty = saved_diff;
     g->selected_character = saved_char;
+    g->challenge = saved_challenge;
     g->state = STATE_PLAYING;
     g->score = 0;
     g->current_floor = 0;
@@ -1459,12 +2341,24 @@ void start_new_game(Game *g) {
     g->player.holy_mantle_active = 0;
     g->player.book_belial_dmg_timer = 0;
     g->player.yum_heart_cd = 0;
+    g->player.active_item = ITEM_NONE;
+    g->player.active_charge = 0;
+    g->player.active_max_charge = 0;
     g->player.soul_hp = 0;
+    g->player.trinket = TRINKET_NONE;
     g->player.has_pill = 0;
     g->player.has_card = 0;
 
     /* Apply character starting bonuses (items + adjust HP to max) */
     apply_character_start(g);
+
+    /* Challenge modifiers (mirrored onto the player so recalc sees them) */
+    g->player.challenge = g->challenge;
+    if (g->challenge) {
+        recalc_player_stats(&g->player);
+        if (g->player.hp > g->player.stats.max_hp)
+            g->player.hp = g->player.stats.max_hp;
+    }
 
     recalc_player_stats(&g->player);
 
@@ -1486,6 +2380,10 @@ void start_new_game(Game *g) {
     }
     for (int i = 0; i < PILL_EFFECT_COUNT; i++) g->pill_known[i] = 0;
 
+    /* Roll a curse for the starting floor (30% chance). Rolled before
+     * dungeon_generate so Curse of the Labyrinth can influence layout size. */
+    roll_curse(g);
+
     dungeon_generate(&g->dungeon, g->current_floor);
 
     g->player.x = (ROOM_LEFT + ROOM_RIGHT) / 2.0f;
@@ -1494,8 +2392,24 @@ void start_new_game(Game *g) {
     Room *r = current_room(g);
     room_spawn_enemies(g, r);
 
-    /* Roll a curse for the starting floor (30% chance) */
-    roll_curse(g);
+    /* E6: seed the familiar trail at the spawn position */
+    familiars_reset_trail(g);
+    g_black_burst_pending = 0;
+
+    /* E9 challenge 5 "Cat Got Your Tongue": no tears — start with the
+       Demon Baby + Brother Bobby familiars as the only weapons. */
+    if (g->challenge == 5) {
+        g->player.familiar[0] = ITEM_DEMON_BABY;
+        g->player.familiar[1] = ITEM_BROTHER_BOBBY;
+    }
+
+    /* E9 challenge 6 "The Purist": the final floor's boss room becomes a
+       Boss Rush gauntlet (its clear grants the winning trapdoor). Floor 0
+       never qualifies, but keep the check parallel with advance_floor. */
+    if (g->challenge == 6 && g->current_floor == MAX_FLOORS - 1) {
+        Dungeon *pd = &g->dungeon;
+        pd->rooms[pd->boss_y][pd->boss_x].type = ROOM_BOSSRUSH;
+    }
 
     /* Track total runs started in persistent config */
     g_config.total_runs_started++;
@@ -1510,16 +2424,28 @@ void apply_character_start(Game *g) {
     Player *p = &g->player;
     switch (p->character) {
         case CHAR_MAGDALENE:
-            /* +1 heart container, Yum Heart starter */
-            p->items[p->item_count++] = ITEM_YUM_HEART;
+            /* +1 heart container, Yum Heart starter (active item) */
+            collect_item(g, ITEM_YUM_HEART);
             break;
         case CHAR_CAIN:
             /* Lucky Foot starter, missing eye visual */
             p->items[p->item_count++] = ITEM_LUCKY_FOOT;
             break;
         case CHAR_JUDAS:
-            /* Book of Belial starter */
-            p->items[p->item_count++] = ITEM_BOOK_OF_BELIAL;
+            /* Book of Belial starter (active item) */
+            collect_item(g, ITEM_BOOK_OF_BELIAL);
+            break;
+        case CHAR_EVE:
+            /* Starts with 1 soul heart */
+            p->soul_hp = 2;   /* soul_hp is in half-heart units */
+            break;
+        case CHAR_SAMSON:
+            /* Flat stat start, no special starting item */
+            break;
+        case CHAR_BLUE_BABY:
+            /* 2 red heart containers + 4 soul hearts (safe option, avoids
+             * 0-red-heart edge cases in HUD/heal code) */
+            p->soul_hp = 8;   /* soul_hp is in half-heart units: 4 hearts = 8 */
             break;
         case CHAR_ISAAC:
         default:
@@ -1562,8 +2488,19 @@ void advance_floor(Game *g) {
 static void finish_floor_transition(Game *g) {
     g->state = STATE_PLAYING;
 
+    /* Roll a possible curse for this floor (30% chance). Rolled before
+     * dungeon_generate so Curse of the Labyrinth can influence layout size. */
+    roll_curse(g);
+
     /* Generate new dungeon for new floor */
     dungeon_generate(&g->dungeon, g->current_floor);
+
+    /* E9 challenge 6 "The Purist": final floor's boss room is a Boss Rush
+       gauntlet instead (its clear grants the winning trapdoor). */
+    if (g->challenge == 6 && g->current_floor == MAX_FLOORS - 1) {
+        Dungeon *pd = &g->dungeon;
+        pd->rooms[pd->boss_y][pd->boss_x].type = ROOM_BOSSRUSH;
+    }
 
     /* Reset tears and enemy shots */
     for (int i = 0; i < MAX_TEARS; i++)
@@ -1575,18 +2512,33 @@ static void finish_floor_transition(Game *g) {
     for (int i = 0; i < MAX_BLOOD_PARTICLES; i++)
         g->blood[i].active = 0;
 
-    /* Reset bomb */
-    g->bomb_timer = 0;
+    /* Reset bombs */
+    for (int i = 0; i < MAX_BOMBS; i++)
+        g->bombs[i].active = 0;
+
+    /* Reset beam weapons + knife (Phase D) */
+    g->laser_active = 0;
+    g->laser_timer = 0;
+    g->laser_charge = 0;
+    g->knife_state = 0;
+    g->knife_hit_cd = 0;
 
     /* Reset boss state */
     g->boss_active = 0;
     g->boss_death_anim = 0;
     g->boss_intro_timer = 0;
 
+    /* E3: no enemy beam survives a floor change */
+    g->ebeam_state = 0;
+    g->ebeam_timer = 0;
+
     /* Place player in center */
     g->player.x = (ROOM_LEFT + ROOM_RIGHT) / 2.0f;
     g->player.y = (ROOM_TOP + ROOM_BOTTOM) / 2.0f;
     g->player.iframes = 30;
+
+    /* E6: snap the familiar trail to the new floor's spawn */
+    familiars_reset_trail(g);
 
     /* Safety: guarantee at least 1 key per floor so locked doors
      * are never a permanent softlock even in edge cases */
@@ -1594,9 +2546,6 @@ static void finish_floor_transition(Game *g) {
 
     Room *r = current_room(g);
     room_spawn_enemies(g, r);
-
-    /* Roll a possible curse for this floor (30% chance) */
-    roll_curse(g);
 
     /* Play floor-appropriate music (crossfades if track changes) */
     music_play(music_for_floor(g->current_floor));
@@ -1615,6 +2564,7 @@ static int player_blocked_at(Room *r, float x, float y) {
     for (int i = 0; i < r->obstacle_count; i++) {
         Obstacle *o = &r->obstacles[i];
         if (!o->active) continue;
+        if (o->type == OBST_SPIKES) continue;   /* spikes never block movement */
         float ox = x - o->x, oy = y - o->y;
         float md = PLAYER_SIZE + OBSTACLE_SIZE * 0.5f;
         if (ox * ox + oy * oy < md * md) return 1;
@@ -1801,21 +2751,36 @@ void player_update(Game *g, u32 kHeld, circlePosition circlePos) {
         float hdx = p->x - h->x;
         float hdy = p->y - h->y;
         if (hdx * hdx + hdy * hdy < (PLAYER_SIZE + 8) * (PLAYER_SIZE + 8)) {
-            /* Heal player based on heart type */
-            int heal_amount = 0;
-            if (h->type == HEART_RED_FULL) {
-                heal_amount = 2;
-            } else if (h->type == HEART_RED_HALF) {
-                heal_amount = 1;
-            }
-            
-            /* Only pick up if player can be healed */
-            if (p->hp < p->stats.max_hp) {
-                p->hp += heal_amount;
-                if (p->hp > p->stats.max_hp) p->hp = p->stats.max_hp;
-                h->active = 0;
-                r->heart_count--;
-                audio_play(SFX_PICKUP);
+            if (h->type == HEART_SOUL) {
+                /* Soul heart: bonus HP consumed before red hearts.
+                   (Gain path was missing — soul hearts previously healed 0.) */
+                if (p->soul_hp < 12) {   /* cap at 6 blue hearts */
+                    p->soul_hp += 2;
+                    if (p->soul_hp > 12) p->soul_hp = 12;
+                    h->active = 0;
+                    r->heart_count--;
+                    audio_play(SFX_PICKUP);
+                }
+            } else if (h->type == HEART_BLACK) {
+                /* E5 black heart: absorbs like a soul heart but BEFORE soul
+                   hearts; depleting one nukes the room. Refused at cap. */
+                if (p->black_hp < 12) {  /* cap at 6 black hearts */
+                    p->black_hp += 2;
+                    if (p->black_hp > 12) p->black_hp = 12;
+                    h->active = 0;
+                    r->heart_count--;
+                    audio_play(SFX_PICKUP);
+                }
+            } else {
+                /* Red hearts heal, only if player is wounded */
+                int heal_amount = (h->type == HEART_RED_FULL) ? 2 : 1;
+                if (p->hp < p->stats.max_hp) {
+                    p->hp += heal_amount;
+                    if (p->hp > p->stats.max_hp) p->hp = p->stats.max_hp;
+                    h->active = 0;
+                    r->heart_count--;
+                    audio_play(SFX_PICKUP);
+                }
             }
         }
     }
@@ -1835,13 +2800,27 @@ void player_update(Game *g, u32 kHeld, circlePosition circlePos) {
             case PICKUP_KEY:    p->keys  += 1; break;
             case PICKUP_COIN:   p->coins += 1; break;
             case PICKUP_COIN5:  p->coins += 5; break;
+            case PICKUP_KEY5:   p->keys  += 5; break;
+            case PICKUP_BATTERY:
+                if (p->active_item != ITEM_NONE) {
+                    /* Refill active item charge to full */
+                    p->active_charge = p->active_max_charge;
+                } else picked_up = 0;  /* nothing to charge: leave it */
+                break;
             case PICKUP_PILL:
                 if (!p->has_pill) {
                     p->has_pill = 1;
                     p->held_pill = (PillEffect)c->sub_type;
-                    /* Show pill color name as pickup message */
-                    snprintf(g->pickup_msg_text, sizeof(g->pickup_msg_text),
-                             "Pill: %s", pill_color_name(c->sub_type));
+                    /* Effect name if identified this run, else the color of
+                       the capsule actually drawn (via pill_color_map) */
+                    {
+                        PillEffect pe = (PillEffect)c->sub_type;
+                        const char *pn = g->pill_known[pe]
+                            ? pill_name(pe, 1)
+                            : pill_color_name(g->pill_color_map[pe]);
+                        snprintf(g->pickup_msg_text, sizeof(g->pickup_msg_text),
+                                 "Pill: %s", pn);
+                    }
                     g->pickup_msg_timer = 180;
                 } else picked_up = 0;
                 break;
@@ -1854,6 +2833,61 @@ void player_update(Game *g, u32 kHeld, circlePosition circlePos) {
                     g->pickup_msg_timer = 180;
                 } else picked_up = 0;
                 break;
+            case PICKUP_TRINKET: {
+                int newT = c->sub_type;
+                if (p->trinket != TRINKET_NONE) {
+                    /* Swap: drop the held trinket just out of grab range */
+                    spawn_trinket_pickup(r, c->x + 30, c->y, p->trinket);
+                }
+                p->trinket = newT;
+                recalc_player_stats(p);
+                snprintf(g->pickup_msg_text, sizeof(g->pickup_msg_text),
+                         "Trinket: %s", trinket_name(newT));
+                g->pickup_msg_timer = 180;
+                break;
+            }
+            case PICKUP_CHEST: {
+                /* Wooden chest: pops open into a small loot burst */
+                int n = randi(2, 3);
+                for (int ci2 = 0; ci2 < n; ci2++)
+                    spawn_random_consumable(r, c->x + randf(-22, 22),
+                                            c->y + randf(-16, 16));
+                if (randi(0, 99) < 40)
+                    spawn_heart(r, c->x + randf(-18, 18),
+                                c->y + randf(-14, 14), HEART_RED_HALF);
+                spawn_tear_pop(g, c->x, c->y, 0);
+                break;
+            }
+            case PICKUP_CHEST_GOLD:
+                if (p->keys > 0) {
+                    /* Gold chest: costs a key, guaranteed good loot */
+                    p->keys--;
+                    if (randi(0, 1))
+                        spawn_pill_pickup(r, c->x + randf(-22, 22),
+                                          c->y + randf(-14, 14),
+                                          randi(0, PILL_EFFECT_COUNT - 1));
+                    else
+                        spawn_card_pickup(r, c->x + randf(-22, 22),
+                                          c->y + randf(-14, 14),
+                                          randi(0, TAROT_COUNT - 1));
+                    spawn_consumable(r, c->x + randf(-22, 22),
+                                     c->y + randf(-16, 16), PICKUP_COIN5);
+                    spawn_heart(r, c->x + randf(-18, 18), c->y + randf(-14, 14),
+                                randi(0, 99) < 25 ? HEART_SOUL : HEART_RED_FULL);
+                    /* 20% bonus trinket in gold chests */
+                    if (randi(0, 99) < 20)
+                        spawn_trinket_pickup(r, c->x + randf(-24, 24),
+                                             c->y + randf(-16, 16),
+                                             randi(1, TRINKET_COUNT - 1));
+                    spawn_tear_pop(g, c->x, c->y, 0);
+                } else {
+                    picked_up = 0;
+                    if (g->shop_deny_timer <= 0) {
+                        audio_play(SFX_TEAR_BLOCK);   /* locked: need a key */
+                        g->shop_deny_timer = 45;
+                    }
+                }
+                break;
             default: break;
             }
             if (p->coins > 99) p->coins = 99;
@@ -1865,8 +2899,11 @@ void player_update(Game *g, u32 kHeld, circlePosition circlePos) {
         }
     }
 
-    /* Shop item purchase (walk into shop item to buy) */
-    if (r->type == ROOM_SHOP) {
+    /* Shop / devil-deal / black-market item purchase (walk into item to buy).
+       Black market is a secret room flagged via is_black_market rather than
+       a distinct RoomType, so it reuses the ROOM_SHOP purchase path (paid in
+       coins, same as a normal shop). */
+    if (r->type == ROOM_SHOP || r->type == ROOM_DEVIL || r->is_black_market) {
         if (g->shop_deny_timer > 0) g->shop_deny_timer--;
         for (int i = 0; i < r->shop_count; i++) {
             ShopItem *si = &r->shop_items[i];
@@ -1875,8 +2912,53 @@ void player_update(Game *g, u32 kHeld, circlePosition circlePos) {
             float sdx = p->x - si->x;
             float sdy = p->y - (si->y + 5);  /* match pedestal visual center */
             if (sdx * sdx + sdy * sdy < (PLAYER_SIZE + 12) * (PLAYER_SIZE + 12)) {
-                /* Player walked into shop item - buy if affordable */
-                if (p->coins >= si->cost) {
+                if (r->type == ROOM_DEVIL) {
+                    /* Devil deal: pay with heart containers (permanent) */
+                    int hpCost = si->cost * 2;
+                    if (player_has_item(p, ITEM_DEAD_CAT)) {
+                        /* Dead Cat floors max_hp to 2, so heart-container payment
+                           is impossible. Pay a spare life per heart of cost. */
+                        int lifeCost = si->cost;
+                        if (p->lives >= lifeCost) {
+                            p->lives -= lifeCost;
+                            g->last_pickup = si->item;
+                            g->pickup_flash = PICKUP_FLASH_FRAMES;
+                            p->pickup_anim = 40;
+                            collect_item(g, si->item);
+                            si->active = 0;
+                            g->score += 66;
+                            g->hurt_flash_timer = HURT_FLASH_FRAMES;
+                            audio_play(SFX_HURT_GRUNT);
+                        } else if (g->shop_deny_timer <= 0) {
+                            audio_play(SFX_HURT);
+                            g->shop_deny_timer = 30;
+                        }
+                    } else if (p->stats.max_hp - hpCost >= 2) {
+                        /* Burn over-cap pill HP first so the heart payment is
+                           always real — recalc's cap clamp used to swallow the
+                           whole debit for over-cap players. */
+                        if (p->pill_max_hp_bonus > 0) {
+                            int saved = p->pill_max_hp_bonus;
+                            p->pill_max_hp_bonus = 0;
+                            recalc_player_stats(p);
+                            int head = PLAYER_MAX_HP_CAP - p->stats.max_hp;
+                            p->pill_max_hp_bonus = (saved > head) ? head : saved;
+                        }
+                        p->pill_max_hp_bonus -= hpCost;  /* persistent debit */
+                        g->last_pickup = si->item;
+                        g->pickup_flash = PICKUP_FLASH_FRAMES;
+                        p->pickup_anim = 40;
+                        collect_item(g, si->item);       /* recalcs stats */
+                        if (p->hp > p->stats.max_hp) p->hp = p->stats.max_hp;
+                        si->active = 0;
+                        g->score += 66;
+                        g->hurt_flash_timer = HURT_FLASH_FRAMES; /* it hurts */
+                        audio_play(SFX_HURT_GRUNT);
+                    } else if (g->shop_deny_timer <= 0) {
+                        audio_play(SFX_HURT);
+                        g->shop_deny_timer = 30;
+                    }
+                } else if (p->coins >= si->cost) {
                     p->coins -= si->cost;
                     g->last_pickup = si->item;
                     g->pickup_flash = PICKUP_FLASH_FRAMES;
@@ -1902,6 +2984,22 @@ void player_update(Game *g, u32 kHeld, circlePosition circlePos) {
         float tdy = p->y - cy;
         if (tdx * tdx + tdy * tdy < 20.0f * 20.0f) {
             advance_floor(g);
+            return;
+        }
+    }
+
+    /* E2: Mom's Heart end-run choice — the "beam of light" next to the
+       trapdoor ends the run immediately with Ending 1. */
+    if (r->has_ending_beam && g->state == STATE_PLAYING) {
+        float bx = (ROOM_LEFT + ROOM_RIGHT) / 2.0f + 60.0f;
+        float by = (ROOM_TOP + ROOM_BOTTOM) / 2.0f;
+        float bdx = p->x - bx;
+        float bdy = p->y - by;
+        if (bdx * bdx + bdy * bdy < 18.0f * 18.0f) {
+            g->win_ending = 1;
+            g->state = STATE_WIN;
+            audio_play(SFX_ROOM_CLEAR);
+            unlock_check_after_win(g);
         }
     }
 }
@@ -2033,7 +3131,29 @@ static void render_blood_particles(Game *g) {
     }
 }
 
-static void spawn_tear(Game *g, float dx, float dy) {
+/* Stamp a permanent blood stain onto the room floor (persists between
+   visits — rooms get progressively gorier as you fight, like Rebirth). */
+static void spawn_blood_decal(Room *r, float x, float y, int big) {
+    BloodDecal *bd = &r->decals[r->decal_next % MAX_BLOOD_DECALS];
+    r->decal_next++;
+    bd->active = 1;
+    /* Keep stains on the floor area, off the walls */
+    bd->x = clampf(x, ROOM_LEFT + 8.0f, ROOM_RIGHT - 8.0f);
+    bd->y = clampf(y, ROOM_TOP + 8.0f, ROOM_BOTTOM - 8.0f);
+    bd->scale = big ? randf(1.2f, 1.9f) : randf(0.7f, 1.3f);
+    bd->rotation = randf(0, 6.28f);
+    int roll = randi(0, 2);
+    if (roll == 0)
+        bd->sprite_idx = bulletatlas_blood_splat_large_1_idx + randi(0, 2);
+    else if (roll == 1)
+        bd->sprite_idx = bulletatlas_blood_splat_huge_1_idx + randi(0, 1);
+    else
+        bd->sprite_idx = bulletatlas_blood_splat_med_1_idx;
+}
+
+/* Core tear spawn with a positional offset (E8 20/20 parallel shots pass
+ * a perpendicular offset; everything else uses the spawn_tear wrapper). */
+static void spawn_tear_off(Game *g, float offx, float offy, float dx, float dy) {
     Tear *t = NULL;
     for (int i = 0; i < MAX_TEARS; i++) {
         if (!g->tears[i].active) { t = &g->tears[i]; break; }
@@ -2052,10 +3172,10 @@ static void spawn_tear(Game *g, float dx, float dy) {
         float fwd = PLAYER_SIZE * 0.55f;  /* forward push (in pixels) */
         float fx = (tlen > 0.1f) ? (dx / tlen) * fwd : 0.0f;
         float fy = (tlen > 0.1f) ? (dy / tlen) * fwd : 0.0f;
-        t->x = g->player.x + fx;
+        t->x = g->player.x + fx + offx;
         /* Raise spawn so tears look like they come from the head, not
            the body. PLAYER_SIZE/3 ≈ Isaac's eye height. */
-        t->y = g->player.y - (PLAYER_SIZE * 0.30f) + fy;
+        t->y = g->player.y - (PLAYER_SIZE * 0.30f) + fy + offy;
     }
 
     /* Apply slight random spread by rotating the direction vector */
@@ -2066,19 +3186,30 @@ static void spawn_tear(Game *g, float dx, float dy) {
     t->dx = ndx;
     t->dy = ndy;
 
+    /* Momentum transfer: player velocity pushes tears (Rebirth feel) */
+    t->dx += g->player.vx * 0.4f;
+    t->dy += g->player.vy * 0.4f;
+
     t->dist = 0;
-    t->speed = sqrtf(ndx * ndx + ndy * ndy);
+    t->speed = sqrtf(t->dx * t->dx + t->dy * t->dy);
     t->dmg = g->player.stats.damage;
     t->piercing = (g->player.stats.flags & ITEM_FLAG_PIERCING) ? 1 : 0;
     t->spectral = (g->player.stats.flags & ITEM_FLAG_SPECTRAL) ? 1 : 0;
     t->homing   = (g->player.stats.flags & ITEM_FLAG_HOMING) ? 1 : 0;
+    /* Magician card: temporary homing tears */
+    if (g->homing_timer > 0) t->homing = 1;
 
-    /* Tear arc: launch slightly upward, gravity will bring it down */
+    /* D5 Ipecac (ITEM_FLAG_EXPLOSIVE): lobbed grenade-tears that detonate
+       on any impact (enemy, obstacle, wall or landing) */
+    t->explosive = (g->player.stats.flags & ITEM_FLAG_EXPLOSIVE) ? 1 : 0;
+
+    /* Tear arc: launch slightly upward, gravity will bring it down.
+       Explosive tears get a much higher lob (Ipecac mortar arc). */
     t->z = 0;
-    t->vz = TEAR_ARC_VEL;
+    t->vz = t->explosive ? TEAR_ARC_VEL * 2.2f : TEAR_ARC_VEL;
 
     /* Sprite animation fields */
-    t->rotation = atan2f(ndy, ndx);  /* rotation based on travel direction */
+    t->rotation = atan2f(t->dy, t->dx);  /* rotation based on travel direction */
     t->anim_frame = 0;
     t->is_enemy = 0;  /* player tear */
 
@@ -2089,15 +3220,259 @@ static void spawn_tear(Game *g, float dx, float dy) {
     t->size = dscale;
 }
 
+static void spawn_tear(Game *g, float dx, float dy) {
+    spawn_tear_off(g, 0.0f, 0.0f, dx, dy);
+}
+
+/* ---------------- Special weapon fire paths (Phase D) ---------------- */
+
+/* Cardinal Direction -> unit vector */
+static void dir_to_vec(Direction dir, float *dx, float *dy) {
+    *dx = 0.0f; *dy = 0.0f;
+    switch (dir) {
+        case DIR_UP:    *dy = -1.0f; break;
+        case DIR_DOWN:  *dy =  1.0f; break;
+        case DIR_LEFT:  *dx = -1.0f; break;
+        case DIR_RIGHT: *dx =  1.0f; break;
+        default: break;
+    }
+}
+
+/* Shared "player fired" presentation: face + crying-head anim */
+static void weapon_face(Game *g, Direction dir) {
+    g->player.face_dir = dir;
+    g->player.shoot_dir = dir;
+    g->player.shoot_anim = 18;
+}
+
+/* ---------------- Familiar system (Phase E6) ---------------- */
+
+/* Fill the trail history with the player's current position (room entry,
+ * warps, run start) so followers don't glide in from stale coordinates. */
+static void familiars_reset_trail(Game *g) {
+    for (int i = 0; i < FAM_TRAIL_LEN; i++) {
+        g->fam_hist_x[i] = g->player.x;
+        g->fam_hist_y[i] = g->player.y;
+    }
+    g->fam_hist_head = 0;
+}
+
+/* Follower position: trail the player's recent positions with a fixed
+ * per-slot delay (slot 0 = 20 frames back, slot 1 = 40). */
+static void familiar_pos(Game *g, int slot, float *fx, float *fy) {
+    int delay = FAM_TRAIL_DELAY * (slot + 1);
+    int idx = g->fam_hist_head - delay;
+    while (idx < 0) idx += FAM_TRAIL_LEN;
+    idx %= FAM_TRAIL_LEN;
+    *fx = g->fam_hist_x[idx];
+    *fy = g->fam_hist_y[idx];
+}
+
+/* Per-frame: record the player position + tick familiar fire cooldowns. */
+static void familiars_update(Game *g) {
+    g->fam_hist_head = (g->fam_hist_head + 1) % FAM_TRAIL_LEN;
+    g->fam_hist_x[g->fam_hist_head] = g->player.x;
+    g->fam_hist_y[g->fam_hist_head] = g->player.y;
+    for (int i = 0; i < MAX_FAMILIARS; i++) {
+        if (g->fam_cd[i] > 0) g->fam_cd[i]--;
+    }
+}
+
+/* Familiar tears: plain 0.75-dmg tears fired from the familiar's position.
+ * Ghost Baby's tears are spectral. T4: in Cat Got Your Tongue (challenge 5,
+ * familiars are the ONLY weapon) they hit for 1.5 so bosses die in
+ * reasonable time. */
+static void spawn_familiar_tear(Game *g, float x, float y,
+                                float dx, float dy, int spectral) {
+    Tear *t = NULL;
+    for (int i = 0; i < MAX_TEARS; i++) {
+        if (!g->tears[i].active) { t = &g->tears[i]; break; }
+    }
+    if (!t) return;
+    memset(t, 0, sizeof(Tear));
+    t->active = 1;
+    t->x = x;
+    t->y = y;
+    t->dx = dx;
+    t->dy = dy;
+    t->dist = 0;
+    t->speed = sqrtf(dx * dx + dy * dy);
+    t->dmg = (g->challenge == 5) ? 1.5f : 0.75f;
+    t->spectral = spectral;
+    t->z = 0;
+    t->vz = TEAR_ARC_VEL;
+    t->rotation = atan2f(dy, dx);
+    t->size = 0.6f;
+    t->is_enemy = 0;
+}
+
+/* Fire hook: called from shoot_tear on player fire INTENT — before the
+ * weapon dispatch and before the Cat-Got-Your-Tongue no-tears gate, so
+ * familiars remain that challenge's only weapon. Familiars shoot in the
+ * player's aim direction at 2x the player's cooldown; Demon Baby instead
+ * auto-aims the nearest enemy.
+ * T6: familiar tears intentionally ignore the player's shot_speed stat —
+ * they always fly at TEAR_BASE_SPEED. */
+static void familiars_try_fire(Game *g, Direction dir) {
+    Player *p = &g->player;
+    Room *r = current_room(g);
+    for (int i = 0; i < MAX_FAMILIARS; i++) {
+        if (p->familiar[i] == ITEM_NONE) continue;
+        if (g->fam_cd[i] > 0) continue;
+        float fx, fy;
+        familiar_pos(g, i, &fx, &fy);
+        float dx = 0.0f, dy = 0.0f;
+        if (p->familiar[i] == ITEM_DEMON_BABY) {
+            /* Auto-aim the nearest enemy; hold fire in an empty room */
+            float best = 1e9f;
+            Enemy *bestE = NULL;
+            for (int j = 0; j < r->enemy_count; j++) {
+                Enemy *e = &r->enemies[j];
+                if (!e->active || e->hidden) continue;
+                float ddx = e->x - fx, ddy = e->y - fy;
+                float d2 = ddx * ddx + ddy * ddy;
+                if (d2 < best) { best = d2; bestE = e; }
+            }
+            if (!bestE) continue;
+            float ddx = bestE->x - fx, ddy = bestE->y - fy;
+            float dm = sqrtf(ddx * ddx + ddy * ddy);
+            if (dm < 1.0f) continue;
+            dx = (ddx / dm) * TEAR_BASE_SPEED;
+            dy = (ddy / dm) * TEAR_BASE_SPEED;
+        } else {
+            float ux, uy;
+            dir_to_vec(dir, &ux, &uy);
+            if (ux == 0.0f && uy == 0.0f) continue;
+            dx = ux * TEAR_BASE_SPEED;
+            dy = uy * TEAR_BASE_SPEED;
+        }
+        spawn_familiar_tear(g, fx, fy, dx, dy,
+                            p->familiar[i] == ITEM_GHOST_BABY);
+        g->fam_cd[i] = get_tear_cooldown(p) * 2;
+    }
+}
+
+/* D3 Mom's Knife: throw the held knife forward; it returns on its own */
+static void knife_fire(Game *g, Direction dir) {
+    Player *p = &g->player;
+    if (dir == DIR_NONE) return;
+    if (g->knife_state != 0) return;      /* knife already in flight */
+    if (p->tear_cooldown > 0) return;
+    float dx, dy;
+    dir_to_vec(dir, &dx, &dy);
+    g->knife_state = 1;                   /* thrown */
+    g->knife_x = p->x + dx * PLAYER_SIZE;
+    g->knife_y = p->y - PLAYER_SIZE * 0.3f + dy * PLAYER_SIZE;
+    g->knife_dx = dx;
+    g->knife_dy = dy;
+    g->knife_dist = 0.0f;
+    g->knife_hit_cd = 0;
+    p->tear_cooldown = get_tear_cooldown(p);
+    weapon_face(g, dir);
+    audio_play(SFX_SHOOT);
+}
+
+/* D1 Brimstone: hold-to-charge (15f), then a 10f beam sweep. Normal firing
+ * is fully replaced (precedence in shoot_tear); while a beam is live or the
+ * post-beam cooldown runs, holding fire does nothing. */
+static void brimstone_fire(Game *g, Direction dir) {
+    Player *p = &g->player;
+    if (dir == DIR_NONE) return;
+    if (g->laser_active) return;          /* live beam blocks re-fire */
+    if (p->tear_cooldown > 0) return;     /* recovering from last blast */
+    float dx, dy;
+    dir_to_vec(dir, &dx, &dy);
+    g->laser_dx = dx;                     /* track aim while charging */
+    g->laser_dy = dy;
+    weapon_face(g, dir);
+    g->laser_charge++;
+    if (g->laser_charge >= 15) {
+        g->laser_charge = 0;
+        g->laser_active = 1;
+        g->laser_is_tech = 0;
+        g->laser_timer = 10;              /* beam sweep duration */
+        p->tear_cooldown = get_tear_cooldown(p);  /* item's -2.0 fire rate */
+        trigger_shake(g, 3.0f, 10);
+        audio_play(SFX_BOSS);             /* deep roar sells the blast */
+    }
+}
+
+/* D2 Technology: continuous thin beam while the fire button is held.
+ * No charge, no cooldown; laser_update deals dmg*0.25 per frame. */
+static void technology_fire(Game *g, Direction dir) {
+    if (dir == DIR_NONE) return;
+    float dx, dy;
+    dir_to_vec(dir, &dx, &dy);
+    if (!g->laser_active) audio_play(SFX_TEAR_FIRE1);
+    g->laser_active = 1;
+    g->laser_is_tech = 1;
+    g->laser_dx = dx;
+    g->laser_dy = dy;
+    g->laser_timer = 2;   /* refreshed while held; dies 2f after release */
+    weapon_face(g, dir);
+}
+
+/* D4 Dr./Epic Fetus: "tears" are pooled bombs launched with tear velocity
+ * that slide, stop, then explode on a short 45f fuse. */
+static void fetus_fire(Game *g, Direction dir) {
+    Player *p = &g->player;
+    if (dir == DIR_NONE) return;
+    if (p->tear_cooldown > 0) return;
+    int slot = -1;
+    for (int i = 0; i < MAX_BOMBS; i++) {
+        if (!g->bombs[i].active) { slot = i; break; }
+    }
+    if (slot < 0) return;                 /* pool full: wait for a blast */
+    float dx, dy;
+    dir_to_vec(dir, &dx, &dy);
+    float sp = TEAR_BASE_SPEED * (1.0f + p->stats.shot_speed * 0.15f);
+    ActiveBomb *b = &g->bombs[slot];
+    b->x = p->x + dx * PLAYER_SIZE;
+    b->y = p->y + dy * PLAYER_SIZE;
+    b->vx = dx * sp + p->vx * 0.4f;       /* tear velocity + momentum */
+    b->vy = dy * sp + p->vy * 0.4f;
+    b->timer = 45;                        /* short Dr. Fetus fuse */
+    b->flash = 0;
+    b->is_epic = player_has_item(p, ITEM_EPIC_FETUS);
+    b->active = 1;
+    p->tear_cooldown = get_tear_cooldown(p);
+    weapon_face(g, dir);
+    audio_play(SFX_SHOOT);
+}
+
 void shoot_tear(Game *g, Direction dir) {
+    /* E6: familiars fire on player fire intent (their own 2x cooldown).
+       Runs BEFORE the no-tears challenge gate so familiars remain the only
+       weapon in "Cat Got Your Tongue". */
+    if (dir != DIR_NONE) familiars_try_fire(g, dir);
+
+    /* E9 challenge 5 "Cat Got Your Tongue": the player has no weapon */
+    if (g->challenge == 5) {
+        weapon_face(g, dir);
+        return;
+    }
+
+    /* ---- Weapon precedence (Phase D) ----
+     * KNIFE > BRIMSTONE > LASER (Technology) > BOMB_TEAR (Dr./Epic Fetus)
+     * > normal tears. The highest-priority owned weapon fully replaces
+     * tears; lower-priority flags are ignored while it is held. */
+    int wflags = g->player.stats.flags;
+    if (wflags & ITEM_FLAG_KNIFE)     { knife_fire(g, dir);      return; }
+    if (wflags & ITEM_FLAG_BRIMSTONE) { brimstone_fire(g, dir);  return; }
+    if (wflags & ITEM_FLAG_LASER)     { technology_fire(g, dir); return; }
+    if (wflags & ITEM_FLAG_BOMB_TEAR) { fetus_fire(g, dir);      return; }
+
     if (g->player.tear_cooldown > 0) return;
+
+    /* Live shot-speed stat: each point = +15% tear velocity */
+    float sp = TEAR_BASE_SPEED * (1.0f + g->player.stats.shot_speed * 0.15f);
 
     float tdx = 0, tdy = 0;
     switch (dir) {
-        case DIR_UP:    tdy = -TEAR_BASE_SPEED; break;
-        case DIR_DOWN:  tdy =  TEAR_BASE_SPEED; break;
-        case DIR_LEFT:  tdx = -TEAR_BASE_SPEED; break;
-        case DIR_RIGHT: tdx =  TEAR_BASE_SPEED; break;
+        case DIR_UP:    tdy = -sp; break;
+        case DIR_DOWN:  tdy =  sp; break;
+        case DIR_LEFT:  tdx = -sp; break;
+        case DIR_RIGHT: tdx =  sp; break;
         default: return;
     }
 
@@ -2107,12 +3482,19 @@ void shoot_tear(Game *g, Direction dir) {
 
         float angle = 0.25f;
         if (tdx != 0) {
-            spawn_tear(g, tdx, -TEAR_BASE_SPEED * angle);
-            spawn_tear(g, tdx,  TEAR_BASE_SPEED * angle);
+            spawn_tear(g, tdx, -sp * angle);
+            spawn_tear(g, tdx,  sp * angle);
         } else {
-            spawn_tear(g, -TEAR_BASE_SPEED * angle, tdy);
-            spawn_tear(g,  TEAR_BASE_SPEED * angle, tdy);
+            spawn_tear(g, -sp * angle, tdy);
+            spawn_tear(g,  sp * angle, tdy);
         }
+    } else if (g->player.stats.flags & ITEM_FLAG_DOUBLE) {
+        /* E8 20/20: two parallel tears offset perpendicular to the aim */
+        float pl = sqrtf(tdx * tdx + tdy * tdy);
+        float pxn = (pl > 0.1f) ? -tdy / pl : 0.0f;
+        float pyn = (pl > 0.1f) ?  tdx / pl : 0.0f;
+        spawn_tear_off(g,  pxn * 5.0f,  pyn * 5.0f, tdx, tdy);
+        spawn_tear_off(g, -pxn * 5.0f, -pyn * 5.0f, tdx, tdy);
     } else {
         spawn_tear(g, tdx, tdy);
     }
@@ -2129,6 +3511,13 @@ void shoot_tear(Game *g, Direction dir) {
     static int tear_sound_toggle = 0;
     audio_play(tear_sound_toggle ? SFX_TEAR_FIRE2 : SFX_TEAR_FIRE1);
     tear_sound_toggle = !tear_sound_toggle;
+}
+
+/* D5 Ipecac detonation: small blast, tear dmg + 20 to everything in it,
+ * and it CAN hurt the player standing too close (that's the Ipecac deal;
+ * the player hit is Pyromaniac-gated inside bomb_explode_ex). */
+static void tear_detonate(Game *g, Tear *t) {
+    bomb_explode_ex(g, t->x, t->y, 32.0f, t->dmg + 20.0f, t->dmg + 20.0f, 2);
 }
 
 void tears_update(Game *g) {
@@ -2159,11 +3548,11 @@ void tears_update(Game *g) {
                     float steer = 0.18f;
                     t->dx += (edx / em) * steer;
                     t->dy += (edy / em) * steer;
-                    /* Re-normalize speed back to original */
+                    /* Re-normalize speed back to this tear's own speed */
                     float sm = sqrtf(t->dx * t->dx + t->dy * t->dy);
                     if (sm > 0.1f) {
-                        t->dx = (t->dx / sm) * TEAR_BASE_SPEED;
-                        t->dy = (t->dy / sm) * TEAR_BASE_SPEED;
+                        t->dx = (t->dx / sm) * t->speed;
+                        t->dy = (t->dy / sm) * t->speed;
                     }
                 }
             }
@@ -2175,21 +3564,35 @@ void tears_update(Game *g) {
         /* Track distance using actual velocity */
         t->dist += sqrtf(t->dx * t->dx + t->dy * t->dy);
 
-        /* Arc: gravity pulls vz back down to ground */
+        /* Arc: launch hop, then glide slightly airborne; near the end of
+           range the tear drops out of the air and pops where it lands. */
         t->z += t->vz;
         t->vz += TEAR_GRAVITY;
-        if (t->z > 0) t->z = 0; /* hit ground (z = 0 ground plane) */
+        if (t->dist > range - 30.0f) {
+            /* Falling phase: gravity keeps pulling; landing = splash */
+            if (t->z >= 0) {
+                if (t->explosive) tear_detonate(g, t);
+                spawn_tear_pop(g, t->x, t->y, 0);
+                t->active = 0;
+                continue;
+            }
+        } else if (t->vz > 0 && t->z > -4.0f) {
+            /* Done with the launch arc: hold a small glide height */
+            t->z = -4.0f;
+            t->vz = 0;
+        }
 
-        /* Animate tear: spin slowly and increment frame counter */
+        /* Animate tear: increment frame counter. Homing tears re-aim their
+           sprite each frame; everything else keeps its spawn aim rotation
+           (Rebirth tears don't spin). */
         t->anim_frame++;
         if (t->homing) {
             t->rotation = atan2f(t->dy, t->dx);  /* always face travel direction */
-        } else {
-            t->rotation += 0.04f;  /* gentle wobble/spin */
         }
 
         /* Out of range -> splash + blood particles */
         if (t->dist >= range) {
+            if (t->explosive) tear_detonate(g, t);
             spawn_tear_pop(g, t->x, t->y, 0);  /* wall splash */
             t->active = 0;
             continue;
@@ -2199,6 +3602,7 @@ void tears_update(Game *g) {
         if (!t->spectral) {
             if (t->x < ROOM_LEFT || t->x > ROOM_RIGHT ||
                 t->y < ROOM_TOP  || t->y > ROOM_BOTTOM) {
+                if (t->explosive) tear_detonate(g, t);
                 audio_play(SFX_TEAR_BLOCK);  /* Play wall hit sound */
                 spawn_tear_pop(g, t->x, t->y, 0);  /* wall splash */
                 t->active = 0;
@@ -2213,16 +3617,34 @@ void tears_update(Game *g) {
             }
         }
 
-        /* Hit obstacle (spectral tears pass through) */
+        /* Hit obstacle (spectral tears pass through; spikes never block) */
         if (!t->spectral) {
             for (int j = 0; j < r->obstacle_count; j++) {
                 Obstacle *o = &r->obstacles[j];
                 if (!o->active) continue;
+                if (o->type == OBST_SPIKES) continue;
                 float odx = t->x - o->x;
                 float ody = t->y - o->y;
                 float dist = odx * odx + ody * ody;
                 float minDist = TEAR_RADIUS + OBSTACLE_SIZE * 0.5f;
                 if (dist < minDist * minDist) {
+                    if (o->type == OBST_POOP) {
+                        /* Poop is destructible: 3 tear hits, then a chance
+                           of a pickup underneath (classic Isaac) */
+                        o->hp--;
+                        if (o->hp <= 0) {
+                            o->active = 0;
+                            spawn_tear_pop(g, o->x, o->y, 0);
+                            spawn_tear_pop(g, o->x, o->y, 0);
+                            /* Petrified Poop: way better poop loot */
+                            int poop_rate =
+                                (g->player.trinket == TRINKET_PETRIFIED_POOP)
+                                ? 60 : 25;
+                            if (randi(0, 99) < poop_rate)
+                                spawn_random_consumable(r, o->x, o->y);
+                        }
+                    }
+                    if (t->explosive) tear_detonate(g, t);
                     audio_play(SFX_TEAR_BLOCK);  /* Play obstacle hit sound */
                     spawn_tear_pop(g, t->x, t->y, 0);  /* obstacle splash */
                     t->active = 0;
@@ -2253,7 +3675,16 @@ static const char *boss_name_str(EnemyType t) {
     case ENEMY_BOSS_PIN:        return "PIN";
     case ENEMY_BOSS_HAUNT:      return "THE HAUNT";
     case ENEMY_BOSS_WIDOW:      return "WIDOW";
+    case ENEMY_BOSS_GISH:       return "GISH";
+    case ENEMY_BOSS_LOKI:       return "LOKI";
+    case ENEMY_BOSS_STEVEN:     return "STEVEN";
+    case ENEMY_BOSS_CHUB:       return "CHUB";
+    case ENEMY_BOSS_FISTULA:    return "FISTULA";
+    case ENEMY_BOSS_SCOLEX:     return "SCOLEX";
     case ENEMY_BOSS_MEGA_SATAN: return "MEGA SATAN";
+    case ENEMY_BOSS_MOM:        return "MOM";
+    case ENEMY_BOSS_MOMS_HEART: return "MOM'S HEART";
+    case ENEMY_BOSS_SATAN:      return "SATAN";
     default: return "BOSS";
     }
 }
@@ -2267,14 +3698,15 @@ static int count_alive_flies(Room *r) {
 }
 
 static void boss_spawn_fly(Game *g, Room *r, float bx, float by) {
-    (void)g;
     if (r->enemy_count >= MAX_ENEMIES) return;
     Enemy *e = &r->enemies[r->enemy_count];
     memset(e, 0, sizeof(Enemy));
     e->active = 1;
+    e->spawn_grace = 10; /* F6: no same-frame contact */
     e->type = ENEMY_FLY;
-    e->hp = 2;
-    e->max_hp = 2;
+    /* T5: same difficulty/infinite HP scaling as room spawns */
+    e->hp = 2.0f * spawn_hp_mult(g);
+    e->max_hp = e->hp;
     e->x = bx + randf(-30, 30);
     e->y = by + randf(-30, 30);
     e->dx = randf(-1.5f, 1.5f);
@@ -2286,6 +3718,19 @@ static void boss_spawn_fly(Game *g, Room *r, float bx, float by) {
 /* Spawn boss tear in a specific direction */
 static void boss_shoot_tear(Game *g, float x, float y, float dx, float dy) {
     spawn_enemy_shot(g, x, y, dx, dy, BOSS_SHOT_DMG);
+}
+
+/* E3 (Satan): clip the enemy Brimstone ray to the room walls. Uses the
+ * dedicated ebeam_* state on Game — never the player's laser_* fields. */
+static void ebeam_clip_endpoint(Game *g) {
+    float t_max = 600.0f;   /* generous cap: longer than any room diagonal */
+    if (g->ebeam_dx >  0.0001f) { float t = (ROOM_RIGHT  - g->ebeam_x) / g->ebeam_dx; if (t < t_max) t_max = t; }
+    if (g->ebeam_dx < -0.0001f) { float t = (ROOM_LEFT   - g->ebeam_x) / g->ebeam_dx; if (t < t_max) t_max = t; }
+    if (g->ebeam_dy >  0.0001f) { float t = (ROOM_BOTTOM - g->ebeam_y) / g->ebeam_dy; if (t < t_max) t_max = t; }
+    if (g->ebeam_dy < -0.0001f) { float t = (ROOM_TOP    - g->ebeam_y) / g->ebeam_dy; if (t < t_max) t_max = t; }
+    if (t_max < 0.0f) t_max = 0.0f;
+    g->ebeam_ex = g->ebeam_x + g->ebeam_dx * t_max;
+    g->ebeam_ey = g->ebeam_y + g->ebeam_dy * t_max;
 }
 
 /* Monstro: 8-way tear spread on landing */
@@ -2408,12 +3853,33 @@ static int count_enemies_of_type(Room *r, EnemyType t) {
     return c;
 }
 
+/* Allocate a slot for a mid-combat dynamic spawn. PREFERS appending at
+ * r->enemy_count so death-spawns land at indices >= any sweep's captured
+ * `initial` count (they must not be hit by the burst that killed their
+ * parent — see damage_all_enemies). Falls back to the first inactive slot
+ * only when the array is genuinely full. Returns NULL if no slot free.
+ * The slot is zeroed and marked active; caller fills in the rest. */
+static Enemy *alloc_dynamic_enemy(Room *r) {
+    Enemy *e = NULL;
+    if (r->enemy_count < MAX_ENEMIES) {
+        e = &r->enemies[r->enemy_count++];
+    } else {
+        for (int i = 0; i < r->enemy_count; i++) {
+            if (!r->enemies[i].active) { e = &r->enemies[i]; break; }
+        }
+    }
+    if (e) {
+        memset(e, 0, sizeof(Enemy));
+        e->active = 1;
+        e->spawn_grace = 10; /* F6: no contact damage at the corpse position */
+    }
+    return e;
+}
+
 /* Spawn a small gaper as part of split-on-death */
 static void spawn_gaper_split(Room *r, float px, float py) {
-    if (r->enemy_count >= MAX_ENEMIES) return;
-    Enemy *e = &r->enemies[r->enemy_count];
-    memset(e, 0, sizeof(Enemy));
-    e->active = 1;
+    Enemy *e = alloc_dynamic_enemy(r);
+    if (!e) return;
     e->type = ENEMY_GAPER_SMALL;
     e->hp = 1;
     e->max_hp = 1;
@@ -2423,15 +3889,27 @@ static void spawn_gaper_split(Room *r, float px, float py) {
     e->dy = randf(-1.5f, 1.5f);
     e->timer = randi(20, 60);
     e->split_done = 1; /* don't split again */
-    r->enemy_count++;
+}
+
+/* Spawn a small Fistula ball as part of the boss's split-on-hit mechanic */
+static void spawn_fistula_ball(Room *r, float px, float py, float hp) {
+    Enemy *e = alloc_dynamic_enemy(r);
+    if (!e) return;
+    e->type = ENEMY_FISTULA_BALL;
+    e->hp = hp;
+    e->max_hp = hp;
+    e->x = px + randf(-14, 14);
+    e->y = py + randf(-14, 14);
+    e->dx = randf(-1.8f, 1.8f);
+    e->dy = randf(-1.8f, 1.8f);
+    e->timer = randi(20, 60);
+    e->split_done = (hp <= 1.0f) ? 1 : 0; /* stop splitting once tiny */
 }
 
 /* Spawn a fly from a dying Mulligan */
 static void spawn_fly_from_death(Room *r, float px, float py, const FloorInfo *fi) {
-    if (r->enemy_count >= MAX_ENEMIES) return;
-    Enemy *e = &r->enemies[r->enemy_count];
-    memset(e, 0, sizeof(Enemy));
-    e->active = 1;
+    Enemy *e = alloc_dynamic_enemy(r);
+    if (!e) return;
     e->type = ENEMY_FLY;
     e->hp = 2;
     e->max_hp = 2;
@@ -2440,7 +3918,6 @@ static void spawn_fly_from_death(Room *r, float px, float py, const FloorInfo *f
     e->dx = randf(-1.0f, 1.0f) * fi->enemy_speed_mult;
     e->dy = randf(-1.0f, 1.0f) * fi->enemy_speed_mult;
     e->timer = randi(30, 90);
-    r->enemy_count++;
 }
 
 /* Boom fly explosion: damage player if close, spawn blood particles */
@@ -2450,15 +3927,25 @@ static void boom_fly_explode(Game *g, float x, float y) {
     float dy = p->y - y;
     float dist = sqrtf(dx * dx + dy * dy);
     float blast_radius = 40.0f;
-    if (dist < blast_radius && p->iframes == 0) {
+    if (dist < blast_radius && (p->stats.flags & ITEM_FLAG_FIRE_IMMUNE)) {
+        /* D6 Pyromaniac: no explosion damage, heal half a heart instead */
+        if (p->hp < p->stats.max_hp) p->hp += 1;
+        audio_play(SFX_PICKUP);
+    } else if (dist < blast_radius && p->iframes == 0) {
         p->hp -= player_absorb_dmg(p, 1);
         p->iframes = PLAYER_IFRAMES;
+        g->hitstop = 3;
         if (dist > 0.1f) {
             p->vx = (dx / dist) * PLAYER_KB_FORCE * 1.5f;
             p->vy = (dy / dist) * PLAYER_KB_FORCE * 1.5f;
         }
-        p->kb_timer = PLAYER_KB_FRAMES;
         audio_play(SFX_HURT);
+        /* F4: explosion damage can kill — consume a life (Dead Cat) or die,
+           same as the bomb blast path. */
+        if (player_check_death(p)) {
+            audio_play(SFX_PLAYER_DEATH);
+            g->state = STATE_GAMEOVER;
+        }
     }
     /* Screen shake */
     trigger_shake(g, 5.0f, 20);
@@ -2477,34 +3964,63 @@ static int is_boss_type(EnemyType t);
 /* Roll heart/consumable drops from killed enemy, respecting difficulty */
 static void enemy_death_drops(Game *g, Room *r, Enemy *e) {
     if (is_boss_type(e->type)) {
-        /* Boss always drops 2 full hearts */
-        spawn_heart(r, e->x - 12, e->y, HEART_RED_FULL);
-        spawn_heart(r, e->x + 12, e->y, HEART_RED_FULL);
+        /* Boss drops one full heart */
+        spawn_heart(r, e->x, e->y, HEART_RED_FULL);
     } else {
-        /* 5% chance for pill or card on every regular kill */
-        int special = randi(0, 100);
-        if (special < 3) {
-            spawn_pill_pickup(r, e->x, e->y, randi(0, PILL_EFFECT_COUNT - 1));
+        /* Keeper: always drops a coin on top of the usual roll below */
+        if (e->type == ENEMY_KEEPER) {
+            spawn_consumable(r, e->x, e->y, PICKUP_COIN);
+        }
+        /* Rare trinket drop (luck improves it via luck_roll, ~1.2% base) */
+        if (luck_roll(g, 1, 1)) {
+            spawn_trinket_pickup(r, e->x, e->y, randi(1, TRINKET_COUNT - 1));
             return;
-        } else if (special < 5) {
-            spawn_card_pickup(r, e->x, e->y, randi(0, TAROT_COUNT - 1));
+        }
+        /* Pill/card chance on every regular kill, luck improves it
+           (halved from 3% — kills shouldn't shower loot) */
+        if (luck_roll(g, 2, 1)) {
+            if (randi(0, 1))
+                spawn_pill_pickup(r, e->x, e->y, randi(0, PILL_EFFECT_COUNT - 1));
+            else
+                spawn_card_pickup(r, e->x, e->y, randi(0, TAROT_COUNT - 1));
             return;
         }
         /* Difficulty-scaled heart drop rates:
-         * Easy: full<13, half<40, consumable<60
-         * Normal: full<10, half<30, consumable<50
-         * Hard: full<7, half<20, consumable<40 */
+         * Easy: full<8, half<24, consumable<44
+         * Normal: full<5, half<16, consumable<36
+         * Hard: full<3, half<10, consumable<30
+         * Luck nudges the full/half thresholds up further. */
         float rate = diff_heart_drop_rate(g->difficulty);
-        int full_thresh  = (int)(rate * 0.33f);       /* ~10 normal */
-        int half_thresh  = (int)(rate);                /* ~30 normal */
-        int consum_thresh = half_thresh + 20;          /* ~50 normal */
+        int heart_bonus = (g->player.trinket == TRINKET_CHILDS_HEART) ? 8 : 0;
+        int luck_bonus  = (int)(g->player.stats.luck * 2);
+        int full_thresh  = (int)(rate * 0.33f) + heart_bonus / 2 + luck_bonus / 2;
+        int half_thresh  = (int)(rate) + heart_bonus + luck_bonus;
+        /* T2b/T3 mercy: hearts drop a little more often at Womb depth
+           (floor >= 5, where contact damage stiffens) and on The Purist
+           (challenge 6, no items to heal with). Stacks, but capped. */
+        {
+            int widen = 0;
+            if (g->current_floor >= 5) widen += 4;
+            if (g->challenge == 6)     widen += 4;
+            if (widen > 6) widen = 6;
+            half_thresh += widen;
+        }
+        int consum_thresh = half_thresh + 10;          /* halved consumable window */
         int roll = randi(0, 100);
         if (roll < full_thresh) {
             spawn_heart(r, e->x, e->y, HEART_RED_FULL);
         } else if (roll < half_thresh) {
             spawn_heart(r, e->x, e->y, HEART_RED_HALF);
         } else if (roll < consum_thresh) {
-            spawn_random_consumable(r, e->x, e->y);
+            /* Rusted Key / Match Stick / Broken Magnet bias the consumable toward their type */
+            if (g->player.trinket == TRINKET_RUSTED_KEY && randi(0, 1))
+                spawn_consumable(r, e->x, e->y, PICKUP_KEY);
+            else if (g->player.trinket == TRINKET_MATCH_STICK && randi(0, 1))
+                spawn_consumable(r, e->x, e->y, PICKUP_BOMB);
+            else if (g->player.trinket == TRINKET_BROKEN_MAGNET && randi(0, 1))
+                spawn_consumable(r, e->x, e->y, PICKUP_COIN);
+            else
+                spawn_random_consumable(r, e->x, e->y);
         }
     }
 }
@@ -2526,6 +4042,12 @@ static void spawn_heart(Room *r, float x, float y, HeartType type) {
 
 /* Spawn an enemy projectile (clotty blood shots) */
 static void spawn_enemy_shot(Game *g, float x, float y, float dx, float dy, int dmg) {
+    /* Reject non-finite velocities: a NaN shot (e.g. a zero-length aim vector
+       normalised by 0) never satisfies the expiry checks in
+       enemy_shots_update and would permanently occupy a pool slot. */
+    if (!isfinite(dx) || !isfinite(dy)) return;
+    /* Womb onward (floor >= 5): every shot hits for a full heart */
+    if (g->current_floor >= 5 && dmg < 2) dmg = 2;
     for (int i = 0; i < MAX_ENEMY_SHOTS; i++) {
         if (!g->enemy_shots[i].active) {
             EnemyShot *s = &g->enemy_shots[i];
@@ -2554,10 +4076,13 @@ void trigger_shake(Game *g, float intensity, int frames) {
 
 const char *curse_name(int curse) {
     switch (curse) {
-        case CURSE_DARKNESS: return "CURSE OF DARKNESS";
-        case CURSE_LOST:     return "CURSE OF THE LOST";
-        case CURSE_BLIND:    return "CURSE OF THE BLIND";
-        default:             return "";
+        case CURSE_DARKNESS:  return "CURSE OF DARKNESS";
+        case CURSE_LOST:      return "CURSE OF THE LOST";
+        case CURSE_BLIND:     return "CURSE OF THE BLIND";
+        case CURSE_UNKNOWN:   return "CURSE OF THE UNKNOWN";
+        case CURSE_MAZE:      return "CURSE OF THE MAZE";
+        case CURSE_LABYRINTH: return "CURSE OF THE LABYRINTH";
+        default:              return "";
     }
 }
 
@@ -2565,16 +4090,49 @@ const char *curse_name(int curse) {
  * Called on floor transition completion. */
 void roll_curse(Game *g) {
     g->active_curse = CURSE_NONE;
+    g_curse_labyrinth_pending = 0;
+    g->floor_red_dmg = 0;   /* fresh floor: devil deal possible again */
+    g->floor_intro_timer = 150;  /* Rebirth-style floor title banner */
     g->curse_display_timer = 0;
+
+    /* Challenge: Eternal Darkness — every floor is cursed with darkness */
+    if (g->challenge == 2) {
+        g->active_curse = CURSE_DARKNESS;
+        g->curse_display_timer = 180;
+        return;
+    }
 
     /* No curse on starting floor (floor 0) to give players a fair start */
     if (g->current_floor == 0) return;
 
     /* 30% chance per floor */
     if (randi(0, 9) < 3) {
-        /* Pick one of the 3 curses at random */
-        g->active_curse = randi(1, 3);  /* CURSE_DARKNESS..CURSE_BLIND */
+        /* Weighted curse pool: the original 3 curses (DARKNESS, LOST, BLIND)
+         * are always available. The 3 deeper curses (UNKNOWN, MAZE,
+         * LABYRINTH) are rarer/absent on early floors and become
+         * progressively more likely the deeper the run goes, so new
+         * players aren't hit with the harsher curses immediately. */
+        int pool[6];
+        int pool_count = 0;
+        pool[pool_count++] = CURSE_DARKNESS;
+        pool[pool_count++] = CURSE_LOST;
+        pool[pool_count++] = CURSE_BLIND;
+
+        /* Deeper curses gated by floor: each becomes available a couple
+         * floors in, then gets extra weighted entries the deeper we go
+         * so they show up more often relative to the base three. */
+        if (g->current_floor >= 2) pool[pool_count++] = CURSE_UNKNOWN;
+        if (g->current_floor >= 3) pool[pool_count++] = CURSE_MAZE;
+        if (g->current_floor >= 4) pool[pool_count++] = CURSE_LABYRINTH;
+        if (g->current_floor >= 5) {
+            /* Extra weight for the deep curses on late floors */
+            if (pool_count < 6) pool[pool_count++] = CURSE_UNKNOWN;
+        }
+
+        g->active_curse = pool[randi(0, pool_count - 1)];
         g->curse_display_timer = 180;   /* 3 seconds at 60 FPS */
+
+        if (g->active_curse == CURSE_LABYRINTH) g_curse_labyrinth_pending = 1;
     }
 }
 
@@ -2598,7 +4156,8 @@ void unlock_check_after_win(Game *g) {
     g_config.characters_completed |= char_bit;
     g_config.total_wins++;
 
-    /* Unlock next character (progression: Isaac -> Magdalene -> Cain -> Judas) */
+    /* Unlock next character (progression: Isaac -> Magdalene -> Cain -> Judas
+     * -> Eve -> Samson -> ??? (Blue Baby)) */
     int prev_unlocked = g_config.unlocked_chars;
     if ((g_config.characters_completed & 0x01) && !(g_config.unlocked_chars & 0x02)) {
         g_config.unlocked_chars |= 0x02;  /* unlock Magdalene */
@@ -2608,6 +4167,15 @@ void unlock_check_after_win(Game *g) {
     }
     if ((g_config.characters_completed & 0x04) && !(g_config.unlocked_chars & 0x08)) {
         g_config.unlocked_chars |= 0x08;  /* unlock Judas */
+    }
+    if ((g_config.characters_completed & 0x08) && !(g_config.unlocked_chars & 0x10)) {
+        g_config.unlocked_chars |= 0x10;  /* unlock Eve */
+    }
+    if ((g_config.characters_completed & 0x10) && !(g_config.unlocked_chars & 0x20)) {
+        g_config.unlocked_chars |= 0x20;  /* unlock Samson */
+    }
+    if ((g_config.characters_completed & 0x20) && !(g_config.unlocked_chars & 0x40)) {
+        g_config.unlocked_chars |= 0x40;  /* unlock Blue Baby */
     }
 
     /* Track current boss in defeated mask (current_boss_type may not always
@@ -2625,42 +4193,232 @@ void unlock_check_after_win(Game *g) {
 /* Forward declaration for bomb death handling */
 static int is_boss_type(EnemyType t);
 
+/* Shared enemy death path — tear hits, bomb blasts and card damage all
+ * funnel through here so drops, champion splits, boss-defeat tracking and
+ * gore can't diverge. Room-clear detection stays in the per-frame sweep,
+ * which sees e->active = 0 as before.
+ * Returns 1 if the enemy actually died, 0 if it survived (Globin collapse). */
+static int kill_enemy(Game *g, Room *r, Enemy *e) {
+    /* F2: defensive re-entry guard — a second tear (TRIPLE/DOUBLE shot) or
+       overlapping burst hitting the same corpse in one frame must not re-run
+       the death path (double drops/score, quadruple splits, double saves). */
+    if (!e->active) return 1;
+
+    /* Globin: collapse into pile instead of dying (first time) */
+    if (e->type == ENEMY_GLOBIN && e->state == 0 && !e->split_done) {
+        e->state = 1;          /* collapsed pile */
+        e->hp = 1;
+        e->regen_timer = 120;   /* ticks until full regen */
+        e->split_done = 1;      /* only collapse once */
+        return 0;
+    }
+
+    /* Gaper split on death */
+    if (e->type == ENEMY_GAPER && !e->split_done) {
+        e->split_done = 1; /* F2: split exactly once */
+        spawn_gaper_split(r, e->x, e->y);
+        spawn_gaper_split(r, e->x, e->y);
+    }
+
+    /* Boom Fly: explode on death */
+    if (e->type == ENEMY_BOOM_FLY) {
+        boom_fly_explode(g, e->x, e->y);
+    }
+
+    /* Mulligan: spawn 2-3 flies on death */
+    if (e->type == ENEMY_MULLIGAN) {
+        const FloorInfo *fi = get_floor_info(g->current_floor);
+        int nflies = randi(2, 3);
+        for (int f = 0; f < nflies; f++) {
+            spawn_fly_from_death(r, e->x, e->y, fi);
+        }
+    }
+
+    /* Drops (difficulty-scaled) */
+    enemy_death_drops(g, r, e);
+
+    /* Champion bonus reward + black champion split */
+    if (e->champion != CHAMP_NONE) {
+        enemy_drop_champion_reward(g, e);
+        if (e->champion == CHAMP_BLACK && e->split_pending) {
+            e->split_pending = 0; /* F2: split exactly once */
+            /* Spawn 2 weaker copies of base enemy at same location.
+               F3: alloc_dynamic_enemy appends at r->enemy_count so the
+               splits land above any sweep's captured `initial` count. */
+            float split_hp = (e->max_hp > 1.0f) ? (e->max_hp * 0.5f) : 1.0f;
+            for (int ci = 0; ci < 2; ci++) {
+                Enemy *ne = alloc_dynamic_enemy(r);
+                if (!ne) break;
+                ne->type = e->type;
+                ne->x = e->x + randf(-12.0f, 12.0f);
+                ne->y = e->y + randf(-12.0f, 12.0f);
+                ne->hp = ne->max_hp = split_hp;
+                ne->champion = CHAMP_NONE;
+                ne->dx = randf(-1.0f, 1.0f);
+                ne->dy = randf(-1.0f, 1.0f);
+            }
+        }
+    }
+
+    /* Death gore: big blood burst + permanent floor stain */
+    spawn_blood_splatter(g, e->x, e->y, e->kb_dx, e->kb_dy, 1);
+    spawn_blood_decal(r, e->x, e->y, is_boss_type(e->type));
+    if (is_boss_type(e->type)) {
+        /* Bosses go out messy: extra burst + extra stains */
+        spawn_blood_splatter(g, e->x + randf(-10, 10),
+                             e->y + randf(-10, 10), 0, 0, 1);
+        spawn_blood_decal(r, e->x + randf(-18, 18),
+                          e->y + randf(-14, 14), 1);
+        spawn_blood_decal(r, e->x + randf(-18, 18),
+                          e->y + randf(-14, 14), 1);
+    }
+
+    e->active = 0;
+    g->score += is_boss_type(e->type) ? 100 : 10;
+    g->kills++;
+    audio_play(SFX_ENEMY_DEATH);
+    if (is_boss_type(e->type)) {
+        trigger_shake(g, 7.0f, 40);
+        g->boss_active = 0;
+        g->boss_death_anim = 60; /* boss death explosion effect */
+        g->boss_death_x = e->x;  /* anchor the death anim on the corpse */
+        g->boss_death_y = e->y;
+        /* Track in persistent unlocks (bosses_defeated bitmask).
+           20 bosses: Duke..Mega Satan (17) + Mom, Mom's Heart, Satan. */
+        {
+            int boss_idx = (int)e->type - (int)ENEMY_BOSS_DUKE;
+            if (boss_idx >= 0 && boss_idx < 20) {
+                g_config.bosses_defeated |= (1 << boss_idx);
+                config_save(&g_config);
+            }
+        }
+        /* E2: Mom's Heart offers the run-ending choice — the boss-room clear
+           sweep drops the usual trapdoor (to Sheol); we add the "beam of
+           light" end-run object beside it (Ending 1). */
+        if (e->type == ENEMY_BOSS_MOMS_HEART) {
+            r->has_ending_beam = 1;
+        }
+        /* E5: Satan showers black hearts on defeat. Also kill any beam the
+           corpse was charging — its state machine lives in his AI case. */
+        if (e->type == ENEMY_BOSS_SATAN) {
+            spawn_heart(r, e->x - 20, e->y + 10, HEART_BLACK);
+            spawn_heart(r, e->x + 20, e->y + 10, HEART_BLACK);
+            g->ebeam_state = 0;
+            g->ebeam_timer = 0;
+        }
+        /* Return to floor music after boss defeat */
+        music_play(music_for_floor(g->current_floor));
+    } else {
+        trigger_shake(g, 1.5f, 6);
+    }
+    return 1;
+}
+
+/* Deal flat damage to every enemy in the room, routing deaths through the
+ * shared kill_enemy path (drops, champion splits, boss tracking). Captures
+ * the initial count so death-spawned splits aren't hit by the same burst.
+ * Used by TAROT_DEATH, the Necronomicon (E7) and black-heart bursts (E5). */
+static void damage_all_enemies(Game *g, float dmg) {
+    Room *r = current_room(g);
+    if (!r) return;
+    int initial = r->enemy_count;
+    for (int i = 0; i < initial; i++) {
+        Enemy *e = &r->enemies[i];
+        if (!e->active) continue;
+        e->hp -= dmg;
+        e->flash = 14;
+        if (e->hp <= 0) kill_enemy(g, r, e);
+    }
+}
+
 void place_bomb(Game *g) {
-    if (g->bomb_timer > 0) return;       /* already a bomb active */
     if (g->player.bombs <= 0) return;
+    int slot = -1;
+    for (int i = 0; i < MAX_BOMBS; i++) {
+        if (!g->bombs[i].active) { slot = i; break; }
+    }
+    if (slot < 0) return;                /* bomb pool full */
     g->player.bombs--;
-    g->bomb_x = g->player.x;
-    g->bomb_y = g->player.y;
-    g->bomb_timer = 90;   /* ~1.5 seconds at 60fps */
-    g->bomb_flash = 0;
+    g->bombs[slot].x = g->player.x;
+    g->bombs[slot].y = g->player.y;
+    g->bombs[slot].vx = 0;
+    g->bombs[slot].vy = 0;
+    g->bombs[slot].timer = 90;   /* ~1.5 seconds at 60fps */
+    g->bombs[slot].flash = 0;
+    g->bombs[slot].is_epic = 0;
+    g->bombs[slot].active = 1;
     audio_play(SFX_SHOOT);  /* reuse shoot sound for placement */
 }
 
-void bomb_update(Game *g) {
-    if (g->bomb_timer <= 0) return;
-    g->bomb_timer--;
-    g->bomb_flash++;
+/* Arm a troll bomb (Tower card / Explosive Diarrhea): a live pool bomb that
+ * explodes on the normal fuse and CAN hurt the player.
+ * Returns 1 if a pool slot was free. */
+static int spawn_troll_bomb(Game *g, float x, float y) {
+    for (int i = 0; i < MAX_BOMBS; i++) {
+        if (g->bombs[i].active) continue;
+        g->bombs[i].x = x;
+        g->bombs[i].y = y;
+        g->bombs[i].vx = 0;
+        g->bombs[i].vy = 0;
+        g->bombs[i].timer = randi(60, 110);  /* staggered fuses */
+        g->bombs[i].flash = 0;
+        g->bombs[i].is_epic = 0;
+        g->bombs[i].active = 1;
+        return 1;
+    }
+    return 0;
+}
 
-    if (g->bomb_timer > 0) return;
-
-    /* === EXPLOSION === */
+/* Parameterized explosion core. Every explosion that can touch the player
+ * funnels through here so Pyromaniac (D6) gates them all in one place.
+ *   blast      - radius in pixels
+ *   enemy_dmg  - damage to non-boss enemies in the radius
+ *   boss_dmg   - damage to bosses in the radius
+ *   player_dmg - half-hearts dealt to the player if caught in the radius */
+static void bomb_explode_ex(Game *g, float bx, float by, float blast,
+                            float enemy_dmg, float boss_dmg, int player_dmg) {
     Room *r = current_room(g);
-    float bx = g->bomb_x, by = g->bomb_y;
-    float blast = 48.0f;
 
     trigger_shake(g, 6.0f, 20);
     audio_play(SFX_ENEMY_DEATH);  /* reuse for explosion sound */
 
-    /* Destroy obstacles (rocks) in blast radius */
+    /* Destroy obstacles (rocks/poop) in blast radius. Slot machines and
+       spikes are blast-proof. */
     for (int i = 0; i < r->obstacle_count; i++) {
         Obstacle *o = &r->obstacles[i];
         if (!o->active) continue;
+        if (o->type == OBST_SLOT_MACHINE || o->type == OBST_SPIKES) continue;
         float dx = o->x - bx, dy = o->y - by;
         if (dx * dx + dy * dy < blast * blast) {
             o->active = 0;
             /* Chance to drop a consumable from destroyed rock */
             if (randi(0, 100) < 35) {
                 spawn_random_consumable(r, o->x, o->y);
+            }
+        }
+    }
+
+    /* Blasts hurt the player too (troll bombs and careless placement alike).
+       D6 Pyromaniac (ITEM_FLAG_FIRE_IMMUNE): immune to ALL explosion damage;
+       instead each blast that catches the player HEALS half a heart. */
+    Player *p = &g->player;
+    {
+        float pdx = p->x - bx, pdy = p->y - by;
+        int p_inside = (pdx * pdx + pdy * pdy < blast * blast);
+        if (p->stats.flags & ITEM_FLAG_FIRE_IMMUNE) {
+            if (p_inside) {
+                if (p->hp < p->stats.max_hp) p->hp += 1;
+                audio_play(SFX_PICKUP);
+            }
+        } else if (p_inside && p->iframes == 0) {
+            p->hp -= player_absorb_dmg(p, player_dmg);
+            p->iframes = PLAYER_IFRAMES;
+            g->hitstop = 3;
+            audio_play(SFX_HURT_GRUNT);
+            trigger_shake(g, 5.0f, 18);
+            if (player_check_death(p)) {
+                audio_play(SFX_PLAYER_DEATH);
+                g->state = STATE_GAMEOVER;
             }
         }
     }
@@ -2675,7 +4433,9 @@ void bomb_update(Game *g) {
         if (!e->active) continue;
         float dx = e->x - bx, dy = e->y - by;
         if (dx * dx + dy * dy < blast * blast) {
-            e->hp -= 3;  /* bombs do heavy damage */
+            float bomb_prev_hp = e->hp;
+            /* Standard bombs kill any non-boss outright; bosses take a chunk */
+            e->hp -= is_boss_type(e->type) ? boss_dmg : enemy_dmg;
             e->flash = 14;  /* punchier white-hit flash on bomb damage */
             /* Knockback away from bomb */
             float dist = sqrtf(dx * dx + dy * dy);
@@ -2684,86 +4444,23 @@ void bomb_update(Game *g) {
                 e->y += (dy / dist) * 20.0f;
             }
 
-            /* Handle enemy death from bomb */
-            if (e->hp <= 0) {
-                /* Globin: collapse instead of dying (first time) */
-                if (e->type == ENEMY_GLOBIN && e->state == 0 && !e->split_done) {
-                    e->state = 1;
-                    e->hp = 1;
-                    e->regen_timer = 120;
-                    e->split_done = 1;
-                    continue;
-                }
-
-                /* Gaper split on death */
-                if (e->type == ENEMY_GAPER && !e->split_done) {
-                    spawn_gaper_split(r, e->x, e->y);
-                    spawn_gaper_split(r, e->x, e->y);
-                }
-
-                /* Boom Fly: explode on death */
-                if (e->type == ENEMY_BOOM_FLY) {
-                    boom_fly_explode(g, e->x, e->y);
-                }
-
-                /* Mulligan: spawn 2-3 flies on death */
-                if (e->type == ENEMY_MULLIGAN) {
-                    const FloorInfo *mfi = get_floor_info(g->current_floor);
-                    int nflies = randi(2, 3);
-                    for (int f = 0; f < nflies; f++) {
-                        spawn_fly_from_death(r, e->x, e->y, mfi);
-                    }
-                }
-
-                /* Drops (difficulty-scaled) */
-                enemy_death_drops(g, r, e);
-
-                /* Champion bonus reward + black champion split */
-                if (e->champion != CHAMP_NONE) {
-                    enemy_drop_champion_reward(g, e);
-                    if (e->champion == CHAMP_BLACK && e->split_pending) {
-                        int split_hp = (e->max_hp > 1) ? (e->max_hp / 2) : 1;
-                        for (int ci = 0; ci < 2; ci++) {
-                            for (int ei = 0; ei < MAX_ENEMIES; ei++) {
-                                if (!r->enemies[ei].active) {
-                                    Enemy *ne = &r->enemies[ei];
-                                    memset(ne, 0, sizeof(Enemy));
-                                    ne->type = e->type;
-                                    ne->x = e->x + randf(-12.0f, 12.0f);
-                                    ne->y = e->y + randf(-12.0f, 12.0f);
-                                    ne->hp = ne->max_hp = split_hp;
-                                    ne->active = 1;
-                                    ne->champion = CHAMP_NONE;
-                                    ne->dx = randf(-1.0f, 1.0f);
-                                    ne->dy = randf(-1.0f, 1.0f);
-                                    if (ei >= r->enemy_count) r->enemy_count = ei + 1;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                e->active = 0;
-                g->score += is_boss_type(e->type) ? 100 : 10;
-                g->kills++;
-                audio_play(SFX_ENEMY_DEATH);
-                if (is_boss_type(e->type)) {
-                    trigger_shake(g, 7.0f, 40);
-                    g->boss_active = 0;
-                    g->boss_death_anim = 60;
-                    /* Track in persistent unlocks (bosses_defeated bitmask) */
-                    {
-                        int boss_idx = (int)e->type - (int)ENEMY_BOSS_DUKE;
-                        if (boss_idx >= 0 && boss_idx < 16) {
-                            g_config.bosses_defeated |= (1 << boss_idx);
-                            config_save(&g_config);
-                        }
-                    }
-                    /* Return to floor music after boss defeat */
-                    music_play(music_for_floor(g->current_floor));
+            /* Fistula: splits into a couple of smaller balls every time it
+               crosses a quarter-HP threshold, as long as it survives the hit. */
+            if (e->type == ENEMY_BOSS_FISTULA && e->hp > 0) {
+                float quarter = e->max_hp * 0.25f;
+                if (quarter < 1.0f) quarter = 1.0f;
+                int thresholds_crossed = (int)(bomb_prev_hp / quarter)
+                                       - (int)(e->hp / quarter);
+                if (thresholds_crossed > 0) {
+                    float ball_hp = e->max_hp / 6.0f;
+                    if (ball_hp < 1.0f) ball_hp = 1.0f;
+                    spawn_fistula_ball(r, e->x, e->y, ball_hp);
+                    spawn_fistula_ball(r, e->x, e->y, ball_hp);
                 }
             }
+
+            /* Handle enemy death from bomb (shared death path) */
+            if (e->hp <= 0) kill_enemy(g, r, e);
         }
     }
 
@@ -2806,6 +4503,198 @@ void bomb_update(Game *g) {
     }
 }
 
+/* Standard bomb: 48px blast, kills any non-boss (60), chunks bosses (15),
+ * hits the player for a full heart (2 half-hearts). */
+static void bomb_explode(Game *g, float bx, float by) {
+    bomb_explode_ex(g, bx, by, 48.0f, 60.0f, 15.0f, 2);
+}
+
+void bomb_update(Game *g) {
+    for (int i = 0; i < MAX_BOMBS; i++) {
+        ActiveBomb *b = &g->bombs[i];
+        if (!b->active) continue;
+        /* D4 Dr. Fetus tear-bombs slide with friction, then sit on the fuse */
+        if (b->vx != 0.0f || b->vy != 0.0f) {
+            b->x += b->vx;
+            b->y += b->vy;
+            b->vx *= 0.90f;
+            b->vy *= 0.90f;
+            if (b->vx * b->vx + b->vy * b->vy < 0.05f) { b->vx = 0; b->vy = 0; }
+            /* Stop dead at walls */
+            if (b->x < ROOM_LEFT + 6)   { b->x = ROOM_LEFT + 6;   b->vx = 0; }
+            if (b->x > ROOM_RIGHT - 6)  { b->x = ROOM_RIGHT - 6;  b->vx = 0; }
+            if (b->y < ROOM_TOP + 6)    { b->y = ROOM_TOP + 6;    b->vy = 0; }
+            if (b->y > ROOM_BOTTOM - 6) { b->y = ROOM_BOTTOM - 6; b->vy = 0; }
+        }
+        b->timer--;
+        b->flash++;
+        if (b->timer > 0) continue;
+        b->active = 0;
+        if (b->is_epic) {
+            /* D4 Epic Fetus: x1.5 blast radius and x1.5 damage */
+            bomb_explode_ex(g, b->x, b->y, 72.0f, 90.0f, 22.5f, 2);
+        } else {
+            bomb_explode(g, b->x, b->y);
+        }
+    }
+}
+
+/* ================================================================
+ * Beam weapons (D1 Brimstone / D2 Technology) + Mom's Knife (D3)
+ * ================================================================ */
+
+/* Advance the live beam one frame: recompute the player->wall segment
+ * (bent toward the nearest on-line enemy for the Brimstone + Spoon Bender
+ * synergy, D7) and damage every enemy the segment crosses.
+ * Brimstone: 10-frame sweep totalling ~3x tear damage (dmg*0.30/frame).
+ * Technology: continuous while firing at dmg*0.25/frame. */
+static void laser_update(Game *g) {
+    if (!g->laser_active) return;
+    g->laser_timer--;
+    if (g->laser_timer <= 0) { g->laser_active = 0; return; }
+
+    Player *p = &g->player;
+    Room *r = current_room(g);
+    float ox = p->x;
+    float oy = p->y - PLAYER_SIZE * 0.3f;   /* fires from eye height */
+
+    /* Endpoint: straight to the wall in the (cardinal) aim direction */
+    float ex = ox, ey = oy;
+    if      (g->laser_dx > 0) ex = ROOM_RIGHT;
+    else if (g->laser_dx < 0) ex = ROOM_LEFT;
+    else if (g->laser_dy > 0) ey = ROOM_BOTTOM;
+    else                      ey = ROOM_TOP;
+
+    /* D7 Brimstone + Spoon Bender/Sacred Heart (synergy grants HOMING in
+       recalc_player_stats): bend the far endpoint toward the closest enemy
+       within ~60px of the beam line. */
+    if (!g->laser_is_tech && (p->stats.flags & ITEM_FLAG_HOMING)) {
+        float sx = ex - ox, sy = ey - oy;
+        float slen2 = sx * sx + sy * sy;
+        if (slen2 > 1.0f) {
+            float best_d = 60.0f;
+            Enemy *best = NULL;
+            for (int i = 0; i < r->enemy_count; i++) {
+                Enemy *e = &r->enemies[i];
+                if (!e->active || e->hidden) continue;
+                float t = ((e->x - ox) * sx + (e->y - oy) * sy) / slen2;
+                if (t < 0.1f || t > 1.0f) continue;
+                float px = ox + sx * t, py = oy + sy * t;
+                float ddx = e->x - px, ddy = e->y - py;
+                float dd = sqrtf(ddx * ddx + ddy * ddy);
+                if (dd < best_d) { best_d = dd; best = e; }
+            }
+            if (best) {
+                ex += (best->x - ex) * 0.65f;
+                ey += (best->y - ey) * 0.65f;
+            }
+        }
+    }
+    g->laser_ex = ex;
+    g->laser_ey = ey;
+
+    float per_frame = g->laser_is_tech ? p->stats.damage * 0.25f
+                                       : p->stats.damage * 0.30f;
+    float half_w = g->laser_is_tech ? 2.0f : 6.0f;
+    float sx = ex - ox, sy = ey - oy;
+    float slen2 = sx * sx + sy * sy;
+    if (slen2 < 1.0f) return;
+    for (int i = 0; i < r->enemy_count; i++) {
+        Enemy *e = &r->enemies[i];
+        if (!e->active || e->hidden) continue;
+        float esz = is_boss_type(e->type) ? ENEMY_SIZE * 2 : ENEMY_SIZE;
+        /* Distance from enemy center to the beam segment */
+        float t = ((e->x - ox) * sx + (e->y - oy) * sy) / slen2;
+        if (t < 0.0f) t = 0.0f;
+        if (t > 1.0f) t = 1.0f;
+        float px = ox + sx * t, py = oy + sy * t;
+        float ddx = e->x - px, ddy = e->y - py;
+        float rr = esz + half_w;
+        if (ddx * ddx + ddy * ddy >= rr * rr) continue;
+        e->hp -= per_frame;
+        e->flash = 4;
+        /* Light gore while the beam burns (every 4th frame, deterministic) */
+        if ((g->frame & 3) == 0)
+            spawn_blood_splatter(g, e->x, e->y, sx * 0.002f, sy * 0.002f, 0);
+        if (e->hp <= 0) kill_enemy(g, r, e);
+    }
+}
+
+/* D3 Mom's Knife: single entity. Held in front of the player until thrown;
+ * flies out to range, then homes back to the player's hand. Damages on
+ * overlap in both flight states at 2x tear damage (a short re-hit cooldown
+ * makes each pass-through count once per enemy pass). */
+static void knife_update(Game *g) {
+    Player *p = &g->player;
+    if (!(p->stats.flags & ITEM_FLAG_KNIFE)) { g->knife_state = 0; return; }
+    Room *r = current_room(g);
+
+    if (g->knife_hit_cd > 0) g->knife_hit_cd--;
+
+    if (g->knife_state == 0) {
+        /* Held: hover just in front of the facing direction (no damage) */
+        float dx, dy;
+        dir_to_vec((p->face_dir == DIR_NONE) ? DIR_DOWN : p->face_dir,
+                   &dx, &dy);
+        g->knife_x = p->x + dx * (PLAYER_SIZE + 4.0f);
+        g->knife_y = p->y - PLAYER_SIZE * 0.3f + dy * (PLAYER_SIZE + 4.0f);
+        g->knife_dx = dx;
+        g->knife_dy = dy;
+        return;
+    }
+
+    float spd = TEAR_BASE_SPEED * (1.0f + p->stats.shot_speed * 0.15f) * 1.6f;
+    if (g->knife_state == 1) {
+        /* Thrown: fly straight out to range (walls also turn it around) */
+        g->knife_x += g->knife_dx * spd;
+        g->knife_y += g->knife_dy * spd;
+        g->knife_dist += spd;
+        if (g->knife_dist >= p->stats.range ||
+            g->knife_x < ROOM_LEFT || g->knife_x > ROOM_RIGHT ||
+            g->knife_y < ROOM_TOP  || g->knife_y > ROOM_BOTTOM) {
+            g->knife_state = 2;   /* returning */
+        }
+    } else {
+        /* Returning: home back to the player's hand */
+        float hdx = p->x - g->knife_x;
+        float hdy = p->y - g->knife_y;
+        float hm = sqrtf(hdx * hdx + hdy * hdy);
+        if (hm < spd + 4.0f) { g->knife_state = 0; return; }
+        g->knife_dx = hdx / hm;
+        g->knife_dy = hdy / hm;
+        g->knife_x += g->knife_dx * spd;
+        g->knife_y += g->knife_dy * spd;
+    }
+
+    /* Damage on overlap in both flight states */
+    if (g->knife_hit_cd == 0) {
+        for (int i = 0; i < r->enemy_count; i++) {
+            Enemy *e = &r->enemies[i];
+            if (!e->active || e->hidden) continue;
+            float esz = is_boss_type(e->type) ? ENEMY_SIZE * 2 : ENEMY_SIZE;
+            float kdx = g->knife_x - e->x, kdy = g->knife_y - e->y;
+            float rr = esz + 6.0f;
+            if (kdx * kdx + kdy * kdy >= rr * rr) continue;
+            float dmg = p->stats.damage * 2.0f;
+            e->hp -= dmg;
+            e->flash = 14;
+            audio_play(SFX_HIT);
+            spawn_blood_splatter(g, g->knife_x, g->knife_y,
+                                 g->knife_dx, g->knife_dy, 1);
+            /* Knockback along the knife's travel direction */
+            {
+                float kbScale = is_boss_type(e->type) ? 0.25f : 1.0f;
+                float kbMag = TEAR_KNOCKBACK * (0.5f + dmg * 0.4f) * kbScale;
+                e->kb_dx += g->knife_dx * kbMag;
+                e->kb_dy += g->knife_dy * kbMag;
+            }
+            if (e->hp <= 0) kill_enemy(g, r, e);
+            g->knife_hit_cd = 8;
+            break;
+        }
+    }
+}
+
 void enemy_shots_update(Game *g) {
     Room *r = current_room(g);
     Player *p = &g->player;
@@ -2844,13 +4733,13 @@ void enemy_shots_update(Game *g) {
             if (pdx * pdx + pdy * pdy < md * md) {
                 p->hp -= player_absorb_dmg(p, s->dmg);
                 p->iframes = PLAYER_IFRAMES;
+                g->hitstop = 3;
                 /* Knockback from projectile direction */
                 float sv = sqrtf(s->dx * s->dx + s->dy * s->dy);
                 if (sv > 0.1f) {
                     p->vx = (s->dx / sv) * PLAYER_KB_FORCE * 0.7f;
                     p->vy = (s->dy / sv) * PLAYER_KB_FORCE * 0.7f;
                 }
-                p->kb_timer = PLAYER_KB_FRAMES;
                 s->active = 0;
                 audio_play(SFX_HURT_GRUNT);  /* New hurt grunt sound */
                 trigger_shake(g, 4.0f, 14);
@@ -2868,6 +4757,16 @@ void enemies_update(Game *g) {
     Room *r = current_room(g);
     const FloorInfo *fi = get_floor_info(g->current_floor);
 
+    /* E9 Challenge "Speed!": every enemy AI reads its speed through the
+       floor multipliers, so scale a local copy 1.4x for the whole update. */
+    FloorInfo fi_speed;
+    if (g->challenge == 4) {
+        fi_speed = *fi;
+        fi_speed.enemy_speed_mult *= 1.4f;
+        fi_speed.boss_speed_scale *= 1.4f;
+        fi = &fi_speed;
+    }
+
     /* Pause AI during boss intro */
     if (g->boss_intro_timer > 0) {
         for (int i = 0; i < r->enemy_count; i++) {
@@ -2876,11 +4775,129 @@ void enemies_update(Game *g) {
         return;
     }
 
+    /* ── Boss Rush wave controller ──
+       Drives the ROOM_BOSSRUSH gauntlet: 2 bosses per wave, 6 waves total,
+       drawn from the same boss pools/init path as normal boss rooms. The
+       room is guaranteed to become clearable -- see the safety net below. */
+    if (r->type == ROOM_BOSSRUSH && !r->cleared) {
+        if (!g->bossrush_active) {
+            /* First frame in the room: start the gauntlet */
+            g->bossrush_active = 1;
+            g->bossrush_wave = 0;
+            g->bossrush_spawn_timer = 30; /* brief grace period before wave 1 */
+        }
+
+        if (g->bossrush_spawn_timer > 0) {
+            g->bossrush_spawn_timer--;
+        } else {
+            int alive_bosses = 0;
+            for (int i = 0; i < r->enemy_count; i++) {
+                if (r->enemies[i].active) alive_bosses++;
+            }
+
+            if (alive_bosses == 0) {
+                if (g->bossrush_wave >= BOSSRUSH_TOTAL_WAVES) {
+                    /* Anti-softlock safety net: zero alive enemies and the wave
+                       counter is at/after the final wave -- always clear here,
+                       regardless of how we got to this state. */
+                    r->cleared = 1;
+                    g->bossrush_active = 0;
+                    g->boss_active = 0;
+                    audio_play(SFX_ROOM_CLEAR);
+
+                    /* Reward: item pedestal + a full heal (guarantees the room
+                       is worth clearing and never leaves the player stuck).
+                       E9 "The Purist": no pedestals — hearts only. */
+                    r->pedestal.x = (ROOM_LEFT + ROOM_RIGHT) / 2.0f;
+                    r->pedestal.y = (ROOM_TOP + ROOM_BOTTOM) / 2.0f;
+                    r->pedestal.item = pick_random_item(g);
+                    r->pedestal.active = (g->challenge != 6);
+                    spawn_heart(r, ROOM_LEFT + 60, ROOM_TOP + 60, HEART_RED_FULL);
+                    spawn_heart(r, ROOM_RIGHT - 60, ROOM_TOP + 60, HEART_RED_FULL);
+
+                    /* E9 "The Purist": the final floor's boss room was
+                       replaced by this Boss Rush — its clear grants the
+                       winning trapdoor (advance past the last floor). */
+                    if (g->challenge == 6 &&
+                        g->current_floor == MAX_FLOORS - 1) {
+                        r->has_trapdoor = 1;
+                    }
+                } else {
+                    /* Spawn the next wave: 2 bosses from the floor's boss pool,
+                       capped by MAX_ENEMIES (always true here since 2 << 20). */
+                    float cx = (ROOM_LEFT + ROOM_RIGHT) / 2.0f;
+                    int to_spawn = 2;
+                    if (to_spawn > MAX_ENEMIES - r->enemy_count)
+                        to_spawn = MAX_ENEMIES - r->enemy_count;
+
+                    r->enemy_count = 0; /* clear defeated bosses' slots for reuse */
+                    /* F5: wave spawn safety — room-entry-style iframes so a
+                       boss materialising on top of the player can't land an
+                       unavoidable hit. */
+                    if (g->player.iframes < 40) g->player.iframes = 40;
+                    for (int i = 0; i < to_spawn; i++) {
+                        Enemy *e = &r->enemies[r->enemy_count++];
+                        memset(e, 0, sizeof(Enemy));
+                        e->active = 1;
+                        e->spawn_grace = 10; /* F6: no same-frame contact */
+                        /* Boss Rush waves draw from the RANDOM pools. Floors
+                           4+ have fixed story bosses in select_boss_for_floor,
+                           so map late floors onto pool floors — otherwise
+                           every wave on a late floor would be the same fixed
+                           boss (Mom x12...). Floor 4 -> Depths pool (Fistula),
+                           5+ -> Womb pool (Scolex/Loki), keeping every
+                           pool boss reachable for the 20-boss collection. */
+                        int pool_floor = (g->current_floor > 5) ? 5 : g->current_floor;
+                        EnemyType selected_boss = select_pool_boss_for_floor(g, pool_floor);
+                        push_boss_history(g, selected_boss);
+                        /* F5: proximity rejection — bosses spawn at
+                           (cx±40, ROOM_TOP+60); if that lands within 70px of
+                           the player, flip to the opposite side, and failing
+                           that spawn at the far corner from the player. */
+                        float sx = cx + (i == 0 ? -40.0f : 40.0f);
+                        float sy = ROOM_TOP + 60.0f;
+                        float pdx = sx - g->player.x;
+                        float pdy = sy - g->player.y;
+                        if (pdx * pdx + pdy * pdy < 70.0f * 70.0f) {
+                            sx = cx + (i == 0 ? 40.0f : -40.0f);
+                            pdx = sx - g->player.x;
+                            if (pdx * pdx + pdy * pdy < 70.0f * 70.0f) {
+                                sx = (g->player.x < cx) ? (ROOM_RIGHT - 60.0f)
+                                                        : (ROOM_LEFT + 60.0f);
+                            }
+                        }
+                        init_boss_enemy(g, fi, e, selected_boss, sx);
+                        g->current_boss_type = selected_boss;
+                        g->boss_name = boss_name_str(selected_boss);
+
+                        /* Same difficulty + infinite-loop HP scaling the
+                           normal boss-room spawn path applies */
+                        float hp_mult = diff_enemy_hp_mult(g->difficulty);
+                        if (g->game_mode == MODE_INFINITE && g->infinite_loop > 0) {
+                            hp_mult *= 1.0f + g->infinite_loop * 0.25f;
+                        }
+                        if (hp_mult != 1.0f) {
+                            e->hp = e->hp * hp_mult;
+                            if (e->hp < 1) e->hp = 1;
+                            e->max_hp = e->hp;
+                        }
+                    }
+                    g->bossrush_wave++;
+                    g->boss_active = 1;
+                    g->bossrush_spawn_timer = 40; /* short breather before next check */
+                    trigger_shake(g, 4.0f, 20);
+                    audio_play(SFX_BOSS);
+                }
+            }
+        }
+    }
+
     for (int i = 0; i < r->enemy_count; i++) {
         Enemy *e = &r->enemies[i];
         if (!e->active) continue;
 
         if (e->flash > 0) e->flash--;
+        if (e->spawn_grace > 0) e->spawn_grace--; /* F6: post-spawn contact grace */
         e->anim_timer++;  /* increment sprite animation counter */
 
         /* Yellow champion: drop creep trail periodically */
@@ -2906,42 +4923,15 @@ void enemies_update(Game *g) {
 
         switch (e->type) {
         case ENEMY_FLY: {
-            /* Smarter fly: orbits the player at some radius, occasionally dives */
-            float pdx = p->x - e->x;
-            float pdy = p->y - e->y;
-            float pd  = sqrtf(pdx * pdx + pdy * pdy);
-
+            /* Rebirth black fly: wanders aimlessly — the threat is only
+               bumping into it, never a chase. Re-rolls heading periodically. */
             e->timer--;
-            if (e->state == 0) {
-                /* Orbit: move perpendicular to player vector + slight inward bias */
-                e->orbit_phase += 0.04f;
-                float target_r = 50.0f;
-                /* tangent direction (counter-clockwise) */
-                if (pd > 0.5f) {
-                    float tx = -pdy / pd;
-                    float ty =  pdx / pd;
-                    float inward = (pd - target_r) * 0.02f;
-                    float spd = 1.1f * fi->enemy_speed_mult;
-                    if (!suppressAI) {
-                        e->dx = tx * spd + (pdx / pd) * inward;
-                        e->dy = ty * spd + (pdy / pd) * inward;
-                    }
-                }
-                if (e->timer <= 0) {
-                    /* Switch to dive */
-                    e->state = 1;
-                    e->timer = 28;
-                    if (pd > 0.5f) {
-                        e->dx = (pdx / pd) * 2.6f * fi->enemy_speed_mult;
-                        e->dy = (pdy / pd) * 2.6f * fi->enemy_speed_mult;
-                    }
-                }
-            } else {
-                /* Dive: keep velocity, then return to orbit */
-                if (e->timer <= 0) {
-                    e->state = 0;
-                    e->timer = randi(60, 140);
-                }
+            if (e->timer <= 0) {
+                float ang = randf(0, 6.28f);
+                float spd = 0.7f * fi->enemy_speed_mult;
+                e->dx = cosf(ang) * spd;
+                e->dy = sinf(ang) * spd;
+                e->timer = randi(40, 90);
             }
             if (!suppressAI) {
                 e->x += e->dx;
@@ -3001,6 +4991,48 @@ void enemies_update(Game *g) {
             break;
         }
 
+        case ENEMY_FATTY: {
+            /* Slow, tanky gaper: same chase steering but sluggish. */
+            float gdx = p->x - e->x;
+            float gdy = p->y - e->y;
+            float gm = sqrtf(gdx * gdx + gdy * gdy);
+            float speed = 0.45f * fi->enemy_speed_mult;  /* slower than gaper's 0.8 */
+            e->wobble += 0.10f;
+
+            if (gm > 1.0f && !suppressAI) {
+                float dirx = gdx / gm;
+                float diry = gdy / gm;
+
+                /* Avoid obstacles like a gaper */
+                for (int j = 0; j < r->obstacle_count; j++) {
+                    Obstacle *o = &r->obstacles[j];
+                    if (!o->active) continue;
+                    float odx = o->x - e->x;
+                    float ody = o->y - e->y;
+                    float od2 = odx * odx + ody * ody;
+                    if (od2 > 60.0f * 60.0f) continue;
+                    float ond = sqrtf(od2);
+                    if (ond < 0.1f) continue;
+                    float push = (60.0f - ond) / 60.0f;
+                    dirx += (-ody / ond) * push * 0.5f;
+                    diry += ( odx / ond) * push * 0.5f;
+                }
+
+                float dl = sqrtf(dirx * dirx + diry * diry);
+                if (dl > 0.1f) { dirx /= dl; diry /= dl; }
+
+                float w = sinf(e->wobble) * 0.3f;
+                float wx = -diry * w;
+                float wy =  dirx * w;
+
+                e->dx = (dirx + wx) * speed;
+                e->dy = (diry + wy) * speed;
+                e->x += e->dx;
+                e->y += e->dy;
+            }
+            break;
+        }
+
         case ENEMY_PACER: {
             /* Pace horizontally; charge when player is close */
             float pdx = p->x - e->x;
@@ -3036,6 +5068,52 @@ void enemies_update(Game *g) {
                         e->dx = -e->dx;
                     if (p->y > e->y + 2) e->y += 0.35f * fi->enemy_speed_mult;
                     else if (p->y < e->y - 2) e->y -= 0.35f * fi->enemy_speed_mult;
+                }
+            }
+            break;
+        }
+
+        case ENEMY_CHARGER: {
+            /* Pacer variant: paces horizontally, then charges STRAIGHT
+             * (locked to an axis) the moment the player lines up with it. */
+            float pdx = p->x - e->x;
+            float pdy = p->y - e->y;
+
+            if (!suppressAI) {
+                if (e->state == 0 &&
+                    (fabsf(pdy) < 14.0f || fabsf(pdx) < 14.0f)) {
+                    /* Aligned on an axis -> begin a straight charge along it */
+                    e->state = 1;
+                    e->timer = 40;
+                    float spd = 3.2f * fi->enemy_speed_mult;
+                    if (fabsf(pdy) < 14.0f) {
+                        /* horizontal charge */
+                        e->dx = (pdx >= 0 ? 1.0f : -1.0f) * spd;
+                        e->dy = 0;
+                    } else {
+                        /* vertical charge */
+                        e->dx = 0;
+                        e->dy = (pdy >= 0 ? 1.0f : -1.0f) * spd;
+                    }
+                }
+
+                if (e->state == 1) {
+                    /* Charging straight; bounce off walls, end after timer */
+                    e->x += e->dx;
+                    e->y += e->dy;
+                    e->timer--;
+                    if (e->x <= ROOM_LEFT + ENEMY_SIZE || e->x >= ROOM_RIGHT - ENEMY_SIZE ||
+                        e->y <= ROOM_TOP + ENEMY_SIZE  || e->y >= ROOM_BOTTOM - ENEMY_SIZE ||
+                        e->timer <= 0) {
+                        e->state = 0;
+                        e->dx = (randi(0, 1) == 0 ? 1 : -1) * 1.2f * fi->enemy_speed_mult;
+                        e->dy = 0;
+                    }
+                } else {
+                    /* Pacing horizontally */
+                    e->x += e->dx;
+                    if (e->x <= ROOM_LEFT + ENEMY_SIZE || e->x >= ROOM_RIGHT - ENEMY_SIZE)
+                        e->dx = -e->dx;
                 }
             }
             break;
@@ -3116,37 +5194,23 @@ void enemies_update(Game *g) {
 
         /* === NEW ENEMY AIs === */
         case ENEMY_ATTACK_FLY: {
-            /* Aggressive fly: dives at player repeatedly, faster than normal fly */
+            /* Rebirth attack fly: relentless straight chase — no hover or
+               rest windows, just constant pursuit. */
             float pdx = p->x - e->x;
             float pdy = p->y - e->y;
             float pd  = sqrtf(pdx * pdx + pdy * pdy);
-            e->timer--;
-
-            if (e->state == 0) {
-                /* Brief hover before diving */
-                e->dx *= 0.92f;
-                e->dy *= 0.92f;
-                if (e->timer <= 0) {
-                    e->state = 1;
-                    e->timer = 20;
-                    if (pd > 0.5f) {
-                        e->dx = (pdx / pd) * 3.2f * fi->enemy_speed_mult;
-                        e->dy = (pdy / pd) * 3.2f * fi->enemy_speed_mult;
-                    }
-                }
-            } else {
-                /* Diving - hold course */
-                if (e->timer <= 0) {
-                    e->state = 0;
-                    e->timer = randi(20, 50); /* shorter rest than normal fly */
-                }
+            if (pd > 1.0f && !suppressAI) {
+                float spd = 1.4f * fi->enemy_speed_mult;
+                e->dx = (pdx / pd) * spd;
+                e->dy = (pdy / pd) * spd;
+                e->x += e->dx;
+                e->y += e->dy;
             }
-            if (!suppressAI) { e->x += e->dx; e->y += e->dy; }
             break;
         }
 
         case ENEMY_POOTER: {
-            /* Flies slowly, stops to shoot at player */
+            /* Flies slowly, stops to fire a 2-shot burst (8f apart) */
             e->timer--;
             e->shoot_timer--;
 
@@ -3162,8 +5226,22 @@ void enemies_update(Game *g) {
                     e->state = 1; /* stop to aim */
                     e->timer = 20;
                 }
+            } else if (e->state == 1) {
+                /* Stopped, aiming, then first shot of the burst */
+                e->dx *= 0.9f; e->dy *= 0.9f;
+                if (e->timer <= 0) {
+                    float pdx = p->x - e->x;
+                    float pdy = p->y - e->y;
+                    float pm  = sqrtf(pdx * pdx + pdy * pdy);
+                    if (pm > 0.5f) {
+                        spawn_enemy_shot(g, e->x, e->y,
+                            (pdx / pm) * 2.5f, (pdy / pm) * 2.5f, 1);
+                    }
+                    e->state = 2;
+                    e->timer = 8; /* gap to the second burst shot */
+                }
             } else {
-                /* Stopped, aiming, then shoot */
+                /* Second burst shot, re-aimed, then back to floating */
                 e->dx *= 0.9f; e->dy *= 0.9f;
                 if (e->timer <= 0) {
                     float pdx = p->x - e->x;
@@ -3251,7 +5329,7 @@ void enemies_update(Game *g) {
                 e->dx *= 0.9f; e->dy *= 0.9f;
                 if (e->regen_timer <= 0) {
                     e->state = 0;
-                    e->hp = e->max_hp / 2; /* regenerate to half HP */
+                    e->hp = e->max_hp * 0.5f; /* regenerate to half HP */
                     if (e->hp < 1) e->hp = 1;
                 }
             }
@@ -3259,33 +5337,41 @@ void enemies_update(Game *g) {
         }
 
         case ENEMY_BOOM_FLY: {
-            /* Flies toward player, explodes on death (handled in death code) */
-            float pdx = p->x - e->x;
-            float pdy = p->y - e->y;
-            float pd  = sqrtf(pdx * pdx + pdy * pdy);
-            float spd = 1.0f * fi->enemy_speed_mult;
-            if (pd > 1.0f && !suppressAI) {
-                e->dx = (pdx / pd) * spd;
-                e->dy = (pdy / pd) * spd;
+            /* Rebirth pattern: bounces diagonally around the room (it does
+               NOT chase); the threat is the on-death explosion. */
+            float spd = 1.4f * fi->enemy_speed_mult;
+            if (e->dx == 0 && e->dy == 0) {
+                /* start on a random diagonal */
+                e->dx = (randi(0, 1) ? 1.0f : -1.0f) * spd * 0.7071f;
+                e->dy = (randi(0, 1) ? 1.0f : -1.0f) * spd * 0.7071f;
+            }
+            if (!suppressAI) {
                 e->x += e->dx;
                 e->y += e->dy;
+                /* bounce off the walls */
+                if (e->x < ROOM_LEFT + ENEMY_SIZE)  { e->x = ROOM_LEFT + ENEMY_SIZE;  e->dx = -e->dx; }
+                if (e->x > ROOM_RIGHT - ENEMY_SIZE) { e->x = ROOM_RIGHT - ENEMY_SIZE; e->dx = -e->dx; }
+                if (e->y < ROOM_TOP + ENEMY_SIZE)   { e->y = ROOM_TOP + ENEMY_SIZE;   e->dy = -e->dy; }
+                if (e->y > ROOM_BOTTOM - ENEMY_SIZE){ e->y = ROOM_BOTTOM - ENEMY_SIZE; e->dy = -e->dy; }
             }
             break;
         }
 
         case ENEMY_MAW: {
-            /* Walks slowly, periodically shoots aimed projectiles */
-            float pdx = p->x - e->x;
-            float pdy = p->y - e->y;
-            float pm  = sqrtf(pdx * pdx + pdy * pdy);
+            /* Rebirth Maw: floats in an aimless sinusoidal drift (it never
+               chases) and periodically fires an aimed shot. */
+            e->wobble += 0.03f;
             float spd = 0.6f * fi->enemy_speed_mult;
-            if (pm > 1.0f && !suppressAI) {
-                e->x += (pdx / pm) * spd;
-                e->y += (pdy / pm) * spd;
+            if (!suppressAI) {
+                e->x += sinf(e->wobble) * spd;
+                e->y += cosf(e->wobble * 0.8f) * spd;
             }
             e->shoot_timer--;
             if (e->shoot_timer <= 0) {
                 e->shoot_timer = randi(60, 100);
+                float pdx = p->x - e->x;
+                float pdy = p->y - e->y;
+                float pm  = sqrtf(pdx * pdx + pdy * pdy);
                 if (pm > 0.5f) {
                     float shotSpd = 2.0f;
                     spawn_enemy_shot(g, e->x, e->y,
@@ -3296,24 +5382,19 @@ void enemies_update(Game *g) {
         }
 
         case ENEMY_MULLIGAN: {
-            /* Walks toward player, shoots occasionally; spawns flies on death */
+            /* Rebirth pattern: a walking fly nest that AVOIDS the player.
+               It never attacks — killing it is what's dangerous (fly burst). */
             float pdx = p->x - e->x;
             float pdy = p->y - e->y;
             float pm  = sqrtf(pdx * pdx + pdy * pdy);
-            float spd = 0.7f * fi->enemy_speed_mult;
+            float spd = 0.8f * fi->enemy_speed_mult;
             e->wobble += 0.12f;
             if (pm > 1.0f && !suppressAI) {
-                float w = sinf(e->wobble) * 0.3f;
-                e->x += (pdx / pm + w) * spd;
-                e->y += (pdy / pm) * spd;
-            }
-            e->shoot_timer--;
-            if (e->shoot_timer <= 0) {
-                e->shoot_timer = randi(80, 140);
-                if (pm > 0.5f) {
-                    spawn_enemy_shot(g, e->x, e->y,
-                        (pdx / pm) * 1.8f, (pdy / pm) * 1.8f, 1);
-                }
+                float w = sinf(e->wobble) * 0.35f;
+                /* flee: move away, harder when the player is close */
+                float urgency = (pm < 90.0f) ? 1.0f : 0.45f;
+                e->x += (-(pdx / pm) + w) * spd * urgency;
+                e->y += (-(pdy / pm)) * spd * urgency;
             }
             break;
         }
@@ -3337,14 +5418,14 @@ void enemies_update(Game *g) {
                     float pdy = p->y - e->y;
                     float pm  = sqrtf(pdx * pdx + pdy * pdy);
                     if (pm > 0.5f) {
+                        /* 3-shot fan: -0.25/0/+0.25 rad around the aim line */
                         float shotSpd = 2.5f;
-                        spawn_enemy_shot(g, e->x, e->y,
-                            (pdx / pm) * shotSpd, (pdy / pm) * shotSpd, 1);
-                        /* Second shot slightly spread */
-                        float spread = 0.3f;
-                        spawn_enemy_shot(g, e->x, e->y,
-                            (pdx / pm + spread) * shotSpd,
-                            (pdy / pm - spread) * shotSpd, 1);
+                        float base = atan2f(pdy, pdx);
+                        for (int fs = -1; fs <= 1; fs++) {
+                            float a = base + (float)fs * 0.25f;
+                            spawn_enemy_shot(g, e->x, e->y,
+                                cosf(a) * shotSpd, sinf(a) * shotSpd, 1);
+                        }
                     }
                 }
                 if (e->timer <= 0) {
@@ -3358,25 +5439,31 @@ void enemies_update(Game *g) {
         }
 
         case ENEMY_RED_MAW: {
-            /* Stationary turret, rapidly shoots toward player */
+            /* Rebirth Red Maw: aggressive chaser that keeps up rapid fire
+               while closing on the player. */
+            float pdx = p->x - e->x;
+            float pdy = p->y - e->y;
+            float pm  = sqrtf(pdx * pdx + pdy * pdy);
+            if (pm > 1.0f && !suppressAI) {
+                float spd = 1.2f * fi->enemy_speed_mult;
+                e->x += (pdx / pm) * spd;
+                e->y += (pdy / pm) * spd;
+            }
             e->shoot_timer--;
             if (e->shoot_timer <= 0) {
                 e->shoot_timer = randi(25, 45); /* fast shooting */
-                float pdx = p->x - e->x;
-                float pdy = p->y - e->y;
-                float pm  = sqrtf(pdx * pdx + pdy * pdy);
                 if (pm > 0.5f) {
                     float shotSpd = 3.0f;
                     spawn_enemy_shot(g, e->x, e->y,
                         (pdx / pm) * shotSpd, (pdy / pm) * shotSpd, 1);
                 }
             }
-            /* Red Maw doesn't move */
             break;
         }
 
         case ENEMY_LEAPER: {
-            /* Jumps toward player in high arcs */
+            /* Jumps toward player; every 3rd hop is a HIGH jump that fires
+               the Rebirth-signature 4-way spread on landing. */
             e->timer--;
             if (e->state == 0) {
                 /* On ground, preparing */
@@ -3390,16 +5477,60 @@ void enemies_update(Game *g) {
                         e->dx = (pdx / pm) * 3.0f * fi->enemy_speed_mult;
                         e->dy = (pdy / pm) * 3.0f * fi->enemy_speed_mult;
                     }
+                    e->attack_pattern++;  /* hop counter */
                     e->state = 1;
                     e->timer = 24; /* jump duration */
                 }
             } else {
-                /* In air - arc */
+                /* In air - arc (high on every 3rd hop, low otherwise) */
+                int high_jump = (e->attack_pattern % 3 == 0);
                 float t = (float)e->timer / 24.0f;
-                e->jump_arc = -sinf(t * 3.14159f) * 25.0f; /* high arc */
+                e->jump_arc = -sinf(t * 3.14159f) * (high_jump ? 25.0f : 14.0f);
                 if (e->timer <= 0) {
                     e->state = 0;
                     e->timer = randi(30, 60);
+                    e->jump_arc = 0;
+                    e->dx = 0; e->dy = 0;
+                    /* 4-way spread only when landing from the high jump */
+                    if (high_jump && !suppressAI) {
+                        float ls = 2.0f;
+                        spawn_enemy_shot(g, e->x, e->y,  ls,  0, 1);
+                        spawn_enemy_shot(g, e->x, e->y, -ls,  0, 1);
+                        spawn_enemy_shot(g, e->x, e->y,  0,  ls, 1);
+                        spawn_enemy_shot(g, e->x, e->y,  0, -ls, 1);
+                    }
+                }
+            }
+            if (!suppressAI) { e->x += e->dx; e->y += e->dy; }
+            break;
+        }
+
+        case ENEMY_TRITE: {
+            /* Fast leaping spider: like a Leaper but quicker with a lower,
+             * snappier arc and shorter recovery. No landing shot. */
+            e->timer--;
+            if (e->state == 0) {
+                /* On ground, preparing */
+                e->dx *= 0.8f; e->dy *= 0.8f;
+                e->jump_arc = 0;
+                if (e->timer <= 0) {
+                    float pdx = p->x - e->x;
+                    float pdy = p->y - e->y;
+                    float pm  = sqrtf(pdx * pdx + pdy * pdy);
+                    if (pm > 1.0f) {
+                        e->dx = (pdx / pm) * 4.6f * fi->enemy_speed_mult;  /* faster */
+                        e->dy = (pdy / pm) * 4.6f * fi->enemy_speed_mult;
+                    }
+                    e->state = 1;
+                    e->timer = 16; /* shorter jump */
+                }
+            } else {
+                /* In air - low fast arc */
+                float t = (float)e->timer / 16.0f;
+                e->jump_arc = -sinf(t * 3.14159f) * 14.0f; /* lower arc */
+                if (e->timer <= 0) {
+                    e->state = 0;
+                    e->timer = randi(14, 30); /* quick recovery */
                     e->jump_arc = 0;
                     e->dx = 0; e->dy = 0;
                 }
@@ -3435,6 +5566,119 @@ void enemies_update(Game *g) {
                         (ny - nx * spread) * shotSpd, 1);
                 }
             }
+            break;
+        }
+
+        case ENEMY_KEEPER: {
+            /* Moves erratically around the room; drops extra coins on death
+               (handled in enemy_death_drops / the coin-flagged death path). */
+            e->timer--;
+            if (e->timer <= 0) {
+                float ang = randf(0, 6.28f);
+                float spd = 1.6f * fi->enemy_speed_mult;
+                e->dx = cosf(ang) * spd;
+                e->dy = sinf(ang) * spd;
+                e->timer = randi(15, 40);
+            }
+            if (!suppressAI) {
+                e->x += e->dx;
+                e->y += e->dy;
+            }
+            if (e->x <= ROOM_LEFT + ENEMY_SIZE) { e->dx = fabsf(e->dx); }
+            if (e->x >= ROOM_RIGHT - ENEMY_SIZE) { e->dx = -fabsf(e->dx); }
+            if (e->y <= ROOM_TOP + ENEMY_SIZE) { e->dy = fabsf(e->dy); }
+            if (e->y >= ROOM_BOTTOM - ENEMY_SIZE) { e->dy = -fabsf(e->dy); }
+            break;
+        }
+
+        case ENEMY_SUCKER: {
+            /* Floats like a Vis but weaker/slower single-shot instead of a
+               double shot, and fires less often. */
+            e->wobble += 0.025f;
+            float spd = 0.3f * fi->enemy_speed_mult;
+            if (!suppressAI) {
+                e->x += sinf(e->wobble) * spd;
+                e->y += cosf(e->wobble * 0.8f) * spd;
+            }
+            e->shoot_timer--;
+            if (e->shoot_timer <= 0) {
+                e->shoot_timer = randi(70, 110);
+                float pdx = p->x - e->x;
+                float pdy = p->y - e->y;
+                float pm  = sqrtf(pdx * pdx + pdy * pdy);
+                if (pm > 0.5f) {
+                    float shotSpd = 2.0f;
+                    spawn_enemy_shot(g, e->x, e->y,
+                        (pdx / pm) * shotSpd, (pdy / pm) * shotSpd, 1);
+                }
+            }
+            break;
+        }
+
+        case ENEMY_ROUND_WORM: {
+            /* Burrows underground (hidden/invulnerable via ENEMY_HOST-style
+               hidden flag), tunnels toward the player, then emerges to chase
+               briefly before diving again. */
+            e->timer--;
+            if (e->phase == 1) {
+                /* Burrowed: hidden, invulnerable, move toward player */
+                e->hidden = 1;
+                float bdx = p->x - e->x;
+                float bdy = p->y - e->y;
+                float bm = sqrtf(bdx * bdx + bdy * bdy);
+                if (bm > 1.0f) {
+                    float spd = 1.6f * fi->enemy_speed_mult;
+                    e->dx = (bdx / bm) * spd;
+                    e->dy = (bdy / bm) * spd;
+                }
+                if (!suppressAI) {
+                    e->x += e->dx;
+                    e->y += e->dy;
+                }
+                if (e->timer <= 0) {
+                    e->phase = 0;
+                    e->hidden = 0;
+                    e->timer = randi(50, 80);   /* time exposed */
+                }
+            } else {
+                /* Emerged: vulnerable, chases briefly */
+                float pdx = p->x - e->x;
+                float pdy = p->y - e->y;
+                float pm = sqrtf(pdx * pdx + pdy * pdy);
+                if (pm > 1.0f) {
+                    float spd = 1.0f * fi->enemy_speed_mult;
+                    e->dx = (pdx / pm) * spd;
+                    e->dy = (pdy / pm) * spd;
+                }
+                if (!suppressAI) {
+                    e->x += e->dx;
+                    e->y += e->dy;
+                }
+                if (e->timer <= 0) {
+                    e->phase = 1;
+                    e->timer = randi(60, 100);  /* time burrowed */
+                }
+            }
+            break;
+        }
+
+        case ENEMY_SPITTY: {
+            /* Stationary spitter: periodically spits a slow projectile at
+               the player. Doesn't move, similar cadence to Red Maw but
+               slower shots (spit, not a rapid turret). */
+            e->shoot_timer--;
+            if (e->shoot_timer <= 0) {
+                e->shoot_timer = randi(60, 100);
+                float pdx = p->x - e->x;
+                float pdy = p->y - e->y;
+                float pm  = sqrtf(pdx * pdx + pdy * pdy);
+                if (pm > 0.5f) {
+                    float shotSpd = 1.8f;
+                    spawn_enemy_shot(g, e->x, e->y,
+                        (pdx / pm) * shotSpd, (pdy / pm) * shotSpd, 1);
+                }
+            }
+            /* Spitty doesn't move */
             break;
         }
 
@@ -3677,14 +5921,14 @@ void enemies_update(Game *g) {
                 float cdsq = cdx * cdx + cdy * cdy;
                 float crad = PLAYER_SIZE + ENEMY_SIZE;
                 if (cdsq < crad * crad) {
-                    p->hp -= player_absorb_dmg(p, 1);
+                    p->hp -= player_absorb_dmg(p, 2);
                     p->iframes = PLAYER_IFRAMES;
+                    g->hitstop = 3;
                     float cm = sqrtf(cdsq);
                     if (cm > 0.1f) {
                         p->vx = (cdx / cm) * PLAYER_KB_FORCE;
                         p->vy = (cdy / cm) * PLAYER_KB_FORCE;
                     }
-                    p->kb_timer = PLAYER_KB_FRAMES;
                     audio_play(SFX_HURT_GRUNT);
                     trigger_shake(g, 4.0f, 12);
                     if (player_check_death(p)) {
@@ -3775,14 +6019,14 @@ void enemies_update(Game *g) {
                     float sdy = p->y - seg->y;
                     float sr = PLAYER_SIZE + ENEMY_SIZE * 0.8f;
                     if (sdx * sdx + sdy * sdy < sr * sr) {
-                        p->hp -= player_absorb_dmg(p, 1);
+                        p->hp -= player_absorb_dmg(p, 2);
                         p->iframes = PLAYER_IFRAMES;
+                        g->hitstop = 3;
                         float sm = sqrtf(sdx * sdx + sdy * sdy);
                         if (sm > 0.1f) {
                             p->vx = (sdx / sm) * PLAYER_KB_FORCE;
                             p->vy = (sdy / sm) * PLAYER_KB_FORCE;
                         }
-                        p->kb_timer = PLAYER_KB_FRAMES;
                         audio_play(SFX_HURT_GRUNT);
                         trigger_shake(g, 3.0f, 10);
                         if (player_check_death(p)) {
@@ -3801,7 +6045,7 @@ void enemies_update(Game *g) {
              *         Phase 1 - headless body (below 40% HP), faster charges, more erratic */
             e->timer--;
 
-            if (e->phase == 0 && e->hp < (int)(e->max_hp * 0.4f)) {
+            if (e->phase == 0 && e->hp < e->max_hp * 0.4f) {
                 /* Transition to headless phase */
                 e->phase = 1;
                 e->timer = 10;
@@ -4006,6 +6250,7 @@ void enemies_update(Game *g) {
                 if (e->timer <= 0) {
                     /* Emerge */
                     e->phase = 0;
+                    e->hidden = 0;
                     e->timer = 75;       /* time vulnerable */
                     e->shoot_timer = 15;
                     trigger_shake(g, 3.0f, 10);
@@ -4043,6 +6288,7 @@ void enemies_update(Game *g) {
                 if (e->timer <= 0) {
                     /* Burrow again */
                     e->phase = 1;
+                    e->hidden = 1;
                     e->timer = 80;
                 }
             }
@@ -4266,6 +6512,764 @@ void enemies_update(Game *g) {
             break;
         }
 
+        case ENEMY_BOSS_MOM: {
+            /* Mom (E1): fixed Depths boss. Stomping foot reusing Monstro's
+               jump-target machinery + "door hands" — minions spawned at the
+               door midpoints on a Duke-style spawn timer. */
+            e->timer--;
+
+            /* Door-hand minion spawns (any phase), capped at 4 alive */
+            e->shoot_timer--;
+            if (e->shoot_timer <= 0) {
+                e->shoot_timer = DUKE_SPAWN_INTERVAL;
+                int minions = 0;
+                for (int mi = 0; mi < r->enemy_count; mi++) {
+                    if (r->enemies[mi].active &&
+                        !is_boss_type(r->enemies[mi].type)) minions++;
+                }
+                if (minions < 4 && r->enemy_count < MAX_ENEMIES) {
+                    float mmx = (ROOM_LEFT + ROOM_RIGHT) / 2.0f;
+                    float mmy = (ROOM_TOP + ROOM_BOTTOM) / 2.0f;
+                    float doorpos[4][2] = {
+                        {mmx, ROOM_TOP + 14}, {mmx, ROOM_BOTTOM - 14},
+                        {ROOM_LEFT + 14, mmy}, {ROOM_RIGHT - 14, mmy}
+                    };
+                    int dpick = randi(0, 3);
+                    Enemy *m = &r->enemies[r->enemy_count];
+                    memset(m, 0, sizeof(Enemy));
+                    m->active = 1;
+                    m->spawn_grace = 10; /* F6: no same-frame contact */
+                    m->type = (randi(0, 1) == 0) ? ENEMY_GAPER : ENEMY_BABY;
+                    /* T5: same difficulty/infinite HP scaling as room spawns */
+                    m->hp = m->max_hp =
+                        ((m->type == ENEMY_GAPER) ? 6.0f : 3.0f) * spawn_hp_mult(g);
+                    m->x = doorpos[dpick][0];
+                    m->y = doorpos[dpick][1];
+                    m->timer = randi(30, 60);
+                    r->enemy_count++;
+                    spawn_tear_pop(g, m->x, m->y, 1);
+                }
+            }
+
+            if (e->phase == 0) {
+                /* Idle: track the player slowly */
+                if (!suppressAI) {
+                    float mdx = p->x - e->x;
+                    float mdy = p->y - e->y;
+                    float mm = sqrtf(mdx * mdx + mdy * mdy);
+                    if (mm > 1.0f) {
+                        float mspd = 0.35f * fi->boss_speed_scale;
+                        e->x += (mdx / mm) * mspd;
+                        e->y += (mdy / mm) * mspd;
+                    }
+                }
+                if (e->timer <= 0) {
+                    /* Stomp: Monstro's big-jump interpolation to the player */
+                    e->phase = 1;
+                    e->timer = 45;
+                    e->target_x = p->x;
+                    e->target_y = p->y;
+                    e->jump_vz = -4.5f;
+                    e->jump_z = 0;
+                    e->dx = (e->target_x - e->x) / 45.0f;
+                    e->dy = (e->target_y - e->y) / 45.0f;
+                }
+            } else if (e->phase == 1) {
+                /* Airborne stomp */
+                e->x += e->dx;
+                e->y += e->dy;
+                e->jump_z += e->jump_vz;
+                e->jump_vz += 0.22f;
+                if (e->timer <= 0 || e->jump_z >= 0) {
+                    e->jump_z = 0;
+                    e->jump_vz = 0;
+                    e->phase = 2;
+                    e->timer = 20;
+                    trigger_shake(g, 7.0f, 24);
+                    boss_spread_8way(g, e->x, e->y, BOSS_SHOT_SPEED);
+                    spawn_blood_splatter(g, e->x, e->y, 0, 0, 0);
+                }
+            } else {
+                /* Landing recovery */
+                e->dx *= 0.85f;
+                e->dy *= 0.85f;
+                if (e->timer <= 0) {
+                    e->phase = 0;
+                    e->timer = randi(60, 110);
+                    e->dx = 0;
+                    e->dy = 0;
+                }
+            }
+            break;
+        }
+
+        case ENEMY_BOSS_MOMS_HEART: {
+            /* Mom's Heart (E2): fixed Womb boss. Stationary tank on the
+               Gurdy AI base + periodic enemy waves. */
+            e->timer--;
+
+            float hxDiff = p->x - e->x;
+            if (fabsf(hxDiff) > 4.0f) {
+                e->dx = (hxDiff > 0 ? 0.25f : -0.25f) * fi->boss_speed_scale;
+            } else {
+                e->dx *= 0.9f;
+            }
+            if (!suppressAI) e->x += e->dx;
+
+            if (e->timer <= 0) {
+                e->phase = (e->phase + 1) % 3;
+                if (e->phase == 0) {
+                    e->timer = 55;
+                } else if (e->phase == 1) {
+                    /* Wave spawn: 2-3 minions, capped at 6 alive */
+                    int alive_minions = 0;
+                    for (int mi = 0; mi < r->enemy_count; mi++) {
+                        if (r->enemies[mi].active &&
+                            !is_boss_type(r->enemies[mi].type)) alive_minions++;
+                    }
+                    if (alive_minions < 6) {
+                        int wave = 2 + randi(0, 1);
+                        for (int s = 0; s < wave; s++) {
+                            int kind = randi(0, 2);
+                            if (kind == 0) boss_spawn_fly(g, r, e->x, e->y);
+                            else if (kind == 1) boss_spawn_spider(r, e->x, e->y);
+                            else boss_spawn_pooter(r, e->x, e->y);
+                        }
+                    }
+                    e->timer = 95;
+                } else {
+                    /* Shot spread + aimed shot */
+                    boss_spread_8way(g, e->x, e->y, BOSS_SHOT_SPEED * 0.85f);
+                    float hfdx = p->x - e->x, hfdy = p->y - e->y;
+                    float hfm = sqrtf(hfdx * hfdx + hfdy * hfdy);
+                    if (hfm > 1.0f) {
+                        float spd = BOSS_SHOT_SPEED * 1.2f;
+                        boss_shoot_tear(g, e->x, e->y,
+                                        (hfdx / hfm) * spd, (hfdy / hfm) * spd);
+                    }
+                    e->timer = 70;
+                }
+            }
+            break;
+        }
+
+        case ENEMY_BOSS_SATAN: {
+            /* Satan (E3): fixed Sheol boss, 3 HP-driven phases.
+               p0 (hp > 2/3): summons Hoppers + aimed shots
+               p1 (1/3..2/3): enemy Brimstone beams — 30f thin-line telegraph
+                              then a 10f thick beam that damages the player
+                              on line overlap (state on g->ebeam_*, NOT the
+                              player's laser_* fields)
+               p2 (< 1/3):    giant stomps (Mom's foot logic scaled up).
+               Movement sub-state lives in e->attack_pattern so it can't
+               fight the HP phase stored in e->phase. */
+            e->timer--;
+
+            {
+                int hp_phase = (e->hp > e->max_hp * 0.66f) ? 0
+                             : (e->hp > e->max_hp * 0.33f) ? 1 : 2;
+                if (hp_phase != e->phase) {
+                    e->phase = hp_phase;
+                    e->attack_pattern = 0;
+                    e->jump_z = 0;
+                    e->jump_vz = 0;
+                    e->timer = 50;
+                    trigger_shake(g, 5.0f, 20);
+                }
+            }
+
+            if (e->phase == 0) {
+                /* Drift toward player + aimed shots + Hopper summons */
+                if (!suppressAI) {
+                    float sdx = p->x - e->x, sdy = p->y - e->y;
+                    float sm = sqrtf(sdx * sdx + sdy * sdy);
+                    if (sm > 80.0f) {
+                        e->x += (sdx / sm) * 0.35f * fi->boss_speed_scale;
+                        e->y += (sdy / sm) * 0.35f * fi->boss_speed_scale;
+                    }
+                }
+                e->shoot_timer--;
+                if (e->shoot_timer <= 0) {
+                    e->shoot_timer = 55;
+                    float sfdx = p->x - e->x, sfdy = p->y - e->y;
+                    float sfm = sqrtf(sfdx * sfdx + sfdy * sfdy);
+                    if (sfm > 1.0f) {
+                        float spd = BOSS_SHOT_SPEED * 1.1f;
+                        boss_shoot_tear(g, e->x, e->y,
+                                        (sfdx / sfm) * spd, (sfdy / sfm) * spd);
+                    }
+                }
+                if (e->timer <= 0) {
+                    e->timer = 150;
+                    if (count_enemies_of_type(r, ENEMY_HOPPER) < 2) {
+                        for (int s = 0; s < 2; s++) {
+                            if (r->enemy_count >= MAX_ENEMIES) break;
+                            Enemy *m = &r->enemies[r->enemy_count];
+                            memset(m, 0, sizeof(Enemy));
+                            m->active = 1;
+                            m->spawn_grace = 10; /* F6: no same-frame contact */
+                            m->type = ENEMY_HOPPER;
+                            /* T5: same difficulty/infinite HP scaling as
+                               room spawns */
+                            m->hp = m->max_hp = 4.0f * spawn_hp_mult(g);
+                            m->x = e->x + randf(-30, 30);
+                            m->y = e->y + randf(-20, 20);
+                            m->timer = randi(20, 50);
+                            r->enemy_count++;
+                        }
+                        trigger_shake(g, 3.0f, 10);
+                    }
+                }
+            } else if (e->phase == 1) {
+                /* Enemy Brimstone beam cycle */
+                if (!suppressAI) {
+                    e->dx *= 0.85f;
+                    e->dy *= 0.85f;
+                    e->x += e->dx;
+                    e->y += e->dy;
+                }
+                if (g->ebeam_state == 0) {
+                    if (e->timer <= 0) {
+                        float bdx = p->x - e->x, bdy = p->y - e->y;
+                        float bm = sqrtf(bdx * bdx + bdy * bdy);
+                        if (bm > 1.0f) {
+                            g->ebeam_x = e->x;
+                            g->ebeam_y = e->y;
+                            g->ebeam_dx = bdx / bm;
+                            g->ebeam_dy = bdy / bm;
+                            ebeam_clip_endpoint(g);
+                            g->ebeam_state = 1;   /* telegraph */
+                            g->ebeam_timer = 30;
+                            audio_play(SFX_BOSS);
+                        }
+                        e->timer = 130;
+                    }
+                } else if (g->ebeam_state == 1) {
+                    g->ebeam_timer--;
+                    if (g->ebeam_timer <= 0) {
+                        g->ebeam_state = 2;       /* fire */
+                        g->ebeam_timer = 10;
+                        trigger_shake(g, 5.0f, 12);
+                    }
+                } else {
+                    /* Firing: damage the player on line overlap each frame */
+                    g->ebeam_timer--;
+                    if (p->iframes == 0) {
+                        float bsx = g->ebeam_ex - g->ebeam_x;
+                        float bsy = g->ebeam_ey - g->ebeam_y;
+                        float bsl = bsx * bsx + bsy * bsy;
+                        if (bsl > 1.0f) {
+                            float bt = ((p->x - g->ebeam_x) * bsx +
+                                        (p->y - g->ebeam_y) * bsy) / bsl;
+                            if (bt < 0.0f) bt = 0.0f;
+                            if (bt > 1.0f) bt = 1.0f;
+                            float qx = g->ebeam_x + bsx * bt;
+                            float qy = g->ebeam_y + bsy * bt;
+                            float qdx = p->x - qx, qdy = p->y - qy;
+                            float rr = PLAYER_SIZE + 6.0f;
+                            if (qdx * qdx + qdy * qdy < rr * rr) {
+                                p->hp -= player_absorb_dmg(p, 2);
+                                p->iframes = PLAYER_IFRAMES;
+                                g->hitstop = 3;
+                                audio_play(SFX_HURT_GRUNT);
+                                trigger_shake(g, 5.0f, 18);
+                                if (player_check_death(p)) {
+                                    audio_play(SFX_PLAYER_DEATH);
+                                    g->state = STATE_GAMEOVER;
+                                }
+                            }
+                        }
+                    }
+                    if (g->ebeam_timer <= 0) g->ebeam_state = 0;
+                }
+            } else {
+                /* Giant stomps (Mom's foot logic scaled up) */
+                if (g->ebeam_state) g->ebeam_state = 0;  /* drop stale beam */
+                if (e->attack_pattern == 0) {
+                    if (e->timer <= 0) {
+                        e->attack_pattern = 1;
+                        e->timer = 40;
+                        e->target_x = p->x;
+                        e->target_y = p->y;
+                        e->jump_vz = -5.5f;
+                        e->jump_z = 0;
+                        e->dx = (e->target_x - e->x) / 40.0f;
+                        e->dy = (e->target_y - e->y) / 40.0f;
+                    }
+                } else if (e->attack_pattern == 1) {
+                    e->x += e->dx;
+                    e->y += e->dy;
+                    e->jump_z += e->jump_vz;
+                    e->jump_vz += 0.28f;
+                    if (e->timer <= 0 || e->jump_z >= 0) {
+                        e->jump_z = 0;
+                        e->jump_vz = 0;
+                        e->attack_pattern = 2;
+                        e->timer = 18;
+                        trigger_shake(g, 8.0f, 28);
+                        boss_spread_8way(g, e->x, e->y, BOSS_SHOT_SPEED * 1.1f);
+                        boss_spread_4way(g, e->x, e->y, BOSS_SHOT_SPEED * 0.7f);
+                        spawn_blood_splatter(g, e->x, e->y, 0, 0, 0);
+                    }
+                } else {
+                    e->dx *= 0.85f;
+                    e->dy *= 0.85f;
+                    if (e->timer <= 0) {
+                        e->attack_pattern = 0;
+                        e->timer = randi(45, 80);
+                        e->dx = 0;
+                        e->dy = 0;
+                    }
+                }
+            }
+            break;
+        }
+
+        case ENEMY_BOSS_GISH: {
+            /* Gish: Monstro-style jump + shoot, but leaves damaging creep
+             * where it lands. Same 3-phase loop as Monstro. */
+            e->timer--;
+
+            if (e->phase == 0) {
+                /* Idle - hop toward player slowly, occasional shotgun */
+                if (!suppressAI) {
+                    float mdx = p->x - e->x;
+                    float mdy = p->y - e->y;
+                    float mm = sqrtf(mdx * mdx + mdy * mdy);
+                    if (mm > 1.0f) {
+                        float hop = fabsf(sinf(e->anim_timer * 0.08f)) * 1.2f;
+                        float mspd = (0.4f + hop * 0.2f) * fi->boss_speed_scale;
+                        e->x += (mdx / mm) * mspd;
+                        e->y += (mdy / mm) * mspd;
+                    }
+                }
+
+                e->shoot_timer--;
+                if (e->shoot_timer <= 0) {
+                    e->shoot_timer = randi(90, 140);
+                    monstro_shotgun(g, e->x, e->y);
+                    trigger_shake(g, 2.0f, 8);
+                }
+
+                if (e->timer <= 0) {
+                    e->attack_pattern = (e->attack_pattern + 1) % 3;
+                    if (e->attack_pattern == 2) {
+                        /* Big jump to player position */
+                        e->phase = 1;
+                        e->timer = 45;
+                        e->target_x = p->x;
+                        e->target_y = p->y;
+                        e->jump_vz = -4.0f;
+                        e->jump_z = 0;
+                        e->dx = (e->target_x - e->x) / 45.0f;
+                        e->dy = (e->target_y - e->y) / 45.0f;
+                    } else {
+                        /* Small hop attack */
+                        e->phase = 1;
+                        e->timer = 30;
+                        float jdx = p->x - e->x;
+                        float jdy = p->y - e->y;
+                        float jm = sqrtf(jdx * jdx + jdy * jdy);
+                        if (jm > 1.0f) {
+                            float jspd = 2.5f * fi->boss_speed_scale;
+                            e->dx = (jdx / jm) * jspd;
+                            e->dy = (jdy / jm) * jspd;
+                        }
+                        e->target_x = e->x + e->dx * 30;
+                        e->target_y = e->y + e->dy * 30;
+                        e->jump_vz = -2.5f;
+                        e->jump_z = 0;
+                    }
+                }
+            } else if (e->phase == 1) {
+                /* Airborne */
+                e->x += e->dx;
+                e->y += e->dy;
+                e->jump_z += e->jump_vz;
+                e->jump_vz += 0.2f;
+
+                if (e->timer <= 0 || e->jump_z >= 0) {
+                    /* Landing! Tar creep + tear spread */
+                    e->jump_z = 0;
+                    e->jump_vz = 0;
+                    e->phase = 2;
+                    e->timer = 15;
+                    trigger_shake(g, 5.0f, 20);
+                    monstro_tear_spread(g, e->x, e->y);
+                    spawn_blood_splatter(g, e->x, e->y, 0, 0, 0);
+                    /* Gish signature: leave a pool of green creep on landing */
+                    if (!suppressAI) {
+                        spawn_creep(g, e->x, e->y, 1, 240);
+                        spawn_creep(g, e->x + 16, e->y, 1, 220);
+                        spawn_creep(g, e->x - 16, e->y, 1, 220);
+                    }
+                }
+            } else {
+                /* Landing recovery */
+                e->dx *= 0.85f;
+                e->dy *= 0.85f;
+                if (e->timer <= 0) {
+                    e->phase = 0;
+                    e->timer = randi(50, 100);
+                    e->dx = 0;
+                    e->dy = 0;
+                }
+            }
+            break;
+        }
+
+        case ENEMY_BOSS_LOKI: {
+            /* Loki: stationary cross-shaped boss that blinks to a new spot and
+             * fires a 4-way spread, then an 8-way spread on the next volley. */
+            e->timer--;
+
+            /* Blink: teleport to a fresh position on a timer. */
+            if (e->timer <= 0) {
+                if (!suppressAI) {
+                    /* Pick a new spot away from the player and from edges */
+                    float nx, ny;
+                    int safety = 0;
+                    do {
+                        nx = randf(ROOM_LEFT + 60, ROOM_RIGHT - 60);
+                        ny = randf(ROOM_TOP + 60, ROOM_BOTTOM - 60);
+                        safety++;
+                    } while (fabsf(nx - p->x) < 60 && fabsf(ny - p->y) < 60 && safety < 20);
+                    e->x = nx;
+                    e->y = ny;
+                    trigger_shake(g, 3.0f, 10);
+                    spawn_tear_pop(g, e->x, e->y, 0);
+                }
+                e->timer = randi(90, 150);
+            }
+
+            /* Fire alternating spreads on the shoot timer. */
+            e->shoot_timer--;
+            if (e->shoot_timer <= 0) {
+                if (!suppressAI) {
+                    if (e->attack_pattern == 0) {
+                        boss_spread_4way(g, e->x, e->y, BOSS_SHOT_SPEED * 0.9f);
+                    } else {
+                        boss_spread_8way(g, e->x, e->y, BOSS_SHOT_SPEED * 0.8f);
+                    }
+                    e->attack_pattern ^= 1;  /* toggle 4-way / 8-way */
+                }
+                e->shoot_timer = randi(45, 70);
+            }
+            break;
+        }
+
+        case ENEMY_BOSS_STEVEN: {
+            /* Steven: twin-head Gemini-lite. Main head chases the player;
+             * the second head wobbles on a short tether and, once Steven
+             * drops below half HP, starts making short aggressive lunges
+             * (like Gemini's companion, but never fully detaches). */
+            float speed_main = 1.0f * fi->boss_speed_scale;
+
+            if (!e->gemini_split && e->hp < e->max_hp / 2) {
+                e->gemini_split = 1;  /* second head becomes aggressive */
+                trigger_shake(g, 3.0f, 12);
+            }
+
+            float gdx = p->x - e->x;
+            float gdy = p->y - e->y;
+            float gm = sqrtf(gdx * gdx + gdy * gdy);
+            if (gm > 1.0f && !suppressAI) {
+                e->x += (gdx / gm) * speed_main;
+                e->y += (gdy / gm) * speed_main;
+            }
+
+            if (!e->gemini_split) {
+                /* Second head trails on a short tether, gentle wobble */
+                float tdx = e->x - e->gemini_cx;
+                float tdy = e->y - e->gemini_cy;
+                float td = sqrtf(tdx * tdx + tdy * tdy);
+                if (td > GEMINI_TETHER_DIST * 0.6f) {
+                    e->gemini_cx = e->x - (tdx / td) * (GEMINI_TETHER_DIST * 0.6f);
+                    e->gemini_cy = e->y - (tdy / td) * (GEMINI_TETHER_DIST * 0.6f);
+                }
+                if (td > 8.0f) {
+                    e->gemini_cx += (tdx / td) * 0.7f;
+                    e->gemini_cy += (tdy / td) * 0.7f;
+                }
+                e->gemini_cx += sinf(g->frame * 0.08f) * 0.5f;
+                e->gemini_cy += cosf(g->frame * 0.1f) * 0.5f;
+            } else {
+                /* Aggressive: short lunges toward the player */
+                e->timer--;
+                if (e->state == 0) {
+                    e->gemini_cdx *= 0.9f;
+                    e->gemini_cdy *= 0.9f;
+                    e->gemini_cx += e->gemini_cdx;
+                    e->gemini_cy += e->gemini_cdy;
+                    if (e->timer <= 0) {
+                        e->state = 1;
+                        e->timer = 20;
+                        float cdx = p->x - e->gemini_cx;
+                        float cdy = p->y - e->gemini_cy;
+                        float cm = sqrtf(cdx * cdx + cdy * cdy);
+                        if (cm > 1.0f) {
+                            float cchg = 3.0f * fi->boss_speed_scale;
+                            e->gemini_cdx = (cdx / cm) * cchg;
+                            e->gemini_cdy = (cdy / cm) * cchg;
+                        }
+                    }
+                } else {
+                    e->gemini_cx += e->gemini_cdx;
+                    e->gemini_cy += e->gemini_cdy;
+                    if (e->timer <= 0) {
+                        e->state = 0;
+                        e->timer = randi(25, 55);
+                    }
+                }
+                e->gemini_cx = clampf(e->gemini_cx, ROOM_LEFT + ENEMY_SIZE,
+                                      ROOM_RIGHT - ENEMY_SIZE);
+                e->gemini_cy = clampf(e->gemini_cy, ROOM_TOP + ENEMY_SIZE,
+                                      ROOM_BOTTOM - ENEMY_SIZE);
+            }
+
+            /* Second head collision with player */
+            if (p->iframes == 0) {
+                float cdx = p->x - e->gemini_cx;
+                float cdy = p->y - e->gemini_cy;
+                float cdsq = cdx * cdx + cdy * cdy;
+                float crad = PLAYER_SIZE + ENEMY_SIZE;
+                if (cdsq < crad * crad) {
+                    p->hp -= player_absorb_dmg(p, 2);
+                    p->iframes = PLAYER_IFRAMES;
+                    g->hitstop = 3;
+                    float cm = sqrtf(cdsq);
+                    if (cm > 0.1f) {
+                        p->vx = (cdx / cm) * PLAYER_KB_FORCE;
+                        p->vy = (cdy / cm) * PLAYER_KB_FORCE;
+                    }
+                    audio_play(SFX_HURT_GRUNT);
+                    trigger_shake(g, 3.0f, 10);
+                    if (player_check_death(p)) {
+                        audio_play(SFX_PLAYER_DEATH);
+                        g->state = STATE_GAMEOVER;
+                    }
+                }
+            }
+            break;
+        }
+
+        case ENEMY_BOSS_CHUB: {
+            /* Chub: segmented like Larry Jr, but fatter and slower/tankier.
+             * Reuses the same segment-follow logic with reduced speed. */
+            float hpRatio = (float)e->hp / (float)e->max_hp;
+            e->seg_speed = 1.3f + (1.0f - hpRatio) * 1.2f; /* speeds up when hurt, less than Larry */
+
+            e->timer--;
+            if (e->timer <= 0) {
+                e->timer = randi(25, 70);
+                float ldx = p->x - e->x;
+                float ldy = p->y - e->y;
+                float lm = sqrtf(ldx * ldx + ldy * ldy);
+                if (lm > 1.0f) {
+                    float turn = 0.5f + hpRatio * 0.3f;
+                    e->dx = e->dx * (1.0f - turn) + (ldx / lm) * e->seg_speed * turn;
+                    e->dy = e->dy * (1.0f - turn) + (ldy / lm) * e->seg_speed * turn;
+                }
+                float weave = sinf(g->frame * 0.05f) * 0.6f;
+                float perp_x = -e->dy, perp_y = e->dx;
+                float pm = sqrtf(perp_x * perp_x + perp_y * perp_y);
+                if (pm > 0.1f) {
+                    e->dx += (perp_x / pm) * weave;
+                    e->dy += (perp_y / pm) * weave;
+                }
+            }
+
+            {
+                float sm = sqrtf(e->dx * e->dx + e->dy * e->dy);
+                if (sm > 0.1f) {
+                    e->dx = (e->dx / sm) * e->seg_speed;
+                    e->dy = (e->dy / sm) * e->seg_speed;
+                }
+            }
+
+            if (!suppressAI) {
+                e->x += e->dx;
+                e->y += e->dy;
+            }
+
+            if (e->x <= ROOM_LEFT + ENEMY_SIZE * 2) { e->dx = fabsf(e->dx); e->x = ROOM_LEFT + ENEMY_SIZE * 2; }
+            if (e->x >= ROOM_RIGHT - ENEMY_SIZE * 2) { e->dx = -fabsf(e->dx); e->x = ROOM_RIGHT - ENEMY_SIZE * 2; }
+            if (e->y <= ROOM_TOP + ENEMY_SIZE * 2) { e->dy = fabsf(e->dy); e->y = ROOM_TOP + ENEMY_SIZE * 2; }
+            if (e->y >= ROOM_BOTTOM - ENEMY_SIZE * 2) { e->dy = -fabsf(e->dy); e->y = ROOM_BOTTOM - ENEMY_SIZE * 2; }
+
+            for (int s = 0; s < e->seg_count; s++) {
+                LarrySegment *seg = &e->segments[s];
+                seg->prev_x = seg->x;
+                seg->prev_y = seg->y;
+                float ahead_x = (s == 0) ? e->x : e->segments[s - 1].x;
+                float ahead_y = (s == 0) ? e->y : e->segments[s - 1].y;
+                float sdx = ahead_x - seg->x;
+                float sdy = ahead_y - seg->y;
+                float sd = sqrtf(sdx * sdx + sdy * sdy);
+                if (sd > 0.1f) {
+                    seg->x = ahead_x - (sdx / sd) * LARRY_SEG_DIST;
+                    seg->y = ahead_y - (sdy / sd) * LARRY_SEG_DIST;
+                }
+            }
+
+            if (p->iframes == 0) {
+                for (int s = 0; s < e->seg_count; s++) {
+                    LarrySegment *seg = &e->segments[s];
+                    float sdx = p->x - seg->x;
+                    float sdy = p->y - seg->y;
+                    float sr = PLAYER_SIZE + ENEMY_SIZE; /* fatter body, slightly bigger hitbox than Larry */
+                    if (sdx * sdx + sdy * sdy < sr * sr) {
+                        p->hp -= player_absorb_dmg(p, 2);
+                        p->iframes = PLAYER_IFRAMES;
+                        g->hitstop = 3;
+                        float sm = sqrtf(sdx * sdx + sdy * sdy);
+                        if (sm > 0.1f) {
+                            p->vx = (sdx / sm) * PLAYER_KB_FORCE;
+                            p->vy = (sdy / sm) * PLAYER_KB_FORCE;
+                        }
+                        audio_play(SFX_HURT_GRUNT);
+                        trigger_shake(g, 3.0f, 10);
+                        if (player_check_death(p)) {
+                            audio_play(SFX_PLAYER_DEATH);
+                            g->state = STATE_GAMEOVER;
+                        }
+                        break;
+                    }
+                }
+            }
+            break;
+        }
+
+        case ENEMY_BOSS_FISTULA: {
+            /* Fistula: slow drifting boss with no ranged attack. Its threat
+             * is the split-on-hit mechanic (handled in the damage paths),
+             * flooding the room with small balls as it's whittled down. */
+            e->timer--;
+            if (e->timer <= 0) {
+                e->timer = randi(40, 80);
+                float fdx = p->x - e->x;
+                float fdy = p->y - e->y;
+                float fm = sqrtf(fdx * fdx + fdy * fdy);
+                float spd = 0.6f * fi->boss_speed_scale;
+                if (fm > 1.0f) {
+                    e->dx = (fdx / fm) * spd + randf(-0.3f, 0.3f);
+                    e->dy = (fdy / fm) * spd + randf(-0.3f, 0.3f);
+                }
+            }
+            if (!suppressAI) {
+                e->x += e->dx;
+                e->y += e->dy;
+            }
+            if (e->x <= ROOM_LEFT + ENEMY_SIZE * 2) { e->dx = fabsf(e->dx); }
+            if (e->x >= ROOM_RIGHT - ENEMY_SIZE * 2) { e->dx = -fabsf(e->dx); }
+            if (e->y <= ROOM_TOP + ENEMY_SIZE * 2) { e->dy = fabsf(e->dy); }
+            if (e->y >= ROOM_BOTTOM - ENEMY_SIZE * 2) { e->dy = -fabsf(e->dy); }
+            break;
+        }
+
+        case ENEMY_BOSS_SCOLEX: {
+            /* Scolex: segmented worm (Chub-style body) that alternates
+             * between burrowed (phase 1: fast, safe repositioning toward
+             * the player) and emerged (phase 0: slower, vulnerable, body
+             * segments collide with the player like Larry/Chub). */
+            e->timer--;
+
+            if (e->phase == 1) {
+                /* Burrowed: fast tunnel toward player */
+                float bdx = p->x - e->x;
+                float bdy = p->y - e->y;
+                float bm = sqrtf(bdx * bdx + bdy * bdy);
+                if (bm > 1.0f) {
+                    float spd = 2.2f * fi->boss_speed_scale;
+                    e->dx = (bdx / bm) * spd;
+                    e->dy = (bdy / bm) * spd;
+                }
+                if (!suppressAI) {
+                    e->x += e->dx;
+                    e->y += e->dy;
+                }
+                if (e->timer <= 0) {
+                    /* Emerge */
+                    e->phase = 0;
+                    e->hidden = 0;
+                    e->timer = 100;      /* time vulnerable/emerged */
+                    trigger_shake(g, 3.0f, 10);
+                }
+            } else {
+                /* Emerged: slower segmented chase, vulnerable body collision */
+                float hpRatio = (float)e->hp / (float)e->max_hp;
+                e->seg_speed = 1.4f + (1.0f - hpRatio) * 1.0f; /* speeds up when hurt */
+                float ldx = p->x - e->x;
+                float ldy = p->y - e->y;
+                float lm = sqrtf(ldx * ldx + ldy * ldy);
+                if (lm > 1.0f) {
+                    e->dx = (ldx / lm) * e->seg_speed;
+                    e->dy = (ldy / lm) * e->seg_speed;
+                }
+                if (!suppressAI) {
+                    e->x += e->dx;
+                    e->y += e->dy;
+                }
+                if (e->timer <= 0) {
+                    /* Burrow again */
+                    e->phase = 1;
+                    e->hidden = 1;
+                    e->timer = randi(70, 110);
+                }
+            }
+
+            if (e->x <= ROOM_LEFT + ENEMY_SIZE * 2) { e->dx = fabsf(e->dx); e->x = ROOM_LEFT + ENEMY_SIZE * 2; }
+            if (e->x >= ROOM_RIGHT - ENEMY_SIZE * 2) { e->dx = -fabsf(e->dx); e->x = ROOM_RIGHT - ENEMY_SIZE * 2; }
+            if (e->y <= ROOM_TOP + ENEMY_SIZE * 2) { e->dy = fabsf(e->dy); e->y = ROOM_TOP + ENEMY_SIZE * 2; }
+            if (e->y >= ROOM_BOTTOM - ENEMY_SIZE * 2) { e->dy = -fabsf(e->dy); e->y = ROOM_BOTTOM - ENEMY_SIZE * 2; }
+
+            /* Update body segments - follow the head like Larry/Chub */
+            for (int s = 0; s < e->seg_count; s++) {
+                LarrySegment *seg = &e->segments[s];
+                seg->prev_x = seg->x;
+                seg->prev_y = seg->y;
+                float ahead_x = (s == 0) ? e->x : e->segments[s - 1].x;
+                float ahead_y = (s == 0) ? e->y : e->segments[s - 1].y;
+                float sdx = ahead_x - seg->x;
+                float sdy = ahead_y - seg->y;
+                float sd = sqrtf(sdx * sdx + sdy * sdy);
+                if (sd > 0.1f) {
+                    seg->x = ahead_x - (sdx / sd) * LARRY_SEG_DIST;
+                    seg->y = ahead_y - (sdy / sd) * LARRY_SEG_DIST;
+                }
+            }
+
+            /* Segment collision with player -- only while emerged (phase 0);
+             * burrowed segments trail underground and shouldn't hurt the
+             * player, matching Pin's burrowed-is-safe feel. */
+            if (e->phase == 0 && p->iframes == 0) {
+                for (int s = 0; s < e->seg_count; s++) {
+                    LarrySegment *seg = &e->segments[s];
+                    float sdx = p->x - seg->x;
+                    float sdy = p->y - seg->y;
+                    float sr = PLAYER_SIZE + ENEMY_SIZE * 0.8f;
+                    if (sdx * sdx + sdy * sdy < sr * sr) {
+                        p->hp -= player_absorb_dmg(p, 2);
+                        p->iframes = PLAYER_IFRAMES;
+                        g->hitstop = 3;
+                        float sm = sqrtf(sdx * sdx + sdy * sdy);
+                        if (sm > 0.1f) {
+                            p->vx = (sdx / sm) * PLAYER_KB_FORCE;
+                            p->vy = (sdy / sm) * PLAYER_KB_FORCE;
+                        }
+                        audio_play(SFX_HURT_GRUNT);
+                        trigger_shake(g, 3.0f, 10);
+                        if (player_check_death(p)) {
+                            audio_play(SFX_PLAYER_DEATH);
+                            g->state = STATE_GAMEOVER;
+                        }
+                        break;
+                    }
+                }
+            }
+            break;
+        }
+
         /* ============================
          * Phase 2 Minor enemies (boss minions)
          * ============================ */
@@ -4285,8 +7289,12 @@ void enemies_update(Game *g) {
             }
             e->shoot_timer--;
             if (e->shoot_timer <= 0) {
-                float spd = BOSS_SHOT_SPEED * 0.8f;
-                boss_shoot_tear(g, e->x, e->y, (fdx / fm) * spd, (fdy / fm) * spd);
+                /* Only fire with a valid aim vector; fm can be 0 when the eye
+                   sits exactly on the player (else fdx/fm -> NaN shot). */
+                if (fm > 0.5f) {
+                    float spd = BOSS_SHOT_SPEED * 0.8f;
+                    boss_shoot_tear(g, e->x, e->y, (fdx / fm) * spd, (fdy / fm) * spd);
+                }
                 e->shoot_timer = randi(80, 130);
             }
             break;
@@ -4313,6 +7321,20 @@ void enemies_update(Game *g) {
             break;
         }
 
+        case ENEMY_FISTULA_BALL: {
+            /* Fistula's split-off balls: simple bouncing drifter, no attack
+               beyond contact damage (handled in the shared player collision). */
+            if (!suppressAI) {
+                e->x += e->dx;
+                e->y += e->dy;
+            }
+            if (e->x <= ROOM_LEFT + ENEMY_SIZE) { e->dx = fabsf(e->dx); }
+            if (e->x >= ROOM_RIGHT - ENEMY_SIZE) { e->dx = -fabsf(e->dx); }
+            if (e->y <= ROOM_TOP + ENEMY_SIZE) { e->dy = fabsf(e->dy); }
+            if (e->y >= ROOM_BOTTOM - ENEMY_SIZE) { e->dy = -fabsf(e->dy); }
+            break;
+        }
+
         } /* end switch */
 
         /* Keep in bounds */
@@ -4328,7 +7350,16 @@ void enemies_update(Game *g) {
         case ENEMY_BOSS_PIN:
         case ENEMY_BOSS_HAUNT:
         case ENEMY_BOSS_WIDOW:
+        case ENEMY_BOSS_GISH:
+        case ENEMY_BOSS_LOKI:
+        case ENEMY_BOSS_STEVEN:
+        case ENEMY_BOSS_CHUB:
+        case ENEMY_BOSS_FISTULA:
+        case ENEMY_BOSS_SCOLEX:
         case ENEMY_BOSS_MEGA_SATAN:
+        case ENEMY_BOSS_MOM:
+        case ENEMY_BOSS_MOMS_HEART:
+        case ENEMY_BOSS_SATAN:
             sz = ENEMY_SIZE * 2;
             break;
         default: break;
@@ -4342,11 +7373,11 @@ void enemies_update(Game *g) {
     for (int i = 0; i < r->enemy_count; i++) {
         Enemy *a = &r->enemies[i];
         if (!a->active) continue;
-        int aBoss = (a->type >= ENEMY_BOSS_DUKE && a->type <= ENEMY_BOSS_MEGA_SATAN);
+        int aBoss = (a->type >= ENEMY_BOSS_DUKE && a->type <= ENEMY_BOSS_SATAN);
         for (int j = i + 1; j < r->enemy_count; j++) {
             Enemy *b = &r->enemies[j];
             if (!b->active) continue;
-            int bBoss = (b->type >= ENEMY_BOSS_DUKE && b->type <= ENEMY_BOSS_MEGA_SATAN);
+            int bBoss = (b->type >= ENEMY_BOSS_DUKE && b->type <= ENEMY_BOSS_SATAN);
             float dx = b->x - a->x;
             float dy = b->y - a->y;
             float minD = ENEMY_SIZE * 1.6f;
@@ -4375,7 +7406,9 @@ static int circle_overlap(float x1, float y1, float r1,
 }
 
 static int is_boss_type(EnemyType t) {
-    return t >= ENEMY_BOSS_DUKE && t <= ENEMY_BOSS_MEGA_SATAN;
+    /* Boss block runs Duke..Satan (Mom/Mom's Heart/Satan sit after Mega
+       Satan in the enum, still before the minion types). */
+    return t >= ENEMY_BOSS_DUKE && t <= ENEMY_BOSS_SATAN;
 }
 
 void collisions_update(Game *g) {
@@ -4394,13 +7427,23 @@ void collisions_update(Game *g) {
             if (!t->active) continue;
 
             if (circle_overlap(t->x, t->y, TEAR_RADIUS, e->x, e->y, esz)) {
-                /* Host is invulnerable when hidden */
-                if (e->type == ENEMY_HOST && e->hidden) {
+                /* Hidden enemies (Host in shell, Round Worm / Pin / Scolex
+                   burrowed) are invulnerable to tears */
+                if (e->hidden) {
                     if (!t->piercing) t->active = 0;
                     continue;
                 }
-                int dmg = (int)t->dmg;
-                if (dmg < 1) dmg = 1;
+                /* D5 Ipecac: explosive tears detonate on the target instead
+                   of dealing normal contact damage (the blast covers it) */
+                if (t->explosive) {
+                    t->active = 0;
+                    tear_detonate(g, t);
+                    continue;
+                }
+                /* Float damage: fractional damage bonuses count for real.
+                   Tiny floor so a cursed near-zero build still chips. */
+                float dmg = t->dmg;
+                if (dmg < 0.1f) dmg = 0.1f;
                 e->hp -= dmg;
                 /* Snappier hit-flash (was 6) — about 14 frames feels more
                    responsive and reads clearly in motion. */
@@ -4409,109 +7452,66 @@ void collisions_update(Game *g) {
 
                 /* Spawn blood splatter at impact point */
                 spawn_blood_splatter(g, t->x, t->y, t->dx, t->dy, 1);
+                /* Game-feel: also play the blue tear splash on impact */
+                spawn_tear_pop(g, t->x, t->y, 0);
 
                 /* Apply knockback in direction of tear velocity */
                 float tv = sqrtf(t->dx * t->dx + t->dy * t->dy);
                 if (tv > 0.1f) {
                     float kbScale = is_boss_type(e->type) ? 0.25f : 1.0f;
-                    e->kb_dx += (t->dx / tv) * TEAR_KNOCKBACK * kbScale;
-                    e->kb_dy += (t->dy / tv) * TEAR_KNOCKBACK * kbScale;
+                    /* Knockback scales with tear damage: heavy hits shove */
+                    float kbMag = TEAR_KNOCKBACK * (0.5f + t->dmg * 0.4f);
+                    e->kb_dx += (t->dx / tv) * kbMag * kbScale;
+                    e->kb_dy += (t->dy / tv) * kbMag * kbScale;
                 }
 
                 if (!t->piercing) {
                     t->active = 0;
                 }
 
-                if (e->hp <= 0) {
-                    /* Globin: collapse into pile instead of dying (first time) */
-                    if (e->type == ENEMY_GLOBIN && e->state == 0 && !e->split_done) {
-                        e->state = 1;          /* collapsed pile */
-                        e->hp = 1;
-                        e->regen_timer = 120;   /* ticks until full regen */
-                        e->split_done = 1;      /* only collapse once */
-                        goto skip_death;
-                    }
-
-                    /* Gaper split on death */
-                    if (e->type == ENEMY_GAPER && !e->split_done) {
-                        spawn_gaper_split(r, e->x, e->y);
-                        spawn_gaper_split(r, e->x, e->y);
-                    }
-
-                    /* Boom Fly: explode on death */
-                    if (e->type == ENEMY_BOOM_FLY) {
-                        boom_fly_explode(g, e->x, e->y);
-                    }
-
-                    /* Mulligan: spawn 2-3 flies on death */
-                    if (e->type == ENEMY_MULLIGAN) {
-                        const FloorInfo *fi = get_floor_info(g->current_floor);
-                        int nflies = randi(2, 3);
-                        for (int f = 0; f < nflies; f++) {
-                            spawn_fly_from_death(r, e->x, e->y, fi);
-                        }
-                    }
-                    
-                    /* Drops (difficulty-scaled) */
-                    enemy_death_drops(g, r, e);
-
-                    /* Champion bonus reward + black champion split */
-                    if (e->champion != CHAMP_NONE) {
-                        enemy_drop_champion_reward(g, e);
-                        if (e->champion == CHAMP_BLACK && e->split_pending) {
-                            /* Spawn 2 weaker copies of base enemy at same location */
-                            for (int ci = 0; ci < 2; ci++) {
-                                for (int ei = 0; ei < MAX_ENEMIES; ei++) {
-                                    if (!r->enemies[ei].active) {
-                                        Enemy *ne = &r->enemies[ei];
-                                        memset(ne, 0, sizeof(Enemy));
-                                        ne->type = e->type;
-                                        ne->x = e->x + randf(-12.0f, 12.0f);
-                                        ne->y = e->y + randf(-12.0f, 12.0f);
-                                        ne->hp = ne->max_hp = 3;
-                                        ne->active = 1;
-                                        ne->champion = CHAMP_NONE;
-                                        ne->dx = randf(-1.0f, 1.0f);
-                                        ne->dy = randf(-1.0f, 1.0f);
-                                        r->enemy_count++;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    e->active = 0;
-                    g->score += is_boss_type(e->type) ? 100 : 10;
-                    g->kills++;
-                    audio_play(SFX_ENEMY_DEATH);
-                    if (is_boss_type(e->type)) {
-                        trigger_shake(g, 7.0f, 40);
-                        g->boss_active = 0;
-                        g->boss_death_anim = 60; /* boss death explosion effect */
-                        /* Track in persistent unlocks (bosses_defeated bitmask) */
-                        {
-                            int boss_idx = (int)e->type - (int)ENEMY_BOSS_DUKE;
-                            if (boss_idx >= 0 && boss_idx < 16) {
-                                g_config.bosses_defeated |= (1 << boss_idx);
-                                config_save(&g_config);
-                            }
-                        }
-                        /* Return to floor music after boss defeat */
-                        music_play(music_for_floor(g->current_floor));
-                    } else {
-                        trigger_shake(g, 1.5f, 6);
+                /* Fistula: splits into a couple of smaller balls every time it
+                   crosses a quarter-HP threshold, as long as it survives the hit. */
+                if (e->type == ENEMY_BOSS_FISTULA && e->hp > 0) {
+                    float quarter = e->max_hp * 0.25f;
+                    if (quarter < 1.0f) quarter = 1.0f;
+                    int thresholds_crossed = (int)((e->hp + dmg) / quarter)
+                                           - (int)(e->hp / quarter);
+                    if (thresholds_crossed > 0) {
+                        float ball_hp = e->max_hp / 6.0f;
+                        if (ball_hp < 1.0f) ball_hp = 1.0f;
+                        spawn_fistula_ball(r, e->x, e->y, ball_hp);
+                        spawn_fistula_ball(r, e->x, e->y, ball_hp);
                     }
                 }
-                skip_death: ; /* Globin collapse jumps here */
+
+                /* Shared death path (drops, champion splits, boss tracking) */
+                if (e->hp <= 0) {
+                    kill_enemy(g, r, e);
+                    /* F2: enemy died — stop testing the remaining tears of
+                       this frame's volley against the corpse (a TRIPLE shot
+                       at point-blank must not re-run the death path). */
+                    if (!e->active) break;
+                }
             }
         }
 
-        /* Player vs Enemy */
-        if (e->active && p->iframes == 0) {
+        /* Player vs Enemy (hidden/burrowed enemies deal no contact damage;
+           freshly death-spawned enemies get a short grace so they can't hit
+           the player on the very frame they appear at the corpse position).
+           Bosses hit for a full heart everywhere; normal enemies hit for a
+           full heart from Sheol on (floor >= 6); big bruisers (Fatty /
+           Leaper / Vis) already hit full on the Womb (floor 5). */
+        if (e->active && p->iframes == 0 && !e->hidden && e->spawn_grace == 0) {
             if (circle_overlap(p->x, p->y, PLAYER_SIZE, e->x, e->y, esz)) {
-                p->hp -= player_absorb_dmg(p, 1);
+                int big_bruiser = (e->type == ENEMY_FATTY ||
+                                   e->type == ENEMY_LEAPER ||
+                                   e->type == ENEMY_VIS);
+                int cdmg = (is_boss_type(e->type) ||
+                            g->current_floor >= 6 ||
+                            (big_bruiser && g->current_floor >= 5)) ? 2 : 1;
+                p->hp -= player_absorb_dmg(p, cdmg);
                 p->iframes = PLAYER_IFRAMES;
+                g->hitstop = 3;
                 /* Knockback: push player away from enemy with stun frames */
                 float kdx = p->x - e->x;
                 float kdy = p->y - e->y;
@@ -4524,7 +7524,6 @@ void collisions_update(Game *g) {
                     p->vx = randf(-1.0f, 1.0f) * PLAYER_KB_FORCE;
                     p->vy = randf(-1.0f, 1.0f) * PLAYER_KB_FORCE;
                 }
-                p->kb_timer = PLAYER_KB_FRAMES;
                 audio_play(SFX_HURT_GRUNT);  /* New hurt grunt sound */
                 trigger_shake(g, 5.0f, 18);
                 if (player_check_death(p)) {
@@ -4535,8 +7534,81 @@ void collisions_update(Game *g) {
         }
     }
 
-    /* Check room cleared */
-    if (g->state == STATE_PLAYING && !r->cleared) {
+    /* Spikes: damage the player on contact (1 full heart, like Rebirth) */
+    if (p->iframes == 0 && g->state == STATE_PLAYING) {
+        for (int i = 0; i < r->obstacle_count; i++) {
+            Obstacle *o = &r->obstacles[i];
+            if (!o->active || o->type != OBST_SPIKES) continue;
+            if (circle_overlap(p->x, p->y, PLAYER_SIZE * 0.6f,
+                               o->x, o->y, OBSTACLE_SIZE * 0.4f)) {
+                p->hp -= player_absorb_dmg(p, 2);
+                p->iframes = PLAYER_IFRAMES;
+                g->hitstop = 3;
+                audio_play(SFX_HURT_GRUNT);
+                trigger_shake(g, 4.0f, 14);
+                if (player_check_death(p)) {
+                    audio_play(SFX_PLAYER_DEATH);
+                    g->state = STATE_GAMEOVER;
+                }
+                /* Sacrifice room: repeated spike hits grant a reward */
+                if (r->type == ROOM_SACRIFICE && !r->sacrifice_rewarded) {
+                    r->sacrifice_hits++;
+                    if (r->sacrifice_hits >= 3) {
+                        r->sacrifice_rewarded = 1;
+                        r->pedestal.x = (ROOM_LEFT + ROOM_RIGHT) / 2.0f;
+                        r->pedestal.y = ROOM_TOP + 50;
+                        r->pedestal.item = pick_random_item(g);
+                        r->pedestal.active = (g->challenge != 6);  /* Purist */
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    /* Arcade room: slot machine obstacle -- walk in with >=1 coin to pay and
+       roll a reward (heart / consumable / small chance at a pedestal item).
+       Bounded to a single use per room visit via arcade_slot_used, mirroring
+       the shop's shop_deny_timer cooldown for the "can't afford" feedback. */
+    if (r->type == ROOM_ARCADE && g->state == STATE_PLAYING) {
+        if (g->shop_deny_timer > 0) g->shop_deny_timer--;
+        for (int i = 0; i < r->obstacle_count; i++) {
+            Obstacle *o = &r->obstacles[i];
+            if (!o->active || o->type != OBST_SLOT_MACHINE) continue;
+            if (!circle_overlap(p->x, p->y, PLAYER_SIZE * 0.6f,
+                                o->x, o->y, OBSTACLE_SIZE * 0.5f)) continue;
+            if (r->arcade_slot_used) break;
+            if (p->coins >= 1) {
+                p->coins -= 1;
+                r->arcade_slot_used = 1;
+                audio_play(SFX_PICKUP);
+                if (luck_roll(g, 10, 2)) {
+                    /* Small chance: free pedestal item */
+                    r->pedestal.x = o->x;
+                    r->pedestal.y = o->y - 40;
+                    r->pedestal.item = pick_random_item(g);
+                    r->pedestal.active = (g->challenge != 6);  /* Purist */
+                } else if (randi(0, 1) == 0) {
+                    spawn_heart(r, o->x, o->y - 40,
+                                (randi(0, 3) == 0) ? HEART_SOUL : HEART_RED_HALF);
+                } else {
+                    int roll = randi(0, 2);
+                    PickupType pt = (roll == 0) ? PICKUP_COIN :
+                                    (roll == 1) ? PICKUP_BOMB : PICKUP_KEY;
+                    spawn_consumable(r, o->x, o->y - 40, pt);
+                }
+            } else if (g->shop_deny_timer <= 0) {
+                audio_play(SFX_HURT);
+                g->shop_deny_timer = 30;
+            }
+            break;
+        }
+    }
+
+    /* Check room cleared. Boss Rush is excluded: its own wave controller
+       (in enemies_update) owns clearing it, else it self-clears on frame 1
+       before any wave spawns. The controller force-clears after the last wave. */
+    if (g->state == STATE_PLAYING && !r->cleared && r->type != ROOM_BOSSRUSH) {
         int alive = 0;
         for (int i = 0; i < r->enemy_count; i++) {
             if (r->enemies[i].active) alive++;
@@ -4545,12 +7617,155 @@ void collisions_update(Game *g) {
             r->cleared = 1;
             g->rooms_cleared++;
             audio_play(SFX_ROOM_CLEAR);
+            /* Recharge the active item by 1 on room clear */
+            if (g->player.active_item != ITEM_NONE
+                && g->player.active_charge < g->player.active_max_charge) {
+                g->player.active_charge++;
+            }
             /* Clear enemy projectiles when room is cleared */
             for (int k = 0; k < MAX_ENEMY_SHOTS; k++) g->enemy_shots[k].active = 0;
+
+            /* Door-open poof at each doorway (Rebirth juice) */
+            {
+                float dmx = (ROOM_LEFT + ROOM_RIGHT) / 2.0f;
+                float dmy = (ROOM_TOP + ROOM_BOTTOM) / 2.0f;
+                float dpos[4][2] = {
+                    {dmx, ROOM_TOP + 6}, {dmx, ROOM_BOTTOM - 6},
+                    {ROOM_LEFT + 6, dmy}, {ROOM_RIGHT - 6, dmy}
+                };
+                for (int dd3 = 0; dd3 < 4; dd3++) {
+                    if (!r->doors[dd3]) continue;
+                    spawn_tear_pop(g, dpos[dd3][0], dpos[dd3][1], 0);
+                    spawn_tear_pop(g, dpos[dd3][0], dpos[dd3][1], 0);
+                }
+            }
+
+            /* Room-clear reward: weighted outcome table for normal rooms.
+             * Higher luck and deeper floors shift weight from "nothing"
+             * toward better rewards, ending in the two chest tiers. */
+            if (r->type == ROOM_NORMAL) {
+                float ccx = (ROOM_LEFT + ROOM_RIGHT) / 2.0f + randf(-30, 30);
+                float ccy = (ROOM_TOP + ROOM_BOTTOM) / 2.0f + randf(-20, 20);
+                int floor_bonus = g->current_floor * 2;       /* deeper = better */
+                int luck_bonus  = (int)(g->player.stats.luck * 4);
+                int bonus = floor_bonus + luck_bonus;
+                if (bonus > 40) bonus = 40;                    /* keep it bounded */
+
+                /* Rebirth-parity payout: most rooms give NOTHING. ~15% base
+                 * payout, up to ~25% with deep floors + high luck; the paid
+                 * weight splits roughly like the old table
+                 * (consumable 35% / heart 25% / pill-card 15% / chest 15% /
+                 *  gold chest = remainder). */
+                int payout       = 15 + bonus / 4;             /* 15..25 */
+                int w_nothing    = 100 - payout;
+                int w_consumable = payout * 35 / 100;
+                int w_heart      = payout * 25 / 100;
+                int w_pillcard   = payout * 15 / 100;
+                int w_chest      = payout * 15 / 100;
+                /* remaining payout weight falls through to the gold chest */
+
+                int roll = randi(0, 99);
+                int t1 = w_nothing;
+                int t2 = t1 + w_consumable;
+                int t3 = t2 + w_heart;
+                int t4 = t3 + w_pillcard;
+                int t5 = t4 + w_chest;
+                /* anything >= t5 falls through to the gold chest tier */
+
+                if (roll < t1) {
+                    /* nothing */
+                } else if (roll < t2) {
+                    spawn_random_consumable(r, ccx, ccy);
+                } else if (roll < t3) {
+                    spawn_heart(r, ccx, ccy,
+                                luck_roll(g, 20, 3) ? HEART_SOUL : HEART_RED_HALF);
+                } else if (roll < t4) {
+                    if (randi(0, 1))
+                        spawn_pill_pickup(r, ccx, ccy, randi(0, PILL_EFFECT_COUNT - 1));
+                    else
+                        spawn_card_pickup(r, ccx, ccy, randi(0, TAROT_COUNT - 1));
+                } else if (roll < t5) {
+                    spawn_consumable(r, ccx, ccy, PICKUP_CHEST);
+                } else {
+                    spawn_consumable(r, ccx, ccy, PICKUP_CHEST_GOLD);
+                }
+            }
 
             if (r->type == ROOM_BOSS) {
                 /* Drop trapdoor to next floor */
                 r->has_trapdoor = 1;
+
+                /* Devil deal: 50% chance on a red-damage-free floor, but a
+                   15% base chance survives red damage (Rebirth never hard-
+                   zeroes the roll). 50/50 Devil vs Angel when it succeeds. */
+                int deal_chance = 15 + (g->floor_red_dmg ? 0 : 35);
+                if (randi(0, 99) < deal_chance) {
+                    int wantAngel = (randi(0, 99) < 50);
+                    Dungeon *dd2 = &g->dungeon;
+                    int bx2 = dd2->cur_x, by2 = dd2->cur_y;
+                    int ddx2[] = {0, 0, -1, 1}, ddy2[] = {-1, 1, 0, 0};
+                    int opp2[] = {1, 0, 3, 2};
+                    for (int di2 = 0; di2 < 4; di2++) {
+                        int nx2 = bx2 + ddx2[di2], ny2 = by2 + ddy2[di2];
+                        if (nx2 < 0 || nx2 >= DUNGEON_W ||
+                            ny2 < 0 || ny2 >= DUNGEON_H) continue;
+                        Room *dr = &dd2->rooms[ny2][nx2];
+                        if (dr->type != ROOM_NONE) continue;
+
+                        memset(dr, 0, sizeof(Room));
+                        dr->gx = nx2; dr->gy = ny2;
+                        dr->cleared = 1;
+                        dr->enemies_spawned = 1;
+
+                        if (wantAngel) {
+                            dr->type = ROOM_ANGEL;
+                            dr->doors[opp2[di2]] = 1;
+                            dr->door_type[opp2[di2]] = 6;   /* angel door */
+                            r->doors[di2] = 1;
+                            r->door_type[di2] = 6;
+
+                            /* Free item pedestal + 2 soul hearts (Purist:
+                               soul hearts only) */
+                            dr->pedestal.x = (ROOM_LEFT + ROOM_RIGHT) / 2.0f;
+                            dr->pedestal.y = (ROOM_TOP + ROOM_BOTTOM) / 2.0f;
+                            dr->pedestal.item = pick_random_item(g);
+                            dr->pedestal.active = (g->challenge != 6);
+                            spawn_heart(dr, ROOM_LEFT + 60, ROOM_TOP + 60, HEART_SOUL);
+                            spawn_heart(dr, ROOM_RIGHT - 60, ROOM_TOP + 60, HEART_SOUL);
+                        } else {
+                            dr->type = ROOM_DEVIL;
+                            dr->doors[opp2[di2]] = 1;
+                            dr->door_type[opp2[di2]] = 5;   /* devil door */
+                            r->doors[di2] = 1;
+                            r->door_type[di2] = 5;
+
+                            /* Two items priced in heart containers. E4: The
+                               Pact is devil-pool biased — the first slot has
+                               a 40% chance to stock it when not yet owned.
+                               T3 "The Purist": no item stock — the free
+                               black heart below is the whole deal. */
+                            dr->shop_count = (g->challenge == 6) ? 0 : 2;
+                            for (int si2 = 0; si2 < dr->shop_count; si2++) {
+                                ShopItem *dsi = &dr->shop_items[si2];
+                                dsi->item = (ItemType)randi(1, ITEM_COUNT - 1);
+                                if (si2 == 0 && randi(0, 99) < 40 &&
+                                    !player_has_item(&g->player, ITEM_THE_PACT)) {
+                                    dsi->item = ITEM_THE_PACT;
+                                }
+                                dsi->cost = 1 + randi(0, 1);   /* hearts, not coins */
+                                dsi->x = (ROOM_LEFT + ROOM_RIGHT) / 2.0f - 45 + si2 * 90;
+                                dsi->y = (ROOM_TOP + ROOM_BOTTOM) / 2.0f;
+                                dsi->active = 1;
+                            }
+                            /* E5: devil rooms offer a free black heart */
+                            spawn_heart(dr, (ROOM_LEFT + ROOM_RIGHT) / 2.0f,
+                                        ROOM_BOTTOM - 40, HEART_BLACK);
+                        }
+                        dd2->room_count++;
+                        audio_play(SFX_DOOR);   /* something opened... */
+                        break;
+                    }
+                }
             }
         }
     }
@@ -4596,17 +7811,48 @@ static int try_door_unlock(Game *g, Room *r, int dir) {
         audio_play(SFX_DOOR);
     }
 
-    /* Curse door - costs 1 HP to enter (cannot kill) */
+    /* Curse door - costs 1 HP to enter (cannot kill). F7: the toll goes
+       through the normal absorb chain, so black/soul hearts pay first; the
+       refusal guard only blocks when the toll would have to come out of a
+       player's last half red heart. */
     if (r->door_type[dir] == 4) {
-        if (g->player.hp <= 1) {
+        Player *p = &g->player;
+        if (p->black_hp <= 0 && p->soul_hp <= 0 && p->hp <= 1) {
             audio_play(SFX_HURT); /* Feedback: can't afford HP cost */
             return 0;
         }
-        g->player.hp -= 1;
+        p->hp -= player_absorb_dmg(p, 1);
         audio_play(SFX_HURT);
+        if (player_check_death(p)) {
+            /* Unreachable given the guard above, but keep the death path
+               consistent (Dead Cat lives) if the guard ever changes. */
+            audio_play(SFX_PLAYER_DEATH);
+            g->state = STATE_GAMEOVER;
+        }
     }
 
     return 1; /* allow transition */
+}
+
+/* A secret room entered by ANY means (bombed door, telepills, tarot warp,
+ * Curse-of-Maze redirect) must never strand the player: its doors were
+ * generated closed on both sides, so open them both ways to every adjacent
+ * real room and mark it visited (Rebirth behavior). */
+static void reveal_secret_room(Game *g, int rx, int ry) {
+    Dungeon *d = &g->dungeon;
+    Room *r = &d->rooms[ry][rx];
+    if (r->type != ROOM_SECRET) return;
+    int sdx[] = {0, 0, -1, 1};
+    int sdy[] = {-1, 1, 0, 0};
+    int opp[] = {1, 0, 3, 2};
+    r->visited = 1;
+    for (int i = 0; i < 4; i++) {
+        int ax = rx + sdx[i], ay = ry + sdy[i];
+        if (ax < 0 || ax >= DUNGEON_W || ay < 0 || ay >= DUNGEON_H) continue;
+        if (d->rooms[ay][ax].type == ROOM_NONE) continue;
+        r->doors[i] = 1;
+        d->rooms[ay][ax].doors[opp[i]] = 1;
+    }
 }
 
 void check_door_transition(Game *g) {
@@ -4634,11 +7880,10 @@ void check_door_transition(Game *g) {
     for (int d = 0; d < 4; d++) {
         if (!in_range[d]) continue;
 
-        /* Normal (unlocked) doors require room to be cleared first.
-         * Locked/special doors (treasure, curse) can always be interacted
-         * with — the lock/cost check happens inside try_door_unlock. */
-        int is_special = r->door_locked[d] || r->door_type[d] != 0;
-        if (!r->cleared && !is_special) return;
+        /* Rebirth rule: ALL doors stay shut until the room is cleared —
+         * locked/special doors included (no fleeing a fight through a
+         * treasure/curse door). */
+        if (!r->cleared) return;
 
         if (try_door_unlock(g, r, d)) do_room_transition(g, dirs[d]);
         return;
@@ -4660,11 +7905,65 @@ void do_room_transition(Game *g, Direction dir) {
     if (nx < 0 || nx >= DUNGEON_W || ny < 0 || ny >= DUNGEON_H) return;
     if (d->rooms[ny][nx].type == ROOM_NONE) return;
 
+    /* Curse of the Maze: small chance to redirect the player into a
+     * different explored room adjacent to their CURRENT position instead
+     * of the door they actually walked through. Only ever picks a room
+     * that already exists and has been visited, so this can never send
+     * the player out of bounds, into a ROOM_NONE cell, or soft-lock them
+     * (the fallback is always the originally-intended, already-validated
+     * room). */
+    if (g->active_curse == CURSE_MAZE && randi(0, 99) < 12) {
+        int mdxs[] = {0, 0, -1, 1};
+        int mdys[] = {-1, 1, 0, 0};
+        int candidates_x[4], candidates_y[4];
+        int candidate_count = 0;
+        for (int i = 0; i < 4; i++) {
+            int mx = d->cur_x + mdxs[i];
+            int my = d->cur_y + mdys[i];
+            if (mx < 0 || mx >= DUNGEON_W || my < 0 || my >= DUNGEON_H) continue;
+            if (d->rooms[my][mx].type == ROOM_NONE) continue;
+            if (!d->rooms[my][mx].visited) continue;
+            if (mx == nx && my == ny) continue; /* not the intended room */
+            candidates_x[candidate_count] = mx;
+            candidates_y[candidate_count] = my;
+            candidate_count++;
+        }
+        if (candidate_count > 0) {
+            int pick = randi(0, candidate_count - 1);
+            nx = candidates_x[pick];
+            ny = candidates_y[pick];
+        }
+        /* else: no valid alternate room, fall through to intended room */
+    }
+
+    /* Remember the room we're leaving for the sliding camera transition */
+    g->slide_from_x = d->cur_x;
+    g->slide_from_y = d->cur_y;
+
     d->cur_x = nx;
     d->cur_y = ny;
 
     Room *newRoom = &d->rooms[ny][nx];
     newRoom->visited = 1;
+    /* Secret room landing (normal entry or maze redirect): open its doors */
+    reveal_secret_room(g, nx, ny);
+
+    /* Arcade slot machine is once per VISIT, not once per run */
+    if (newRoom->type == ROOM_ARCADE) newRoom->arcade_slot_used = 0;
+
+    /* Entering an uncleared Boss Rush room: reset the Game-global wave state
+       so a prior/aborted gauntlet can't leak a stale wave counter into it. */
+    if (newRoom->type == ROOM_BOSSRUSH && !newRoom->cleared) {
+        g->bossrush_active = 0;
+        g->bossrush_wave = 0;
+        g->bossrush_spawn_timer = 0;
+    }
+
+    /* E3: never carry a live enemy beam through a door */
+    g->ebeam_state = 0;
+    g->ebeam_timer = 0;
+    /* E6: snap the familiar trail into the new room */
+    familiars_reset_trail(g);
 
     for (int i = 0; i < MAX_TEARS; i++)
         g->tears[i].active = 0;
@@ -4678,8 +7977,11 @@ void do_room_transition(Game *g, Direction dir) {
     /* Reset enemy projectiles */
     for (int i = 0; i < MAX_ENEMY_SHOTS; i++) g->enemy_shots[i].active = 0;
 
-    /* Brief room fade-in for polish */
-    g->room_fade = 16;
+    /* Rebirth-style sliding camera pan into the new room (replaces the old
+       instant-teleport + fade). Warps (cards/pills/trapdoor) still fade. */
+    g->slide_timer = SLIDE_FRAMES;
+    g->slide_dir = dir;
+    g->room_fade = 0;
 
     /* Play boss roar and trigger intro pause when entering boss room first time.
        Grant invulnerability frames that outlast the intro so the player gets a
@@ -4701,6 +8003,10 @@ void do_room_transition(Game *g, Direction dir) {
                 break;
             }
         }
+    } else if (!newRoom->cleared) {
+        /* Entry grace: half a second of iframes stepping into any
+           uncleared room, so doorway ambushes can't cheap-shot. */
+        if (g->player.iframes < 30) g->player.iframes = 30;
     }
 
     float midX = (ROOM_LEFT + ROOM_RIGHT) / 2.0f;
@@ -4734,6 +8040,15 @@ void do_room_transition(Game *g, Direction dir) {
     if (g->player.stats.flags & ITEM_FLAG_MANTLE) g->player.holy_mantle_active = 1;
     /* Clear any active screen creep when leaving the previous room */
     for (int i = 0; i < MAX_CREEP; i++) g->creep[i].active = 0;
+    /* A live beam/knife/bomb must not persist across rooms (Phase D):
+       bombs carry room-local coordinates, and the beam/knife reference the
+       previous room's enemies. Knife snaps back to the held state. */
+    g->laser_active = 0;
+    g->laser_timer = 0;
+    g->laser_charge = 0;
+    g->knife_state = 0;
+    g->knife_hit_cd = 0;
+    for (int i = 0; i < MAX_BOMBS; i++) g->bombs[i].active = 0;
 }
 
 /* ================================================================
@@ -4790,6 +8105,7 @@ void game_update(Game *g, u32 kDown, u32 kHeld, circlePosition circlePos) {
                     /* Start a new run: jump to mode select (Story/Infinite) */
                     g->state = STATE_MODE_SELECT;
                     g->mode_sel = 0;
+                    g->challenge = 0;       /* normal run, no challenge mods */
                     g->transition = 0;
                     break;
                 case MENU_CONTINUE:
@@ -4797,10 +8113,8 @@ void game_update(Game *g, u32 kDown, u32 kHeld, circlePosition circlePos) {
                        When implemented, this would load g_config save slot. */
                     break;
                 case MENU_CHALLENGES:
-                    /* Map Challenges to mode select for now (Story/Infinite).
-                       Future: dedicated challenge list screen. */
-                    g->state = STATE_MODE_SELECT;
-                    g->mode_sel = 1;  /* default to Infinite as the challenge mode */
+                    g->state = STATE_CHALLENGE_SELECT;
+                    g->chal_sel = 0;
                     g->transition = 0;
                     break;
                 case MENU_STATS:
@@ -4825,6 +8139,7 @@ void game_update(Game *g, u32 kDown, u32 kHeld, circlePosition circlePos) {
             /* Quick-start: Normal Story mode */
             g->game_mode = MODE_STORY;
             g->difficulty = DIFF_NORMAL;
+            g->challenge = 0;
             start_new_game(g);
         }
         /* Audio debug: X plays a synthesized test tone, B plays a SFX */
@@ -4855,6 +8170,23 @@ void game_update(Game *g, u32 kDown, u32 kHeld, circlePosition circlePos) {
             g->transition = 0;
         }
         if (kDown & (KEY_B)) {
+            g->state = STATE_MENU;
+        }
+        break;
+
+    case STATE_CHALLENGE_SELECT:
+        /* Pick one of the 6 challenge runs; A starts immediately as Isaac */
+        if (kDown & KEY_DUP)   { g->chal_sel--; if (g->chal_sel < 0) g->chal_sel = 5; }
+        if (kDown & KEY_DDOWN) { g->chal_sel++; if (g->chal_sel > 5) g->chal_sel = 0; }
+        if (kDown & KEY_A) {
+            g->challenge = g->chal_sel + 1;   /* 1..6 */
+            g->game_mode = MODE_STORY;
+            g->selected_character = CHAR_ISAAC;
+            /* Eternal Darkness plays on Hard; the others on Normal */
+            g->difficulty = (g->challenge == 2) ? DIFF_HARD : DIFF_NORMAL;
+            start_new_game(g);
+        }
+        if (kDown & KEY_B) {
             g->state = STATE_MENU;
         }
         break;
@@ -4931,6 +8263,7 @@ void game_update(Game *g, u32 kDown, u32 kHeld, circlePosition circlePos) {
 
         if (kDown & KEY_A) {
             g->difficulty = (Difficulty)g->diff_sel;
+            g->challenge = 0;
             start_new_game(g);
         }
         if (kDown & (KEY_B)) {
@@ -5013,6 +8346,32 @@ void game_update(Game *g, u32 kDown, u32 kHeld, circlePosition circlePos) {
         g->frame++;
         g->play_time_frames++;
 
+        /* Game-feel HITSTOP: brief freeze on player damage. Skip the whole
+           sim update (enemies/tears/shots/physics) for a few frames but keep
+           rendering and stay in STATE_PLAYING. */
+        if (g->hitstop > 0) {
+            g->hitstop--;
+            break;
+        }
+
+        /* Challenge: Time Attack / Speed! — 20 minutes to win, or it's over.
+           F13: route through player_check_death so Dead Cat lives aren't
+           skipped — each remaining life buys a minute of overtime instead
+           of the timeout re-killing the player every frame. */
+        if ((g->challenge == 3 || g->challenge == 4)
+            && g->play_time_frames >= 20 * 60 * 60) {
+            g->player.hp = 0;
+            g->player.soul_hp = 0;
+            g->player.black_hp = 0;
+            if (player_check_death(&g->player)) {
+                audio_play(SFX_PLAYER_DEATH);
+                g->state = STATE_GAMEOVER;
+                break;
+            }
+            g->play_time_frames -= 60 * 60; /* overtime: 1 minute per life */
+            audio_play(SFX_HURT);
+        }
+
         /* Pause toggle: START opens stats screen */
         if (kDown & KEY_START) {
             g->state = STATE_PAUSED;
@@ -5033,8 +8392,16 @@ void game_update(Game *g, u32 kDown, u32 kHeld, circlePosition circlePos) {
         /* Room fade-in counter */
         if (g->room_fade > 0) g->room_fade--;
 
-        /* Boss death animation countdown */
-        if (g->boss_death_anim > 0) g->boss_death_anim--;
+        /* Boss death animation countdown + gore bursts at the corpse
+           (every 5 frames => ~12 bursts over the 60-frame anim) */
+        if (g->boss_death_anim > 0) {
+            g->boss_death_anim--;
+            if ((g->boss_death_anim % 5) == 0) {
+                float ga = (float)g->boss_death_anim * 0.7f;
+                spawn_blood_splatter(g, g->boss_death_x + cosf(ga) * 18.0f,
+                                     g->boss_death_y + sinf(ga) * 12.0f, 0, 0, 1);
+            }
+        }
 
         /* Decrement timers */
         if (g->pickup_msg_timer > 0) g->pickup_msg_timer--;
@@ -5045,24 +8412,21 @@ void game_update(Game *g, u32 kDown, u32 kHeld, circlePosition circlePos) {
         if (g->player.yum_heart_cd > 0) g->player.yum_heart_cd--;
         if (g->homing_timer > 0) g->homing_timer--;
         if (g->curse_display_timer > 0) g->curse_display_timer--;
+        if (g->floor_intro_timer > 0) g->floor_intro_timer--;
+        if (g->shop_deny_timer > 0) g->shop_deny_timer--;  /* also ticks outside shops (gold chests) */
 
-        /* Yum Heart auto-trigger: heal 1 HP every 10s if cooldown expired & wounded */
-        if (player_has_item(&g->player, ITEM_YUM_HEART)
-            && g->player.yum_heart_cd == 0
-            && g->player.hp < g->player.stats.max_hp) {
-            g->player.hp += 1;
-            if (g->player.hp > g->player.stats.max_hp) g->player.hp = g->player.stats.max_hp;
-            g->player.yum_heart_cd = 600;          /* 10 second cooldown */
-            audio_play(SFX_PICKUP);
+        /* Yum Heart and Book of Belial are now active items: their effects are
+         * triggered on demand via the active-item system (KEY_X) rather than
+         * auto-firing here. See active-item use handling below. */
+
+        /* Sliding room transition: freeze gameplay while the camera pans */
+        if (g->slide_timer > 0) {
+            g->slide_timer--;
+            break;
         }
 
-        /* Book of Belial: auto-activate damage buff when entering boss room */
-        if (player_has_item(&g->player, ITEM_BOOK_OF_BELIAL)
-            && g->boss_intro_timer > 0
-            && g->player.book_belial_dmg_timer == 0) {
-            g->player.book_belial_dmg_timer = 600;  /* 10 seconds of bonus damage */
-            recalc_player_stats(&g->player);
-        }
+        /* Red hurt-pulse vignette countdown */
+        if (g->hurt_flash_timer > 0) g->hurt_flash_timer--;
 
         /* Boss intro pause */
         if (g->boss_intro_timer > 0) {
@@ -5077,12 +8441,19 @@ void game_update(Game *g, u32 kDown, u32 kHeld, circlePosition circlePos) {
             return;
         }
 
+        /* Track HP across this frame's updates to trigger the hurt pulse.
+           Red HP is tracked separately for devil-deal eligibility. */
+        int hp_before = g->player.hp + g->player.soul_hp;
+        int red_before = g->player.hp;
+
         player_update(g, kHeld, circlePos);
 
         if (kHeld & KEY_X) shoot_tear(g, DIR_UP);
         if (kHeld & KEY_B) shoot_tear(g, DIR_DOWN);
         if (kHeld & KEY_Y) shoot_tear(g, DIR_LEFT);
         if (kHeld & KEY_A) shoot_tear(g, DIR_RIGHT);
+        /* D1 Brimstone: the charge only holds while a fire button is held */
+        if (!(kHeld & (KEY_X | KEY_B | KEY_Y | KEY_A))) g->laser_charge = 0;
 
         /* Bomb placement (SELECT) */
         if (kDown & KEY_SELECT) place_bomb(g);
@@ -5100,17 +8471,170 @@ void game_update(Game *g, u32 kDown, u32 kHeld, circlePosition circlePos) {
             audio_play(SFX_PICKUP);
         }
 
-        /* Active item use (Yum Heart / Book of Belial / etc) on Y? Use ZL via select? */
-        /* Active items handled via button: ZL (which 3DS lacks); use SELECT+Y combo, or auto when items exist */
+        /* Active item use: all four face buttons (X/B/Y/A) are bound to shooting,
+         * so the active item is triggered by tapping the bottom touch screen
+         * (KEY_TOUCH), which is otherwise unused on Old & New 3DS. */
+        if ((kDown & KEY_TOUCH)
+            && g->player.active_item != ITEM_NONE
+            && g->player.active_charge >= g->player.active_max_charge) {
+            Player *p = &g->player;
+            int used = 1;
+            switch (p->active_item) {
+            case ITEM_YUM_HEART:
+                /* Heal 2 HP (clamped to max) */
+                p->hp += 2;
+                if (p->hp > p->stats.max_hp) p->hp = p->stats.max_hp;
+                audio_play(SFX_PICKUP);
+                break;
+            case ITEM_BOOK_OF_BELIAL:
+                /* +damage this room (reuse existing timer + recalc path) */
+                p->book_belial_dmg_timer = 600;
+                recalc_player_stats(p);
+                audio_play(SFX_PICKUP);
+                break;
+            case ITEM_THE_POOP: {
+                /* Spawn an OBST_POOP just ahead of the player's facing dir */
+                Room *r = current_room(g);
+                if (r && r->obstacle_count < MAX_OBSTACLES) {
+                    float ox = p->x, oy = p->y;
+                    switch (p->face_dir) {
+                    case DIR_UP:    oy -= 28.0f; break;
+                    case DIR_DOWN:  oy += 28.0f; break;
+                    case DIR_LEFT:  ox -= 28.0f; break;
+                    case DIR_RIGHT: ox += 28.0f; break;
+                    default:        oy -= 28.0f; break;
+                    }
+                    if (ox < ROOM_LEFT)   ox = ROOM_LEFT;
+                    if (ox > ROOM_RIGHT)  ox = ROOM_RIGHT;
+                    if (oy < ROOM_TOP)    oy = ROOM_TOP;
+                    if (oy > ROOM_BOTTOM) oy = ROOM_BOTTOM;
+                    Obstacle *o = &r->obstacles[r->obstacle_count++];
+                    o->x = ox; o->y = oy;
+                    o->type = OBST_POOP;
+                    o->hp = 3;
+                    o->active = 1;
+                    audio_play(SFX_PICKUP);
+                } else {
+                    used = 0;  /* no room for poop; keep charge */
+                }
+                break;
+            }
+            /* --- Phase E7 actives --- */
+            case ITEM_NECRONOMICON:
+                /* TAROT_DEATH's effect, dialed up: 40 to the whole room */
+                damage_all_enemies(g, 40.0f);
+                trigger_shake(g, 6.0f, 24);
+                audio_play(SFX_BOSS);
+                break;
+            case ITEM_TELEPORT: {
+                /* PILL_TELEPILLS path: random revealed-safe warp through
+                   do_warp_cleanup (opens secret-room doors, resets state).
+                   F12: if all 30 rolls miss a real room, the warp never
+                   happened — keep the charge. */
+                int ttries = 0;
+                int warped = 0;
+                while (ttries < 30) {
+                    int trx = randi(0, DUNGEON_W - 1);
+                    int try2 = randi(0, DUNGEON_H - 1);
+                    if (g->dungeon.rooms[try2][trx].type != ROOM_NONE) {
+                        g->dungeon.cur_x = trx;
+                        g->dungeon.cur_y = try2;
+                        do_warp_cleanup(g);
+                        warped = 1;
+                        break;
+                    }
+                    ttries++;
+                }
+                if (!warped) used = 0;
+                break;
+            }
+            case ITEM_DECK_OF_CARDS: {
+                /* Draw a random tarot card as a pickup at the player */
+                Room *cr = current_room(g);
+                if (cr) {
+                    spawn_card_pickup(cr, p->x + 16, p->y,
+                                      randi(0, TAROT_COUNT - 1));
+                    audio_play(SFX_PICKUP);
+                } else {
+                    used = 0;
+                }
+                break;
+            }
+            case ITEM_BIBLE: {
+                /* Instantly kills Mom / Mom's Heart. Used on Satan it kills
+                   the PLAYER (the classic). Elsewhere: flight flavor text. */
+                Room *br2 = current_room(g);
+                int did = 0;
+                if (br2) {
+                    for (int bi2 = 0; bi2 < br2->enemy_count; bi2++) {
+                        Enemy *be = &br2->enemies[bi2];
+                        if (!be->active) continue;
+                        if (be->type == ENEMY_BOSS_MOM ||
+                            be->type == ENEMY_BOSS_MOMS_HEART) {
+                            be->hp = 0;
+                            kill_enemy(g, br2, be);
+                            did = 1;
+                        } else if (be->type == ENEMY_BOSS_SATAN) {
+                            /* Divine judgment goes the other way */
+                            p->hp = 0;
+                            p->soul_hp = 0;
+                            p->black_hp = 0;
+                            p->lives = 0;
+                            audio_play(SFX_PLAYER_DEATH);
+                            g->state = STATE_GAMEOVER;
+                            did = 1;
+                            break;
+                        }
+                    }
+                }
+                if (!did) {
+                    snprintf(g->pickup_msg_text, sizeof(g->pickup_msg_text),
+                             "The Bible - You feel lighter for a moment.");
+                    g->pickup_msg_timer = 120;
+                    audio_play(SFX_PICKUP);
+                }
+                break;
+            }
+            default:
+                used = 0;
+                break;
+            }
+            if (used) g->player.active_charge = 0;
+        }
 
+        familiars_update(g);  /* E6: trail history + fire cooldowns */
         tears_update(g);
         enemies_update(g);
         enemy_shots_update(g);
         bomb_update(g);
+        laser_update(g);    /* D1/D2 beam weapons */
+        knife_update(g);    /* D3 Mom's Knife */
         creep_update(g);
         collisions_update(g);
         blood_particles_update(g);
+
+        /* E5: each fully depleted black heart nukes the room for 40 (deaths
+           routed through kill_enemy inside damage_all_enemies) */
+        if (g_black_burst_pending > 0) {
+            damage_all_enemies(g, 40.0f * (float)g_black_burst_pending);
+            g_black_burst_pending = 0;
+            trigger_shake(g, 6.0f, 24);
+            audio_play(SFX_ENEMY_DEATH);
+        }
+
         check_door_transition(g);
+
+        /* Any HP lost this frame -> red vignette pulse */
+        if (g->player.hp + g->player.soul_hp < hp_before) {
+            g->hurt_flash_timer = HURT_FLASH_FRAMES;
+            /* Swallowed Penny: pain pays — drop a coin on damage */
+            if (g->player.trinket == TRINKET_SWALLOWED_PENNY)
+                spawn_consumable(current_room(g),
+                                 g->player.x, g->player.y - 18, PICKUP_COIN);
+        }
+        /* Red heart damage voids the devil deal for this floor */
+        if (g->player.hp < red_before)
+            g->floor_red_dmg = 1;
         break;
 
     case STATE_PAUSED:
@@ -5359,11 +8883,11 @@ void render_menu(Game *g, C2D_TextBuf textBuf) {
     } else {
         /* Fallback: hand-drawn title text inside note */
         C2D_Text titleA, titleB;
-        C2D_TextParse(&titleA, textBuf, "BINDING");
+        gtext_parse(&titleA, textBuf, "BINDING");
         C2D_TextOptimize(&titleA);
         C2D_DrawText(&titleA, C2D_WithColor,
                      note_x + 40, note_y + 30, 0, 0.6f, 0.6f, text_col);
-        C2D_TextParse(&titleB, textBuf, "of  ISAAC");
+        gtext_parse(&titleB, textBuf, "of  ISAAC");
         C2D_TextOptimize(&titleB);
         C2D_DrawText(&titleB, C2D_WithColor,
                      note_x + 30, note_y + 55, 0, 0.55f, 0.55f, text_col);
@@ -5434,7 +8958,7 @@ void render_menu(Game *g, C2D_TextBuf textBuf) {
             };
             u32 col = disabled ? text_disabled : text_col;
             C2D_Text optText;
-            C2D_TextParse(&optText, textBuf, opt_labels[i]);
+            gtext_parse(&optText, textBuf, opt_labels[i]);
             C2D_TextOptimize(&optText);
             C2D_DrawText(&optText, C2D_WithColor,
                          opt_x + xOffset, yPos, 0, 0.65f, 0.65f, col);
@@ -5443,7 +8967,7 @@ void render_menu(Game *g, C2D_TextBuf textBuf) {
 
     /* ===== 6. BOTTOM HINT TEXT ===== */
     C2D_Text hint;
-    C2D_TextParse(&hint, textBuf, "A: Select   D-Pad: Move   Y: Controls");
+    gtext_parse(&hint, textBuf, "A: Select   D-Pad: Move   Y: Controls");
     C2D_TextOptimize(&hint);
     float hint_alpha = 0.6f + sinf(g->menu_timer * 0.08f) * 0.2f;
     C2D_DrawText(&hint, C2D_WithColor, 60, TOP_SCREEN_HEIGHT - 16, 0,
@@ -5452,7 +8976,7 @@ void render_menu(Game *g, C2D_TextBuf textBuf) {
 
     /* Version text bottom-right */
     C2D_Text version;
-    C2D_TextParse(&version, textBuf, "v2.0");
+    gtext_parse(&version, textBuf, "v2.0");
     C2D_TextOptimize(&version);
     C2D_DrawText(&version, C2D_WithColor,
                  TOP_SCREEN_WIDTH - 35, TOP_SCREEN_HEIGHT - 16, 0,
@@ -5473,7 +8997,7 @@ void render_menu(Game *g, C2D_TextBuf textBuf) {
                  ad.init_result, ad.sfx_load_count, SFX_COUNT);
 
         C2D_Text line1;
-        C2D_TextParse(&line1, textBuf, dbg);
+        gtext_parse(&line1, textBuf, dbg);
         C2D_TextOptimize(&line1);
         C2D_DrawText(&line1, C2D_WithColor, 5, 2, 0,
                      0.36f, 0.36f, C2D_Color32(0, 100, 0, 255));
@@ -5486,7 +9010,7 @@ void render_menu(Game *g, C2D_TextBuf textBuf) {
                  ad.test_tone_result);
 
         C2D_Text line2;
-        C2D_TextParse(&line2, textBuf, dbg2);
+        gtext_parse(&line2, textBuf, dbg2);
         C2D_TextOptimize(&line2);
         C2D_DrawText(&line2, C2D_WithColor, 5, 14, 0,
                      0.34f, 0.34f, C2D_Color32(0, 80, 0, 255));
@@ -5499,7 +9023,7 @@ void render_menu(Game *g, C2D_TextBuf textBuf) {
                  ad.last_music_play_result);
 
         C2D_Text line3;
-        C2D_TextParse(&line3, textBuf, dbg3);
+        gtext_parse(&line3, textBuf, dbg3);
         C2D_TextOptimize(&line3);
         C2D_DrawText(&line3, C2D_WithColor, 5, 26, 0,
                      0.34f, 0.34f, C2D_Color32(0, 80, 0, 255));
@@ -5600,11 +9124,11 @@ static void draw_menu_option(C2D_TextBuf textBuf, const char *label, const char 
         /* Animated chevron arrows (larger and brighter than before) */
         C2D_Text al, ar;
         float ao = sinf(timer * 0.22f) * 4.5f;
-        C2D_TextParse(&al, textBuf, ">>");
+        gtext_parse(&al, textBuf, ">>");
         C2D_TextOptimize(&al);
         C2D_DrawText(&al, C2D_WithColor, box_x + 14 + ao, yPos - 1, 0,
                      0.85f, 0.85f, C2D_Color32(255, 240, 170, 255));
-        C2D_TextParse(&ar, textBuf, "<<");
+        gtext_parse(&ar, textBuf, "<<");
         C2D_TextOptimize(&ar);
         C2D_DrawText(&ar, C2D_WithColor, box_x + box_width - 38 - ao, yPos - 1, 0,
                      0.85f, 0.85f, C2D_Color32(255, 240, 170, 255));
@@ -5612,7 +9136,7 @@ static void draw_menu_option(C2D_TextBuf textBuf, const char *label, const char 
 
     /* Label text — bigger, brighter when selected; dimmer when not */
     C2D_Text lbl;
-    C2D_TextParse(&lbl, textBuf, label);
+    gtext_parse(&lbl, textBuf, label);
     C2D_TextOptimize(&lbl);
     float ts = selected ? 0.75f : 0.50f;
     u32 tc = selected ? C2D_Color32(255, 250, 220, 255)
@@ -5622,7 +9146,7 @@ static void draw_menu_option(C2D_TextBuf textBuf, const char *label, const char 
     /* Description text (smaller, below label) */
     if (desc) {
         C2D_Text dt;
-        C2D_TextParse(&dt, textBuf, desc);
+        gtext_parse(&dt, textBuf, desc);
         C2D_TextOptimize(&dt);
         u32 dc = selected ? C2D_Color32(220, 200, 170, 240)
                           : C2D_Color32(110, 90,  75,  150);
@@ -5636,7 +9160,7 @@ void render_mode_select(Game *g, C2D_TextBuf textBuf) {
 
     /* Title */
     C2D_Text title;
-    C2D_TextParse(&title, textBuf, "SELECT GAME MODE");
+    gtext_parse(&title, textBuf, "SELECT GAME MODE");
     C2D_TextOptimize(&title);
     float tp = sinf(g->menu_timer * 0.04f) * 0.03f;
     C2D_DrawText(&title, C2D_WithColor, 95, 28, 0, 0.8f + tp, 0.8f + tp,
@@ -5657,10 +9181,69 @@ void render_mode_select(Game *g, C2D_TextBuf textBuf) {
 
     /* Hint */
     C2D_Text hint;
-    C2D_TextParse(&hint, textBuf, "A: Select    B: Back");
+    gtext_parse(&hint, textBuf, "A: Select    B: Back");
     C2D_TextOptimize(&hint);
     float ha = 0.5f + sinf(g->menu_timer * 0.1f) * 0.3f;
     C2D_DrawText(&hint, C2D_WithColor, 115, 218, 0, 0.48f, 0.48f,
+                 C2D_Color32(150, 130, 110, (int)(ha * 255)));
+}
+
+/* ================================================================
+ * Render: Challenge Select screen
+ * ================================================================ */
+
+void render_challenge_select(Game *g, C2D_TextBuf textBuf) {
+    draw_menu_background(g);
+
+    C2D_Text title;
+    gtext_parse(&title, textBuf, "CHALLENGES");
+    C2D_TextOptimize(&title);
+    float tp = sinf(g->menu_timer * 0.04f) * 0.03f;
+    C2D_DrawText(&title, C2D_WithColor, 130, 28, 0, 0.8f + tp, 0.8f + tp,
+                 C2D_Color32(255, 230, 180, 255));
+
+    float lw = 200 + sinf(g->menu_timer * 0.06f) * 10;
+    C2D_DrawRectSolid((TOP_SCREEN_WIDTH - lw) / 2, 55, 0, lw, 2,
+                      C2D_Color32(200, 140, 80, 200));
+
+    /* 6 challenges shown 3 at a time in a scrolling window centered on the
+       selection (the draw_menu_option boxes are too tall for 6 rows). */
+    {
+        static const char *chal_names[6] = {
+            "Glass Cannon", "Eternal Darkness", "Time Attack",
+            "Speed!", "Cat Got Your Tongue", "The Purist"
+        };
+        static const char *chal_descs[6] = {
+            "One heart. Massive damage. Don't get hit.",
+            "Hard mode. Darkness curses every floor.",
+            "Beat the game in 20 minutes. Clock's ticking.",
+            "Everything moves 1.4x. 20 minute limit.",
+            "No tears. Your familiars fight for you.",
+            "No items anywhere. Final floor: Boss Rush."
+        };
+        int first = g->chal_sel - 1;
+        if (first < 0) first = 0;
+        if (first > 3) first = 3;
+        for (int ci = 0; ci < 3; ci++) {
+            int idx = first + ci;
+            draw_menu_option(textBuf, chal_names[idx], chal_descs[idx],
+                             75 + ci * 50, g->chal_sel == idx, g->menu_timer);
+        }
+        /* Position indicator */
+        char posBuf[16];
+        snprintf(posBuf, sizeof(posBuf), "%d / 6", g->chal_sel + 1);
+        C2D_Text posT;
+        gtext_parse(&posT, textBuf, posBuf);
+        C2D_TextOptimize(&posT);
+        C2D_DrawText(&posT, C2D_WithColor, TOP_SCREEN_WIDTH - 52, 30, 0,
+                     0.45f, 0.45f, C2D_Color32(200, 180, 150, 220));
+    }
+
+    C2D_Text hint;
+    gtext_parse(&hint, textBuf, "A: Start    B: Back    Up/Down: More");
+    C2D_TextOptimize(&hint);
+    float ha = 0.5f + sinf(g->menu_timer * 0.1f) * 0.3f;
+    C2D_DrawText(&hint, C2D_WithColor, 92, 220, 0, 0.48f, 0.48f,
                  C2D_Color32(150, 130, 110, (int)(ha * 255)));
 }
 
@@ -5676,7 +9259,7 @@ void render_difficulty_select(Game *g, C2D_TextBuf textBuf) {
     const char *mode_str = (g->game_mode == MODE_INFINITE) ? "INFINITE" : "STORY";
     char title_buf[48];
     snprintf(title_buf, sizeof(title_buf), "SELECT DIFFICULTY  [%s]", mode_str);
-    C2D_TextParse(&title, textBuf, title_buf);
+    gtext_parse(&title, textBuf, title_buf);
     C2D_TextOptimize(&title);
     float tp = sinf(g->menu_timer * 0.04f) * 0.02f;
     C2D_DrawText(&title, C2D_WithColor, 42, 20, 0, 0.65f + tp, 0.65f + tp,
@@ -5718,7 +9301,7 @@ void render_difficulty_select(Game *g, C2D_TextBuf textBuf) {
 
     /* Hint */
     C2D_Text hint;
-    C2D_TextParse(&hint, textBuf, "A: Start    B: Back");
+    gtext_parse(&hint, textBuf, "A: Start    B: Back");
     C2D_TextOptimize(&hint);
     float ha = 0.5f + sinf(g->menu_timer * 0.1f) * 0.3f;
     C2D_DrawText(&hint, C2D_WithColor, 118, 218, 0, 0.48f, 0.48f,
@@ -5735,6 +9318,9 @@ const char *character_name(CharacterType c) {
         case CHAR_MAGDALENE: return "Magdalene";
         case CHAR_CAIN:      return "Cain";
         case CHAR_JUDAS:     return "Judas";
+        case CHAR_EVE:       return "Eve";
+        case CHAR_SAMSON:    return "Samson";
+        case CHAR_BLUE_BABY: return "???";
         default:             return "?";
     }
 }
@@ -5745,6 +9331,9 @@ static const char *character_blurb(CharacterType c) {
         case CHAR_MAGDALENE: return "4 hearts, slower. Yum Heart heals.";
         case CHAR_CAIN:      return "2 hearts, +damage, +speed, +luck.";
         case CHAR_JUDAS:     return "1 heart, glass cannon. Book of Belial.";
+        case CHAR_EVE:       return "3 hearts, 1 soul heart, +damage, slower.";
+        case CHAR_SAMSON:    return "3 hearts, +damage, +speed.";
+        case CHAR_BLUE_BABY: return "2 hearts, 4 soul hearts, +damage.";
         default:             return "";
     }
 }
@@ -5754,6 +9343,9 @@ static u32 character_tint(CharacterType c) {
         case CHAR_MAGDALENE: return C2D_Color32(255, 160, 200, 255); /* pink */
         case CHAR_CAIN:      return C2D_Color32(220, 200, 80,  255); /* gold */
         case CHAR_JUDAS:     return C2D_Color32(140, 40,  60,  255); /* dark red */
+        case CHAR_EVE:       return C2D_Color32(180, 60,  120, 255); /* magenta */
+        case CHAR_SAMSON:    return C2D_Color32(150, 90,  50,  255); /* brown */
+        case CHAR_BLUE_BABY: return C2D_Color32(140, 200, 255, 255); /* pale blue */
         case CHAR_ISAAC:
         default:             return C2D_Color32(255, 220, 180, 255); /* default */
     }
@@ -5764,7 +9356,7 @@ void render_character_select(Game *g, C2D_TextBuf textBuf) {
 
     /* Title */
     C2D_Text title;
-    C2D_TextParse(&title, textBuf, "SELECT CHARACTER");
+    gtext_parse(&title, textBuf, "SELECT CHARACTER");
     C2D_TextOptimize(&title);
     float tp = sinf(g->menu_timer * 0.04f) * 0.03f;
     C2D_DrawText(&title, C2D_WithColor, 95, 18, 0, 0.8f + tp, 0.8f + tp,
@@ -5775,13 +9367,13 @@ void render_character_select(Game *g, C2D_TextBuf textBuf) {
     C2D_DrawRectSolid((TOP_SCREEN_WIDTH - lw) / 2, 45, 0, lw, 2,
                       C2D_Color32(200, 140, 80, 200));
 
-    /* 4 character cards side-by-side */
-    const float card_w = 80.0f;
-    const float card_h = 110.0f;
-    const float spacing = 8.0f;
-    const float total_w = card_w * 4 + spacing * 3;
+    /* CHAR_COUNT character cards side-by-side (scales to fit screen width) */
+    const float card_w = 52.0f;
+    const float card_h = 100.0f;
+    const float spacing = 4.0f;
+    const float total_w = card_w * CHAR_COUNT + spacing * (CHAR_COUNT - 1);
     const float start_x = (TOP_SCREEN_WIDTH - total_w) / 2.0f;
-    const float card_y = 60.0f;
+    const float card_y = 55.0f;
 
     for (int i = 0; i < CHAR_COUNT; i++) {
         float cx = start_x + i * (card_w + spacing);
@@ -5801,83 +9393,86 @@ void render_character_select(Game *g, C2D_TextBuf textBuf) {
         if (unlocked_bit) {
             /* === Unlocked: show character preview, name, and HP === */
             /* Color swatch (character tint preview) */
-            C2D_DrawRectSolid(cx + 8, card_y + 8, 0, card_w - 16, 40, tint);
+            C2D_DrawRectSolid(cx + 5, card_y + 6, 0, card_w - 10, 34, tint);
 
             /* Character icon - placeholder circle */
-            C2D_DrawCircleSolid(cx + card_w / 2, card_y + 28, 0, 14, C2D_Color32(255, 240, 220, 255));
+            C2D_DrawCircleSolid(cx + card_w / 2, card_y + 24, 0, 11, C2D_Color32(255, 240, 220, 255));
             /* Eye dots */
-            C2D_DrawCircleSolid(cx + card_w / 2 - 4, card_y + 26, 0, 2, C2D_Color32(0, 0, 0, 255));
+            C2D_DrawCircleSolid(cx + card_w / 2 - 3, card_y + 22, 0, 1.5f, C2D_Color32(0, 0, 0, 255));
             if (i != CHAR_CAIN) {  /* Cain has only one eye */
-                C2D_DrawCircleSolid(cx + card_w / 2 + 4, card_y + 26, 0, 2, C2D_Color32(0, 0, 0, 255));
+                C2D_DrawCircleSolid(cx + card_w / 2 + 3, card_y + 22, 0, 1.5f, C2D_Color32(0, 0, 0, 255));
             } else {
                 /* eye-patch */
-                C2D_DrawRectSolid(cx + card_w / 2 + 1, card_y + 24, 0, 8, 4, C2D_Color32(40, 40, 40, 255));
+                C2D_DrawRectSolid(cx + card_w / 2, card_y + 20, 0, 6, 3, C2D_Color32(40, 40, 40, 255));
             }
 
             /* Character name */
             C2D_Text nm;
-            C2D_TextParse(&nm, textBuf, character_name((CharacterType)i));
+            gtext_parse(&nm, textBuf, character_name((CharacterType)i));
             C2D_TextOptimize(&nm);
             u32 tc = selected ? C2D_Color32(255, 240, 200, 255)
                               : C2D_Color32(180, 160, 130, 255);
-            C2D_DrawText(&nm, C2D_WithColor, cx + 10, card_y + 60, 0, 0.5f, 0.5f, tc);
+            C2D_DrawText(&nm, C2D_WithColor, cx + 4, card_y + 52, 0, 0.38f, 0.38f, tc);
 
             /* HP indicator */
             int hp_disp = 3;
             if (i == CHAR_MAGDALENE) hp_disp = 4;
             else if (i == CHAR_CAIN) hp_disp = 2;
             else if (i == CHAR_JUDAS) hp_disp = 1;
+            else if (i == CHAR_EVE) hp_disp = 3;
+            else if (i == CHAR_SAMSON) hp_disp = 3;
+            else if (i == CHAR_BLUE_BABY) hp_disp = 2;
             char hpb[16];
-            snprintf(hpb, sizeof(hpb), "HP: %d", hp_disp);
+            snprintf(hpb, sizeof(hpb), "HP:%d", hp_disp);
             C2D_Text hpt;
-            C2D_TextParse(&hpt, textBuf, hpb);
+            gtext_parse(&hpt, textBuf, hpb);
             C2D_TextOptimize(&hpt);
-            C2D_DrawText(&hpt, C2D_WithColor, cx + 10, card_y + 80, 0, 0.4f, 0.4f,
+            C2D_DrawText(&hpt, C2D_WithColor, cx + 6, card_y + 70, 0, 0.34f, 0.34f,
                          C2D_Color32(220, 100, 100, 255));
         } else {
             /* === Locked: hide all character details === */
             /* Greyed-out silhouette area (no tint reveal) */
-            C2D_DrawRectSolid(cx + 8, card_y + 8, 0, card_w - 16, 40,
+            C2D_DrawRectSolid(cx + 5, card_y + 6, 0, card_w - 10, 34,
                               C2D_Color32(25, 20, 18, 255));
             /* Anonymous silhouette */
-            C2D_DrawCircleSolid(cx + card_w / 2, card_y + 28, 0, 14,
+            C2D_DrawCircleSolid(cx + card_w / 2, card_y + 24, 0, 11,
                                 C2D_Color32(60, 50, 45, 255));
             /* No eyes, no character preview */
 
             /* Name placeholder */
             C2D_Text nm;
-            C2D_TextParse(&nm, textBuf, "??????");
+            gtext_parse(&nm, textBuf, "?????");
             C2D_TextOptimize(&nm);
-            C2D_DrawText(&nm, C2D_WithColor, cx + 10, card_y + 60, 0, 0.5f, 0.5f,
+            C2D_DrawText(&nm, C2D_WithColor, cx + 4, card_y + 52, 0, 0.38f, 0.38f,
                          C2D_Color32(120, 100, 90, 255));
             /* HP hidden as well */
             C2D_Text hpt;
-            C2D_TextParse(&hpt, textBuf, "HP: ?");
+            gtext_parse(&hpt, textBuf, "HP:?");
             C2D_TextOptimize(&hpt);
-            C2D_DrawText(&hpt, C2D_WithColor, cx + 10, card_y + 80, 0, 0.4f, 0.4f,
+            C2D_DrawText(&hpt, C2D_WithColor, cx + 6, card_y + 70, 0, 0.34f, 0.34f,
                          C2D_Color32(120, 90, 90, 255));
 
             /* Soft dim overlay so the card reads as "disabled" */
             C2D_DrawRectSolid(cx, card_y, 0, card_w, card_h,
                               C2D_Color32(0, 0, 0, 140));
             /* Lock icon: padlock body */
-            float lx = cx + card_w / 2 - 8;
-            float ly = card_y + card_h / 2 - 4;
-            C2D_DrawRectSolid(lx, ly, 0, 16, 14,
+            float lx = cx + card_w / 2 - 6;
+            float ly = card_y + card_h / 2 - 2;
+            C2D_DrawRectSolid(lx, ly, 0, 12, 10,
                               C2D_Color32(220, 200, 80, 255));
             /* Shackle */
-            C2D_DrawRectSolid(lx + 3, ly - 6, 0, 10, 4,
+            C2D_DrawRectSolid(lx + 2, ly - 5, 0, 8, 3,
                               C2D_Color32(220, 200, 80, 255));
-            C2D_DrawRectSolid(lx + 3, ly - 6, 0, 2, 8,
+            C2D_DrawRectSolid(lx + 2, ly - 5, 0, 2, 6,
                               C2D_Color32(220, 200, 80, 255));
-            C2D_DrawRectSolid(lx + 11, ly - 6, 0, 2, 8,
+            C2D_DrawRectSolid(lx + 8, ly - 5, 0, 2, 6,
                               C2D_Color32(220, 200, 80, 255));
             /* LOCKED text */
             C2D_Text lk;
-            C2D_TextParse(&lk, textBuf, "LOCKED");
+            gtext_parse(&lk, textBuf, "LOCK");
             C2D_TextOptimize(&lk);
-            C2D_DrawText(&lk, C2D_WithColor, cx + 16, card_y + card_h - 22,
-                         0, 0.45f, 0.45f, C2D_Color32(255, 180, 60, 255));
+            C2D_DrawText(&lk, C2D_WithColor, cx + 8, card_y + card_h - 18,
+                         0, 0.34f, 0.34f, C2D_Color32(255, 180, 60, 255));
         }
     }
 
@@ -5885,13 +9480,13 @@ void render_character_select(Game *g, C2D_TextBuf textBuf) {
     int sel_unlocked = (g_config.unlocked_chars & (1 << g->char_sel)) ? 1 : 0;
     if (sel_unlocked) {
         C2D_Text desc;
-        C2D_TextParse(&desc, textBuf, character_blurb((CharacterType)g->char_sel));
+        gtext_parse(&desc, textBuf, character_blurb((CharacterType)g->char_sel));
         C2D_TextOptimize(&desc);
         C2D_DrawText(&desc, C2D_WithColor, 35, 185, 0, 0.45f, 0.45f,
                      C2D_Color32(220, 200, 160, 255));
     } else {
         C2D_Text desc;
-        C2D_TextParse(&desc, textBuf, "Complete the game with another character to unlock.");
+        gtext_parse(&desc, textBuf, "Complete the game with another character to unlock.");
         C2D_TextOptimize(&desc);
         C2D_DrawText(&desc, C2D_WithColor, 20, 185, 0, 0.45f, 0.45f,
                      C2D_Color32(160, 130, 90, 255));
@@ -5899,7 +9494,7 @@ void render_character_select(Game *g, C2D_TextBuf textBuf) {
 
     /* Hint */
     C2D_Text hint;
-    C2D_TextParse(&hint, textBuf, "D-Pad/Stick: Select   A: Confirm   B: Back");
+    gtext_parse(&hint, textBuf, "D-Pad/Stick: Select   A: Confirm   B: Back");
     C2D_TextOptimize(&hint);
     float ha = 0.5f + sinf(g->menu_timer * 0.1f) * 0.3f;
     C2D_DrawText(&hint, C2D_WithColor, 65, 218, 0, 0.45f, 0.45f,
@@ -5920,7 +9515,7 @@ void render_stats_overlay(Game *g, C2D_TextBuf textBuf) {
 
     /* Title */
     C2D_Text title;
-    C2D_TextParse(&title, textBuf, "PLAYER STATS");
+    gtext_parse(&title, textBuf, "PLAYER STATS");
     C2D_TextOptimize(&title);
     C2D_DrawText(&title, C2D_WithColor, 90, 6, 0, 0.65f, 0.65f,
                  C2D_Color32(255, 230, 180, 255));
@@ -5930,7 +9525,7 @@ void render_stats_overlay(Game *g, C2D_TextBuf textBuf) {
     snprintf(cb, sizeof(cb), "%s   Floor %d", character_name(p->character),
              g->current_floor + 1);
     C2D_Text ct;
-    C2D_TextParse(&ct, textBuf, cb);
+    gtext_parse(&ct, textBuf, cb);
     C2D_TextOptimize(&ct);
     C2D_DrawText(&ct, C2D_WithColor, 80, 25, 0, 0.5f, 0.5f,
                  character_tint(p->character));
@@ -5944,12 +9539,12 @@ void render_stats_overlay(Game *g, C2D_TextBuf textBuf) {
 
     #define STAT_LINE(label, fmt, val) do { \
         C2D_Text lt; \
-        C2D_TextParse(&lt, textBuf, label); \
+        gtext_parse(&lt, textBuf, label); \
         C2D_TextOptimize(&lt); \
         C2D_DrawText(&lt, C2D_WithColor, 18, y, 0, 0.46f, 0.46f, lc); \
         snprintf(buf, sizeof(buf), fmt, val); \
         C2D_Text vt; \
-        C2D_TextParse(&vt, textBuf, buf); \
+        gtext_parse(&vt, textBuf, buf); \
         C2D_TextOptimize(&vt); \
         C2D_DrawText(&vt, C2D_WithColor, 130, y, 0, 0.46f, 0.46f, vc); \
         y += dy; \
@@ -5970,10 +9565,10 @@ void render_stats_overlay(Game *g, C2D_TextBuf textBuf) {
     seconds %= 60;
     snprintf(buf, sizeof(buf), "%02d:%02d", minutes, seconds);
     C2D_Text tl, tv;
-    C2D_TextParse(&tl, textBuf, "Time:");
+    gtext_parse(&tl, textBuf, "Time:");
     C2D_TextOptimize(&tl);
     C2D_DrawText(&tl, C2D_WithColor, 18, y, 0, 0.46f, 0.46f, lc);
-    C2D_TextParse(&tv, textBuf, buf);
+    gtext_parse(&tv, textBuf, buf);
     C2D_TextOptimize(&tv);
     C2D_DrawText(&tv, C2D_WithColor, 130, y, 0, 0.46f, 0.46f, vc);
 
@@ -5981,7 +9576,7 @@ void render_stats_overlay(Game *g, C2D_TextBuf textBuf) {
 
     /* Bottom hint */
     C2D_Text hint;
-    C2D_TextParse(&hint, textBuf, "START or B: Resume");
+    gtext_parse(&hint, textBuf, "START or B: Resume");
     C2D_TextOptimize(&hint);
     C2D_DrawText(&hint, C2D_WithColor, 88, 218, 0, 0.45f, 0.45f,
                  C2D_Color32(150, 130, 110, 255));
@@ -6001,53 +9596,57 @@ void render_pickup_message(Game *g, C2D_TextBuf textBuf) {
     if (alpha < 0) alpha = 0;
     if (alpha > 255) alpha = 255;
 
-    /* Color-code the banner by pickup type. The collect_item / pickup code
-       prefixes pill/card pickups with "Pill:" / "Card:", and item pickups
-       use "<name> - <desc>". We use that to pick an accent color and a
-       short icon-style tag so the player can tell at a glance what kind
-       of pickup it was — this avoids the "everything looks the same"
-       feedback issue in the original UI. */
-    const char *msg_text = g->pickup_msg_text;
-    u32 accent  = C2D_Color32(255, 200, 100, alpha);  /* default: warm gold (item) */
-    u32 textcol = C2D_Color32(255, 240, 200, alpha);
-    const char *tag = "ITEM";
-    u32 tagcol = C2D_Color32(255, 230, 150, alpha);
-
-    if (strncmp(msg_text, "Pill:", 5) == 0) {
-        accent  = C2D_Color32(220, 130, 200, alpha);  /* pink / pill capsule */
-        textcol = C2D_Color32(255, 220, 240, alpha);
-        tag = "PILL";
-        tagcol = C2D_Color32(255, 180, 220, alpha);
-    } else if (strncmp(msg_text, "Card:", 5) == 0) {
-        accent  = C2D_Color32(140, 180, 255, alpha);  /* cool blue / tarot */
-        textcol = C2D_Color32(220, 235, 255, alpha);
-        tag = "CARD";
-        tagcol = C2D_Color32(190, 215, 255, alpha);
+    /* Item pickups store "<name> - <desc>" in pickup_msg_text; pill/card/
+       trinket pickups store just "Pill: <color>" / "Card: <name>" /
+       "Trinket: <name>" with no description. Split on the first " - " so
+       we can render the name (bigger) over the description (smaller); if
+       there's no separator, the whole string is treated as the name. */
+    char name_buf[96];
+    char desc_buf[96];
+    name_buf[0] = '\0';
+    desc_buf[0] = '\0';
+    snprintf(name_buf, sizeof(name_buf), "%s", g->pickup_msg_text);
+    {
+        char *sep = strstr(name_buf, " - ");
+        if (sep) {
+            *sep = '\0';
+            snprintf(desc_buf, sizeof(desc_buf), "%s", sep + 3);
+        }
     }
 
-    /* Background banner near bottom-center of top screen */
+    u32 textcol = C2D_Color32(255, 240, 200, alpha);
+    u32 desccol = C2D_Color32(200, 195, 190, alpha);
+
+    /* Neutral dark plate, sized to fit the two lines of text */
     float bw = 320;
-    float bh = 28;
+    float bh = desc_buf[0] ? 34 : 24;
     float bx = (TOP_SCREEN_WIDTH - bw) / 2;
     float by = ROOM_BOTTOM - bh - 4;
-    C2D_DrawRectSolid(bx, by, 0, bw, bh, C2D_Color32(40, 30, 20, (alpha * 220) / 255));
-    C2D_DrawRectSolid(bx, by, 0, bw, 2, accent);
-    C2D_DrawRectSolid(bx, by + bh - 2, 0, bw, 2, accent);
-    /* Coloured vertical accent rail on the left — instant visual tell of
-       what kind of pickup this is, even before reading the text */
-    C2D_DrawRectSolid(bx, by, 0, 4, bh, accent);
+    C2D_DrawRectSolid(bx, by, 0, bw, bh, C2D_Color32(30, 28, 26, (alpha * 220) / 255));
+    C2D_DrawRectSolid(bx, by, 0, bw, 1, C2D_Color32(90, 85, 80, alpha));
+    C2D_DrawRectSolid(bx, by + bh - 1, 0, bw, 1, C2D_Color32(90, 85, 80, alpha));
 
-    /* Small tag (ITEM / PILL / CARD) */
-    C2D_Text tagText;
-    C2D_TextParse(&tagText, textBuf, tag);
-    C2D_TextOptimize(&tagText);
-    C2D_DrawText(&tagText, C2D_WithColor, bx + 10, by + 3, 0, 0.38f, 0.38f, tagcol);
+    /* Name, larger, centered */
+    C2D_Text nameText;
+    gtext_parse(&nameText, textBuf, name_buf);
+    C2D_TextOptimize(&nameText);
+    float nw = 0.0f, nh = 0.0f;
+    C2D_TextGetDimensions(&nameText, 0.52f, 0.52f, &nw, &nh);
+    float nx = bx + (bw - nw) / 2.0f;
+    float ny = by + (desc_buf[0] ? 4 : (bh - nh) / 2.0f);
+    C2D_DrawText(&nameText, C2D_WithColor, nx, ny, 0, 0.52f, 0.52f, textcol);
 
-    /* Main message text, shifted right to leave room for the tag */
-    C2D_Text msg;
-    C2D_TextParse(&msg, textBuf, msg_text);
-    C2D_TextOptimize(&msg);
-    C2D_DrawText(&msg, C2D_WithColor, bx + 52, by + 6, 0, 0.48f, 0.48f, textcol);
+    /* Description, smaller, centered underneath */
+    if (desc_buf[0]) {
+        C2D_Text descText;
+        gtext_parse(&descText, textBuf, desc_buf);
+        C2D_TextOptimize(&descText);
+        float dw = 0.0f, dh = 0.0f;
+        C2D_TextGetDimensions(&descText, 0.38f, 0.38f, &dw, &dh);
+        float dx = bx + (bw - dw) / 2.0f;
+        float dy = by + bh - dh - 4;
+        C2D_DrawText(&descText, C2D_WithColor, dx, dy, 0, 0.38f, 0.38f, desccol);
+    }
 }
 
 /* ================================================================
@@ -6063,19 +9662,19 @@ void render_settings(Game *g, C2D_TextBuf textBuf) {
 
     /* Title */
     C2D_Text title;
-    C2D_TextParse(&title, textBuf, "=== SETTINGS ===");
+    gtext_parse(&title, textBuf, "=== SETTINGS ===");
     C2D_TextOptimize(&title);
     C2D_DrawText(&title, C2D_WithColor, 120, 12, 0, 0.7f, 0.7f, COL_MENU_SEL);
 
     /* Audio status indicator */
     C2D_Text status_label, status_val;
-    C2D_TextParse(&status_label, textBuf, "Audio Status:");
+    gtext_parse(&status_label, textBuf, "Audio Status:");
     C2D_TextOptimize(&status_label);
     C2D_DrawText(&status_label, C2D_WithColor, 30, 42, 0, 0.5f, 0.5f,
                  C2D_Color32(180, 180, 180, 255));
 
     const char *status_str = audio_status_string();
-    C2D_TextParse(&status_val, textBuf, status_str);
+    gtext_parse(&status_val, textBuf, status_str);
     C2D_TextOptimize(&status_val);
     u32 status_col;
     if (audio_is_available())
@@ -6107,7 +9706,7 @@ void render_settings(Game *g, C2D_TextBuf textBuf) {
 
         /* Label */
         C2D_Text lbl;
-        C2D_TextParse(&lbl, textBuf, labels[i]);
+        gtext_parse(&lbl, textBuf, labels[i]);
         C2D_TextOptimize(&lbl);
         u32 lbl_col = selected ? C2D_Color32(255, 240, 200, 255)
                                : C2D_Color32(180, 160, 130, 255);
@@ -6126,7 +9725,7 @@ void render_settings(Game *g, C2D_TextBuf textBuf) {
                      (int)(g_config.music_volume * 100.0f + 0.5f));
         }
         C2D_Text val_txt;
-        C2D_TextParse(&val_txt, textBuf, val_buf);
+        gtext_parse(&val_txt, textBuf, val_buf);
         C2D_TextOptimize(&val_txt);
         u32 val_col = selected ? C2D_Color32(255, 220, 150, 255)
                                : C2D_Color32(200, 180, 140, 255);
@@ -6136,7 +9735,7 @@ void render_settings(Game *g, C2D_TextBuf textBuf) {
     /* Restart notice if audio toggle changed */
     if (g->settings_changed) {
         C2D_Text notice;
-        C2D_TextParse(&notice, textBuf, "* Audio toggle takes effect on next launch *");
+        gtext_parse(&notice, textBuf, "* Audio toggle takes effect on next launch *");
         C2D_TextOptimize(&notice);
         float blink = sinf(g->menu_timer * 0.1f);
         int alpha = (int)(150 + blink * 80);
@@ -6146,7 +9745,7 @@ void render_settings(Game *g, C2D_TextBuf textBuf) {
 
     /* Hint at bottom (audio backend implementation detail no longer shown) */
     C2D_Text hint;
-    C2D_TextParse(&hint, textBuf, "D-Pad: Navigate   A/L/R: Change   B: Save & Back");
+    gtext_parse(&hint, textBuf, "D-Pad: Navigate   A/L/R: Change   B: Save & Back");
     C2D_TextOptimize(&hint);
     C2D_DrawText(&hint, C2D_WithColor, 45, 228, 0, 0.38f, 0.38f,
                  C2D_Color32(120, 100, 80, 200));
@@ -6174,7 +9773,7 @@ void render_controls(C2D_TextBuf textBuf) {
 
     for (int i = 0; i < 12; i++) {
         if (strlen(text[i]) == 0) continue;
-        C2D_TextParse(&lines[i], textBuf, text[i]);
+        gtext_parse(&lines[i], textBuf, text[i]);
         C2D_TextOptimize(&lines[i]);
         float scale = (i == 0) ? 0.7f : 0.42f;
         u32 col = (i == 0) ? COL_MENU_SEL : (i == 11 ? C2D_Color32(120, 120, 120, 255) : COL_TEXT);
@@ -6192,13 +9791,15 @@ void render_unlocks_screen(Game *g, C2D_TextBuf textBuf) {
 
     /* Title */
     C2D_Text title;
-    C2D_TextParse(&title, textBuf, "=== UNLOCKS & STATS ===");
+    gtext_parse(&title, textBuf, "=== UNLOCKS & STATS ===");
     C2D_TextOptimize(&title);
     C2D_DrawText(&title, C2D_WithColor, 80, 8, 0, 0.62f, 0.62f, COL_MENU_SEL);
 
-    /* Build all the lines */
-    char buf[16][64];
-    const char *lines_text[16];
+    /* Build all the lines. Sized to hold the character list + stats + the
+       full 20-boss roster (headers/stats 14 + 20 bosses = 34 < 36). buf is
+       static to keep the ~2KB scratch off the per-frame render stack. */
+    static char buf[36][64];
+    const char *lines_text[36];
     int line_count = 0;
 
     /* Header section: characters */
@@ -6206,8 +9807,8 @@ void render_unlocks_screen(Game *g, C2D_TextBuf textBuf) {
     lines_text[line_count] = buf[line_count]; line_count++;
 
     /* Character unlocks */
-    const char *chars[] = { "ISAAC", "MAGDALENE", "CAIN", "JUDAS" };
-    for (int i = 0; i < 4; i++) {
+    const char *chars[] = { "ISAAC", "MAGDALENE", "CAIN", "JUDAS", "EVE", "SAMSON", "???" };
+    for (int i = 0; i < CHAR_COUNT; i++) {
         int unlocked = (g_config.unlocked_chars & (1 << i)) != 0;
         int completed = (g_config.characters_completed & (1 << i)) != 0;
         if (unlocked) {
@@ -6234,20 +9835,25 @@ void render_unlocks_screen(Game *g, C2D_TextBuf textBuf) {
     /* Boss progress: count bits */
     int boss_count = 0;
     int boss_mask = g_config.bosses_defeated;
-    for (int b = 0; b < 16; b++) if (boss_mask & (1 << b)) boss_count++;
-    snprintf(buf[line_count], 64, "Bosses Defeated: %d / 11", boss_count);
+    for (int b = 0; b < 20; b++) if (boss_mask & (1 << b)) boss_count++;
+    snprintf(buf[line_count], 64, "Bosses Defeated: %d / 20", boss_count);
     lines_text[line_count] = buf[line_count]; line_count++;
 
     /* Boss list */
     snprintf(buf[line_count], 64, "-- BOSSES --");
     lines_text[line_count] = buf[line_count]; line_count++;
 
+    /* Must stay in exact EnemyType enum order (ENEMY_BOSS_DUKE..ENEMY_BOSS_SATAN)
+       since boss_idx is computed as (e->type - ENEMY_BOSS_DUKE) -- keep in sync
+       whenever a boss is added/reordered. */
     const char *boss_names[] = {
         "Duke of Flies", "Monstro", "Gemini", "Larry Jr.", "Famine",
-        "Peep", "Gurdy", "Pin", "The Haunt", "Widow", "Mega Satan"
+        "Peep", "Gurdy", "Pin", "The Haunt", "Widow", "Gish",
+        "Loki", "Steven", "Chub", "Fistula", "Scolex", "Mega Satan",
+        "Mom", "Mom's Heart", "Satan"
     };
     /* Pack two columns - we'll show ones we have seen vs ???  */
-    for (int b = 0; b < 11 && line_count < 16; b++) {
+    for (int b = 0; b < 20 && line_count < 36; b++) {
         int defeated = (g_config.bosses_defeated & (1 << b)) != 0;
         snprintf(buf[line_count], 64, "  %c %s",
                 defeated ? 'X' : '-',
@@ -6267,17 +9873,17 @@ void render_unlocks_screen(Game *g, C2D_TextBuf textBuf) {
     int end = start + 11;
     if (end > line_count) end = line_count;
     for (int i = start; i < end; i++) {
-        C2D_TextParse(&txt[i], textBuf, lines_text[i]);
-        C2D_TextOptimize(&txt[i]);
+        gtext_parse(&txt[i - start], textBuf, lines_text[i]);
+        C2D_TextOptimize(&txt[i - start]);
         u32 col = COL_TEXT;
         if (lines_text[i][0] == '-' && lines_text[i][1] == '-') col = COL_MENU_SEL;
-        C2D_DrawText(&txt[i], C2D_WithColor, 30, y, 0, 0.42f, 0.42f, col);
+        C2D_DrawText(&txt[i - start], C2D_WithColor, 30, y, 0, 0.42f, 0.42f, col);
         y += 16;
     }
 
     /* Footer hint */
     C2D_Text hint;
-    C2D_TextParse(&hint, textBuf, "Up/Down: Scroll   B: Back");
+    gtext_parse(&hint, textBuf, "Up/Down: Scroll   B: Back");
     C2D_TextOptimize(&hint);
     C2D_DrawText(&hint, C2D_WithColor, 60, 220, 0, 0.38f, 0.38f,
                 C2D_Color32(160, 160, 160, 255));
@@ -6292,12 +9898,32 @@ void render_hud(Game *g, C2D_TextBuf textBuf) {
      * so it does not obscure the top door which sits at y=WALL_THICKNESS */
     C2D_DrawRectSolid(0, 0, 0, TOP_SCREEN_WIDTH, WALL_THICKNESS, COL_HUD_BG);
 
-    /* Hearts – compact layout fitting within 16px tall HUD strip */
+    /* Hearts – compact layout fitting within 16px tall HUD strip. Wraps to
+       a second row (see wrap logic below) instead of hard-hiding extras,
+       so raise the display cap enough for that to matter. */
     int maxHearts = g->player.stats.max_hp / 2;
-    if (maxHearts > 8) maxHearts = 8;
+    if (maxHearts > 12) maxHearts = 12;
+
+    /* Curse of the Unknown: hide the heart row entirely (render-only —
+     * underlying HP state is untouched). Draw a single '?' where the
+     * heart row would normally start so the player knows curse is active
+     * but can't read their exact health. */
+    if (g->active_curse == CURSE_UNKNOWN) {
+        C2D_Text qt;
+        gtext_parse(&qt, textBuf, "?");
+        C2D_TextOptimize(&qt);
+        C2D_DrawText(&qt, C2D_WithColor, 12, 6, 0, 0.55f, 0.55f,
+                     C2D_Color32(220, 220, 220, 255));
+    } else {
     for (int i = 0; i < maxHearts; i++) {
-        float hx = 12 + i * 15;
-        float hy = 8;
+        /* Wrap to a second row instead of the old hard 8-heart cap, so
+           high max-HP loadouts (Blood/Soul Hearts, Bag of Fish, etc.) all
+           remain visible instead of silently vanishing off the HUD. */
+        int wrapped = (maxHearts > 6);
+        int row = wrapped ? i / 6 : 0;
+        int col = wrapped ? i % 6 : i;
+        float hx = 12 + col * 15;
+        float hy = 8 + row * 14;
         int hpForThisHeart = (g->player.hp - i * 2);
 
         if (g_sprites_loaded) {
@@ -6320,40 +9946,74 @@ void render_hud(Game *g, C2D_TextBuf textBuf) {
             }
         }
     }
+    }
 
-    /* Consumable counts (bomb/key/coin) in HUD - right of hearts */
+    /* Soul hearts — drawn after the red heart containers, Rebirth-style.
+       Continues the same row-wrap grid the red hearts use (6 per row) so
+       they land next to the last red heart instead of overlapping it. */
+    int soulShown = 0;
+    if (g->active_curse != CURSE_UNKNOWN) {
+        int soulUnits = g->player.soul_hp;
+        int soulHearts = (soulUnits + 1) / 2;
+        if (maxHearts + soulHearts > 18) soulHearts = 18 - maxHearts;
+        if (soulHearts < 0) soulHearts = 0;
+        int heartWrapped = (maxHearts > 6);
+        for (int i = 0; i < soulHearts; i++) {
+            int slot = maxHearts + i;
+            int row = heartWrapped ? slot / 6 : 0;
+            int col = heartWrapped ? slot % 6 : slot;
+            float hx = 12 + col * 15;
+            float hy = 8 + row * 14;
+            int unitsForThis = soulUnits - i * 2;
+            if (g_sprites_loaded) {
+                float hs = 0.75f;
+                spr_draw(sheet_ui_items,
+                         (unitsForThis >= 2) ? ui_items_atlas_heart_soul_full_idx
+                                             : ui_items_atlas_heart_soul_half_idx,
+                         hx, hy, hs, hs);
+            } else {
+                draw_heart(hx, hy, (unitsForThis >= 2) ? 12 : 8,
+                           C2D_Color32(120, 140, 255, 255));
+            }
+            soulShown++;
+        }
+
+        /* E5: black hearts continue the row after the soul hearts (they are
+           consumed first, but Rebirth draws them in pickup order — after the
+           red containers is the closest simple read). Half hearts draw the
+           full sprite at reduced scale (no dedicated half-black art). */
+        int blackUnits = g->player.black_hp;
+        int blackHearts = (blackUnits + 1) / 2;
+        if (maxHearts + soulShown + blackHearts > 18)
+            blackHearts = 18 - maxHearts - soulShown;
+        if (blackHearts < 0) blackHearts = 0;
+        int rowWrapped = (maxHearts > 6);
+        for (int i = 0; i < blackHearts; i++) {
+            int slot = maxHearts + soulShown + i;
+            int row = rowWrapped ? slot / 6 : 0;
+            int col = rowWrapped ? slot % 6 : slot;
+            float hx = 12 + col * 15;
+            float hy = 8 + row * 14;
+            int unitsForThis = blackUnits - i * 2;
+            if (g_sprites_loaded) {
+                float hs = (unitsForThis >= 2) ? 0.75f : 0.55f;
+                spr_draw(sheet_ui_items, ui_items_atlas_heart_black_full_idx,
+                         hx, hy, hs, hs);
+            } else {
+                draw_heart(hx, hy, (unitsForThis >= 2) ? 12 : 8,
+                           C2D_Color32(40, 30, 50, 255));
+            }
+        }
+    }
+
+    /* Consumable counts (coin/bomb/key) — bottom-left vertical stack. Moved
+       out of the cramped top strip (which was overlapping the floor/room
+       name text) into free space above the pill/card row. */
     {
-        float cx = 12 + maxHearts * 15 + 8;
-        float cy = 8;
-        float iconSc = 0.55f;
-        if (g_sprites_loaded) {
-            spr_draw(sheet_ui_items, ui_items_atlas_item_bomb_idx, cx, cy, iconSc, iconSc);
-        } else {
-            C2D_DrawCircleSolid(cx, cy, 0, 4, C2D_Color32(80, 80, 80, 255));
-        }
-        C2D_Text bt;
-        char bb[8];
-        snprintf(bb, sizeof(bb), "x%d", g->player.bombs);
-        C2D_TextParse(&bt, textBuf, bb);
-        C2D_TextOptimize(&bt);
-        C2D_DrawText(&bt, C2D_WithColor, cx + 7, cy - 4, 0, 0.35f, 0.35f,
-                     C2D_Color32(200, 200, 200, 255));
+        float cx = 10;
+        float cy = TOP_SCREEN_HEIGHT - 42;
+        float iconSc = 0.45f;
 
-        cx += 30;
-        if (g_sprites_loaded) {
-            spr_draw(sheet_ui_items, ui_items_atlas_item_key_idx, cx, cy, iconSc, iconSc);
-        } else {
-            C2D_DrawRectSolid(cx - 3, cy - 5, 0, 6, 10, C2D_Color32(255, 215, 0, 255));
-        }
-        C2D_Text kt;
-        char kb[8];
-        snprintf(kb, sizeof(kb), "x%d", g->player.keys);
-        C2D_TextParse(&kt, textBuf, kb);
-        C2D_TextOptimize(&kt);
-        C2D_DrawText(&kt, C2D_WithColor, cx + 7, cy - 4, 0, 0.35f, 0.35f,
-                     C2D_Color32(200, 200, 200, 255));
-
-        cx += 30;
         if (g_sprites_loaded) {
             spr_draw(sheet_ui_items, ui_items_atlas_item_coin_idx, cx, cy, iconSc, iconSc);
         } else {
@@ -6361,11 +10021,131 @@ void render_hud(Game *g, C2D_TextBuf textBuf) {
         }
         C2D_Text ct;
         char cb[8];
-        snprintf(cb, sizeof(cb), "x%d", g->player.coins);
-        C2D_TextParse(&ct, textBuf, cb);
+        snprintf(cb, sizeof(cb), "%d", g->player.coins);
+        gtext_parse(&ct, textBuf, cb);
         C2D_TextOptimize(&ct);
-        C2D_DrawText(&ct, C2D_WithColor, cx + 7, cy - 4, 0, 0.35f, 0.35f,
-                     C2D_Color32(200, 200, 200, 255));
+        C2D_DrawText(&ct, C2D_WithColor, cx + 8, cy - 4, 0, 0.45f, 0.45f,
+                     C2D_Color32(255, 255, 255, 255));
+
+        cy += 13;
+        if (g_sprites_loaded) {
+            spr_draw(sheet_ui_items, ui_items_atlas_item_bomb_idx, cx, cy, iconSc, iconSc);
+        } else {
+            C2D_DrawCircleSolid(cx, cy, 0, 4, C2D_Color32(80, 80, 80, 255));
+        }
+        C2D_Text bt;
+        char bb[8];
+        snprintf(bb, sizeof(bb), "%d", g->player.bombs);
+        gtext_parse(&bt, textBuf, bb);
+        C2D_TextOptimize(&bt);
+        C2D_DrawText(&bt, C2D_WithColor, cx + 8, cy - 4, 0, 0.45f, 0.45f,
+                     C2D_Color32(255, 255, 255, 255));
+
+        cy += 13;
+        if (g_sprites_loaded) {
+            spr_draw(sheet_ui_items, ui_items_atlas_item_key_idx, cx, cy, iconSc, iconSc);
+        } else {
+            C2D_DrawRectSolid(cx - 3, cy - 5, 0, 6, 10, C2D_Color32(255, 215, 0, 255));
+        }
+        C2D_Text kt;
+        char kb[8];
+        snprintf(kb, sizeof(kb), "%d", g->player.keys);
+        gtext_parse(&kt, textBuf, kb);
+        C2D_TextOptimize(&kt);
+        C2D_DrawText(&kt, C2D_WithColor, cx + 8, cy - 4, 0, 0.45f, 0.45f,
+                     C2D_Color32(255, 255, 255, 255));
+    }
+
+    /* ── Held pill / card slot (Rebirth-style, bottom-left of top screen)
+       plus Yum Heart recharge pips. Previously the player had no way to
+       see what single-use consumable they were carrying. Shifted right of
+       the coin/bomb/key stack above so the two groups don't overlap. ── */
+    {
+        float px = 55, py = TOP_SCREEN_HEIGHT - 12;
+        if (g->player.has_pill) {
+            /* two-tone capsule */
+            C2D_DrawCircleSolid(px - 3, py, 0, 3.5f, C2D_Color32(240, 240, 240, 255));
+            C2D_DrawCircleSolid(px + 3, py, 0, 3.5f, C2D_Color32(220, 90, 160, 255));
+            C2D_DrawRectSolid(px - 3, py - 3.5f, 0, 3, 7, C2D_Color32(240, 240, 240, 255));
+            C2D_DrawRectSolid(px, py - 3.5f, 0, 3, 7, C2D_Color32(220, 90, 160, 255));
+            C2D_Text lt;
+            gtext_parse(&lt, textBuf, "L");
+            C2D_TextOptimize(&lt);
+            C2D_DrawText(&lt, C2D_WithColor, px + 9, py - 7, 0, 0.4f, 0.4f,
+                         C2D_Color32(180, 180, 180, 220));
+        }
+        if (g->player.has_card) {
+            float ccx = px + 30;
+            C2D_DrawRectSolid(ccx - 4, py - 6, 0, 8, 12, C2D_Color32(235, 225, 200, 255));
+            C2D_DrawRectSolid(ccx - 3, py - 5, 0, 6, 10, C2D_Color32(150, 120, 60, 255));
+            C2D_DrawRectSolid(ccx - 2, py - 4, 0, 4, 8, C2D_Color32(235, 225, 200, 255));
+            C2D_Text rt;
+            gtext_parse(&rt, textBuf, "R");
+            C2D_TextOptimize(&rt);
+            C2D_DrawText(&rt, C2D_WithColor, ccx + 7, py - 7, 0, 0.4f, 0.4f,
+                         C2D_Color32(180, 180, 180, 220));
+        }
+        /* Held trinket charm, right of the pill/card slots */
+        if (g->player.trinket != TRINKET_NONE) {
+            draw_trinket_icon(px + 48, py, g->player.trinket, 0.9f);
+        }
+
+    }
+
+    /* ── Active item box (charge-based, use with a touch-screen tap). A framed
+       ~20x20 slot with the item icon inside and a segmented vertical charge bar
+       down its left edge. Placed just below the heart strip, top-left. ── */
+    if (g->player.active_item != ITEM_NONE) {
+        Player *p = &g->player;
+        float bx = 8;                    /* box left */
+        float by = WALL_THICKNESS + 4;   /* just under the HUD heart strip */
+        float bs = 20;                   /* box size */
+        int ready = (p->active_charge >= p->active_max_charge);
+
+        /* Dark framed box */
+        C2D_DrawRectSolid(bx - 1, by - 1, 0, bs + 2, bs + 2,
+                          ready ? C2D_Color32(255, 210, 70, 255)
+                                : C2D_Color32(90, 90, 90, 255));
+        C2D_DrawRectSolid(bx, by, 0, bs, bs, C2D_Color32(24, 20, 28, 235));
+
+        /* Item icon inside */
+        if (g_sprites_loaded) {
+            spr_draw(sheet_ui_items, item_sprite_idx(p->active_item),
+                     bx + bs * 0.5f, by + bs * 0.5f, 0.62f, 0.62f);
+        }
+
+        /* Segmented vertical charge bar down the left edge (Yum-Heart pip style) */
+        int mx = p->active_max_charge;
+        if (mx < 1) mx = 1;
+        if (mx > 6) mx = 6;              /* clamp segment count for HUD sanity */
+        float segGap = 1.0f;
+        float segH = (bs - (mx - 1) * segGap) / (float)mx;
+        for (int si = 0; si < mx; si++) {
+            /* fill from bottom up */
+            int filledFromBottom = p->active_charge;
+            int segIndexFromBottom = mx - 1 - si;
+            u32 sc = (segIndexFromBottom < filledFromBottom)
+                     ? (ready ? C2D_Color32(255, 200, 60, 240)
+                              : C2D_Color32(120, 180, 255, 230))
+                     : C2D_Color32(60, 60, 60, 200);
+            C2D_DrawRectSolid(bx - 4, by + si * (segH + segGap), 0, 3, segH, sc);
+        }
+    }
+
+    /* Challenge: Time Attack / Speed! countdown (top-right, red under 2:00) */
+    if (g->challenge == 3 || g->challenge == 4) {
+        int remain = 20 * 60 * 60 - g->play_time_frames;
+        if (remain < 0) remain = 0;
+        int rsec = remain / 60;
+        char tbuf[16];
+        snprintf(tbuf, sizeof(tbuf), "%d:%02d", rsec / 60, rsec % 60);
+        C2D_Text tt;
+        gtext_parse(&tt, textBuf, tbuf);
+        C2D_TextOptimize(&tt);
+        u32 tcol = (rsec < 120) ? C2D_Color32(255, 60, 60, 255)
+                                : C2D_Color32(255, 230, 160, 255);
+        C2D_DrawText(&tt, C2D_WithColor, TOP_SCREEN_WIDTH - 58, 2, 0,
+                     0.45f, 0.45f, tcol);
     }
 
     /* Floor name and room type */
@@ -6375,7 +10155,8 @@ void render_hud(Game *g, C2D_TextBuf textBuf) {
     C2D_Text floorText, roomText;
     char floorBuf[48], roomBuf[32];
     const char *roomNames[] = { "???", "Start", "Room", "Treasure", "BOSS", "Exit",
-                                "Shop", "Secret", "Curse" };
+                                "Shop", "Secret", "Curse", "DEVIL", "Angel", "Sacrifice",
+                                "Boss Rush", "Arcade", "Library" };
 
     /* Floor display: show loop count in infinite mode */
     if (g->game_mode == MODE_INFINITE && g->infinite_loop > 0) {
@@ -6385,9 +10166,9 @@ void render_hud(Game *g, C2D_TextBuf textBuf) {
         snprintf(floorBuf, sizeof(floorBuf), "%s", fi->name);
     }
     snprintf(roomBuf, sizeof(roomBuf), "%s",
-             r->type < 9 ? roomNames[r->type] : "???");
+             r->type < 15 ? roomNames[r->type] : "???");
 
-    C2D_TextParse(&floorText, textBuf, floorBuf);
+    gtext_parse(&floorText, textBuf, floorBuf);
     C2D_TextOptimize(&floorText);
     C2D_DrawText(&floorText, C2D_WithColor, 155, 3, 0, 0.4f, 0.4f,
                  C2D_Color32(200, 200, 200, 255));
@@ -6396,8 +10177,14 @@ void render_hud(Game *g, C2D_TextBuf textBuf) {
                   (r->type == ROOM_TREASURE) ? COL_TREASURE :
                   (r->type == ROOM_SHOP) ? C2D_Color32(100, 200, 255, 255) :
                   (r->type == ROOM_SECRET) ? C2D_Color32(180, 180, 180, 255) :
-                  (r->type == ROOM_CURSE) ? C2D_Color32(180, 60, 180, 255) : COL_TEXT;
-    C2D_TextParse(&roomText, textBuf, roomBuf);
+                  (r->type == ROOM_CURSE) ? C2D_Color32(180, 60, 180, 255) :
+                  (r->type == ROOM_DEVIL) ? C2D_Color32(220, 30, 30, 255) :
+                  (r->type == ROOM_ANGEL) ? C2D_Color32(255, 245, 200, 255) :
+                  (r->type == ROOM_SACRIFICE) ? C2D_Color32(200, 40, 40, 255) :
+                  (r->type == ROOM_BOSSRUSH) ? C2D_Color32(230, 100, 30, 255) :
+                  (r->type == ROOM_ARCADE) ? C2D_Color32(255, 100, 200, 255) :
+                  (r->type == ROOM_LIBRARY) ? C2D_Color32(140, 100, 220, 255) : COL_TEXT;
+    gtext_parse(&roomText, textBuf, roomBuf);
     C2D_TextOptimize(&roomText);
     C2D_DrawText(&roomText, C2D_WithColor, 230, 3, 0, 0.4f, 0.4f, roomCol);
 
@@ -6418,7 +10205,7 @@ void render_hud(Game *g, C2D_TextBuf textBuf) {
                      diff_labels[g->difficulty < DIFF_COUNT ? g->difficulty : 1]);
         }
         C2D_Text modeText;
-        C2D_TextParse(&modeText, textBuf, mode_buf);
+        gtext_parse(&modeText, textBuf, mode_buf);
         C2D_TextOptimize(&modeText);
         u32 mc = diff_cols[g->difficulty < DIFF_COUNT ? g->difficulty : 1];
         C2D_DrawText(&modeText, C2D_WithColor, TOP_SCREEN_WIDTH - 55, 14, 0,
@@ -6430,7 +10217,7 @@ void render_hud(Game *g, C2D_TextBuf textBuf) {
         C2D_Text itemText;
         char itemBuf[24];
         snprintf(itemBuf, sizeof(itemBuf), "Items:%d", g->player.item_count);
-        C2D_TextParse(&itemText, textBuf, itemBuf);
+        gtext_parse(&itemText, textBuf, itemBuf);
         C2D_TextOptimize(&itemText);
         C2D_DrawText(&itemText, C2D_WithColor, 300, 3, 0, 0.35f, 0.35f,
                      C2D_Color32(180, 180, 255, 255));
@@ -6518,6 +10305,12 @@ void render_hud(Game *g, C2D_TextBuf textBuf) {
                     case ROOM_SHOP:     rmCol = C2D_Color32(80, 150, 220, 220); break;
                     case ROOM_SECRET:   rmCol = C2D_Color32(140, 140, 140, 200); break;
                     case ROOM_CURSE:    rmCol = C2D_Color32(160, 50, 160, 220); break;
+                    case ROOM_DEVIL:    rmCol = C2D_Color32(170, 20, 20, 220); break;
+                    case ROOM_ANGEL:    rmCol = C2D_Color32(230, 220, 170, 220); break;
+                    case ROOM_SACRIFICE: rmCol = C2D_Color32(180, 40, 40, 220); break;
+                    case ROOM_BOSSRUSH: rmCol = C2D_Color32(230, 100, 30, 220); break;
+                    case ROOM_ARCADE:   rmCol = C2D_Color32(230, 90, 180, 220); break;
+                    case ROOM_LIBRARY:  rmCol = C2D_Color32(120, 90, 200, 220); break;
                     default:
                         rmCol = rm->cleared
                               ? C2D_Color32(90, 90, 90, 180)
@@ -6600,25 +10393,9 @@ void render_hud(Game *g, C2D_TextBuf textBuf) {
         if (boss) {
             float barX = TOP_SCREEN_WIDTH / 2.0f;
             float barY = TOP_SCREEN_HEIGHT - 14;
-            float barW = 160.0f;
-            float barH = 8.0f;
             float hpPct = (float)boss->hp / (float)boss->max_hp;
             if (hpPct < 0) hpPct = 0;
             if (hpPct > 1) hpPct = 1;
-
-            /* Bar background (dark) */
-            C2D_DrawRectSolid(barX - barW / 2 - 1, barY - barH / 2 - 1, 0,
-                              barW + 2, barH + 2, C2D_Color32(20, 20, 20, 220));
-
-            /* Bar border */
-            C2D_DrawRectSolid(barX - barW / 2, barY - barH / 2, 0,
-                              barW, barH, C2D_Color32(60, 60, 60, 200));
-
-            /* HP fill with color gradient */
-            u32 hpCol;
-            if (hpPct > 0.6f)      hpCol = C2D_Color32(220, 40, 40, 255);
-            else if (hpPct > 0.3f) hpCol = C2D_Color32(255, 140, 40, 255);
-            else                    hpCol = C2D_Color32(255, 50, 50, 255);
 
             /* Pulsing effect when low */
             float pulse = 1.0f;
@@ -6626,23 +10403,34 @@ void render_hud(Game *g, C2D_TextBuf textBuf) {
                 pulse = 0.8f + sinf(g->frame * 0.2f) * 0.2f;
             }
 
-            C2D_DrawRectSolid(barX - barW / 2, barY - barH / 2, 0,
-                              barW * hpPct * pulse, barH, hpCol);
-
-            /* Highlight on top of bar */
-            C2D_DrawRectSolid(barX - barW / 2, barY - barH / 2, 0,
-                              barW * hpPct * pulse, 2,
-                              C2D_Color32(255, 255, 255, 60));
-
-            /* Boss name text above bar */
-            if (g->boss_name) {
-                C2D_Text bossText;
-                C2D_TextParse(&bossText, textBuf, g->boss_name);
-                C2D_TextOptimize(&bossText);
-                float tw = bossText.width * 0.4f;
-                C2D_DrawText(&bossText, C2D_WithColor,
-                            barX - tw / 2, barY - barH / 2 - 12, 0, 0.4f, 0.4f,
-                            C2D_Color32(255, 220, 220, 255));
+            if (g_sprites_loaded && sheet_ui_items) {
+                /* Rebirth-style framed bar sprite (128x16 art; the interior
+                   trough spans source px x=32..103, rows 7-8). Drawn at
+                   1.5x / 2.0y; fill rects are inset to that interior. */
+                spr_draw(sheet_ui_items, ui_items_atlas_ui_boss_healthbar_idx,
+                         barX, barY, 1.5f, 2.0f);
+                float inX = barX - 48.0f;   /* (32-64)*1.5 */
+                float inW = 108.0f;         /* 72*1.5 */
+                float inY = barY - 2.0f;    /* (7-8)*2 */
+                float inH = 4.0f;           /* 2px*2 */
+                /* Cover the art's baked partial fill with the empty color */
+                C2D_DrawRectSolid(inX, inY, 0, inW, inH,
+                                  C2D_Color32(35, 8, 10, 255));
+                C2D_DrawRectSolid(inX, inY, 0, inW * hpPct * pulse, inH,
+                                  C2D_Color32(220, 30, 30, 255));
+                C2D_DrawRectSolid(inX, inY, 0, inW * hpPct * pulse, 1,
+                                  C2D_Color32(255, 120, 100, 200));
+            } else {
+                /* Procedural fallback bar */
+                float barW = 160.0f;
+                float barH = 8.0f;
+                C2D_DrawRectSolid(barX - barW / 2 - 1, barY - barH / 2 - 1, 0,
+                                  barW + 2, barH + 2, C2D_Color32(20, 20, 20, 220));
+                C2D_DrawRectSolid(barX - barW / 2, barY - barH / 2, 0,
+                                  barW, barH, C2D_Color32(60, 60, 60, 200));
+                C2D_DrawRectSolid(barX - barW / 2, barY - barH / 2, 0,
+                                  barW * hpPct * pulse, barH,
+                                  C2D_Color32(220, 40, 40, 255));
             }
         }
     }
@@ -6665,7 +10453,7 @@ void render_hud(Game *g, C2D_TextBuf textBuf) {
             u8 a = (u8)(nameAlpha * 255);
 
             C2D_Text introText;
-            C2D_TextParse(&introText, textBuf, g->boss_name);
+            gtext_parse(&introText, textBuf, g->boss_name);
             C2D_TextOptimize(&introText);
             float tw = introText.width * 0.7f;
 
@@ -6680,20 +10468,20 @@ void render_hud(Game *g, C2D_TextBuf textBuf) {
         }
     }
 
-    /* Boss death explosion effect */
+    /* Boss death explosion effect: blood-red bursts at the corpse */
     if (g->boss_death_anim > 0) {
         float t = (float)(60 - g->boss_death_anim) / 60.0f;
         int numExplosions = (int)(t * 8);
         for (int ex = 0; ex < numExplosions; ex++) {
             /* Deterministic pseudo-random positions based on frame */
-            float ex_x = TOP_SCREEN_WIDTH / 2.0f + sinf(ex * 2.7f + t * 5.0f) * 80.0f;
-            float ex_y = TOP_SCREEN_HEIGHT / 2.0f + cosf(ex * 3.1f + t * 4.0f) * 50.0f;
+            float ex_x = g->boss_death_x + sinf(ex * 2.7f + t * 5.0f) * 40.0f;
+            float ex_y = g->boss_death_y + cosf(ex * 3.1f + t * 4.0f) * 28.0f;
             float radius = (1.0f - t) * 12.0f + 4.0f;
             u8 alpha = (u8)((1.0f - t) * 200);
             C2D_DrawCircleSolid(ex_x, ex_y, 0, radius,
-                               C2D_Color32(255, 200, 50, alpha));
+                               C2D_Color32(190, 20, 20, alpha));
             C2D_DrawCircleSolid(ex_x, ex_y, 0, radius * 0.6f,
-                               C2D_Color32(255, 255, 200, alpha));
+                               C2D_Color32(255, 80, 50, alpha));
         }
     }
 }
@@ -6702,8 +10490,11 @@ void render_hud(Game *g, C2D_TextBuf textBuf) {
  * Render: Room
  * ================================================================ */
 
-static void render_room(Game *g) {
-    Room *r = current_room(g);
+/* Render one room of the dungeon grid. Parameterized by grid coords so the
+   sliding room transition can draw the outgoing and incoming rooms in the
+   same frame (each under its own C2D view translation). */
+static void render_room_at(Game *g, int room_gx, int room_gy) {
+    Room *r = &g->dungeon.rooms[room_gy][room_gx];
     int fl = g->current_floor;
 
     if (g_sprites_loaded) {
@@ -6712,6 +10503,8 @@ static void render_room(Game *g) {
         /* Floor tiles - pick variant based on room type / floor */
         int floorIdx = environment_atlas_env_floor_clean_idx;
         if (r->type == ROOM_BOSS) floorIdx = environment_atlas_env_floor_bloody_idx;
+        else if (r->type == ROOM_SACRIFICE) floorIdx = environment_atlas_env_floor_bloody_idx;
+        else if (r->type == ROOM_BOSSRUSH) floorIdx = environment_atlas_env_floor_bloody_idx;
         else if (fl >= 2) floorIdx = environment_atlas_env_floor_cracked_idx;
 
         /* Tile the floor with 32x32 sprites */
@@ -6719,6 +10512,76 @@ static void render_room(Game *g) {
             for (float tx = ROOM_LEFT; tx < ROOM_RIGHT; tx += 32) {
                 spr_draw_at(sheet_environment, floorIdx, tx, ty, 1.0f, 1.0f);
             }
+        }
+
+        /* (b) Basement/Cellar warm-brown ambient grade (floors 0 & 1 only) */
+        if (fl == 0 || fl == 1) {
+            C2D_DrawRectSolid(ROOM_LEFT, ROOM_TOP, 0,
+                              ROOM_RIGHT - ROOM_LEFT, ROOM_BOTTOM - ROOM_TOP,
+                              C2D_Color32(110, 75, 40, 26));
+        }
+
+        /* Angel room: soft white/gold glow. Sacrifice room: dim red grade. */
+        if (r->type == ROOM_ANGEL) {
+            C2D_DrawRectSolid(ROOM_LEFT, ROOM_TOP, 0,
+                              ROOM_RIGHT - ROOM_LEFT, ROOM_BOTTOM - ROOM_TOP,
+                              C2D_Color32(255, 245, 200, 40));
+        } else if (r->type == ROOM_SACRIFICE) {
+            C2D_DrawRectSolid(ROOM_LEFT, ROOM_TOP, 0,
+                              ROOM_RIGHT - ROOM_LEFT, ROOM_BOTTOM - ROOM_TOP,
+                              C2D_Color32(120, 20, 20, 40));
+        } else if (r->type == ROOM_BOSSRUSH) {
+            C2D_DrawRectSolid(ROOM_LEFT, ROOM_TOP, 0,
+                              ROOM_RIGHT - ROOM_LEFT, ROOM_BOTTOM - ROOM_TOP,
+                              C2D_Color32(200, 90, 20, 40));
+        } else if (r->type == ROOM_ARCADE) {
+            C2D_DrawRectSolid(ROOM_LEFT, ROOM_TOP, 0,
+                              ROOM_RIGHT - ROOM_LEFT, ROOM_BOTTOM - ROOM_TOP,
+                              C2D_Color32(255, 100, 200, 35));
+        } else if (r->type == ROOM_LIBRARY) {
+            C2D_DrawRectSolid(ROOM_LEFT, ROOM_TOP, 0,
+                              ROOM_RIGHT - ROOM_LEFT, ROOM_BOTTOM - ROOM_TOP,
+                              C2D_Color32(140, 100, 220, 35));
+        }
+
+        /* (c) Grout grid: faint darker lines every 32px over the floor,
+           clipped to the play rect so tiles don't read as one flat sheet. */
+        {
+            u32 groutCol = C2D_Color32(0, 0, 0, 40);
+            for (float gx = ROOM_LEFT + 32; gx < ROOM_RIGHT; gx += 32)
+                C2D_DrawRectSolid(gx, ROOM_TOP, 0, 1, ROOM_BOTTOM - ROOM_TOP, groutCol);
+            for (float gy = ROOM_TOP + 32; gy < ROOM_BOTTOM; gy += 32)
+                C2D_DrawRectSolid(ROOM_LEFT, gy, 0, ROOM_RIGHT - ROOM_LEFT, 1, groutCol);
+        }
+
+        /* Permanent blood stains — drawn right on top of the floor tiles,
+           under everything else. Rooms stay gory between visits. */
+        if (sheet_bullets) {
+            for (int bdi = 0; bdi < MAX_BLOOD_DECALS; bdi++) {
+                BloodDecal *bd = &r->decals[bdi];
+                if (!bd->active) continue;
+                spr_draw_rotated_alpha(sheet_bullets, bd->sprite_idx,
+                                       bd->x, bd->y, bd->scale, bd->scale,
+                                       bd->rotation, 0.75f);
+            }
+        }
+
+        /* Damaging creep puddles: dark rim + brighter core, fading out over
+           the last second. Hardcoded red for now (Gish tar / champion blood);
+           parameterize with a CreepTile color field when green Pestilence
+           creep lands. */
+        for (int ci = 0; ci < MAX_CREEP; ci++) {
+            CreepTile *cr = &g->creep[ci];
+            if (!cr->active) continue;
+            float ca = (float)cr->timer / 60.0f;
+            if (ca > 1.0f) ca = 1.0f;
+            float crr = cr->radius;
+            C2D_DrawEllipseSolid(cr->x - crr, cr->y - crr * 0.6f, 0,
+                                 crr * 2.0f, crr * 1.2f,
+                                 C2D_Color32(110, 12, 12, (u8)(ca * 150)));
+            C2D_DrawEllipseSolid(cr->x - crr * 0.65f, cr->y - crr * 0.4f, 0,
+                                 crr * 1.3f, crr * 0.8f,
+                                 C2D_Color32(190, 30, 25, (u8)(ca * 160)));
         }
 
         /* Walls - continuous directional wall tiles (64x24 horiz, 24x64 vert) */
@@ -6749,11 +10612,25 @@ static void render_room(Game *g) {
         spr_draw_at(sheet_environment, environment_atlas_env_corner_br_idx,
                     ROOM_RIGHT, ROOM_BOTTOM, 1.0f, 1.0f);
 
+        /* (d) Wall bevel: 2px darker inner lip along the inside edge of the
+           four walls to fake a recessed stone frame. */
+        {
+            u32 bevelCol = C2D_Color32(0, 0, 0, 120);
+            C2D_DrawRectSolid(ROOM_LEFT, ROOM_TOP, 0,
+                              ROOM_RIGHT - ROOM_LEFT, 2, bevelCol);          /* top */
+            C2D_DrawRectSolid(ROOM_LEFT, ROOM_BOTTOM - 2, 0,
+                              ROOM_RIGHT - ROOM_LEFT, 2, bevelCol);          /* bottom */
+            C2D_DrawRectSolid(ROOM_LEFT, ROOM_TOP, 0,
+                              2, ROOM_BOTTOM - ROOM_TOP, bevelCol);          /* left */
+            C2D_DrawRectSolid(ROOM_RIGHT - 2, ROOM_TOP, 0,
+                              2, ROOM_BOTTOM - ROOM_TOP, bevelCol);          /* right */
+        }
+
         /* ── Doors ── sprite-based rendering with full type variants ── */
         float midX = (ROOM_LEFT + ROOM_RIGHT) / 2.0f;
         float midY = (ROOM_TOP + ROOM_BOTTOM) / 2.0f;
         Dungeon *dd = &g->dungeon;
-        int rx = dd->cur_x, ry = dd->cur_y;
+        int rx = room_gx, ry = room_gy;
 
         /* Door sprite indices per direction:
          * [0]=normal/open, [1]=treasure/locked, [2]=boss, [3]=closed,
@@ -6816,28 +10693,89 @@ static void render_room(Game *g) {
             if (!r->cleared && !r->door_locked[di] && r->door_type[di] == 0) {
                 /* Normal door, room not cleared => closed/barred */
                 spr_variant = 3; /* closed */
-            } else if (r->door_locked[di] || neighbor_type == ROOM_TREASURE) {
-                spr_variant = 1; /* treasure/locked (gold with lock) */
-            } else if (neighbor_type == ROOM_BOSS) {
-                spr_variant = 2; /* boss (red with skull) */
+            } else if (neighbor_type == ROOM_BOSS ||
+                       neighbor_type == ROOM_DEVIL || r->door_type[di] == 5) {
+                spr_variant = 2; /* boss/devil (red with skull) */
             } else if (neighbor_type == ROOM_CURSE || r->door_type[di] == 4) {
                 spr_variant = 4; /* curse (purple with spikes) */
             } else if (neighbor_type == ROOM_SHOP) {
                 spr_variant = 5; /* shop (blue with coin) */
+            } else if (r->door_locked[di] || neighbor_type == ROOM_TREASURE ||
+                       neighbor_type == ROOM_ANGEL || r->door_type[di] == 6) {
+                spr_variant = 1; /* treasure/locked (gold with lock) -- also angel (white/gold) */
+            } else if (neighbor_type == ROOM_BOSSRUSH) {
+                spr_variant = 2; /* boss rush door (reuse boss/devil red) */
+            } else if (neighbor_type == ROOM_ARCADE || neighbor_type == ROOM_LIBRARY) {
+                spr_variant = 5; /* arcade/library door (reuse shop blue) */
             } else {
                 spr_variant = 0; /* normal/open */
             }
 
             spr_draw_at(sheet_environment, door_spr_arr[di][spr_variant],
                        door_pos[di][0], door_pos[di][1], 1.0f, 1.0f);
+
+            /* Door center + covered wall rect (for identity overlays) */
+            float dcx = door_pos[di][0] + DOOR_WIDTH / 2.0f;
+            float dcy = door_pos[di][1] + WALL_THICKNESS / 2.0f;
+            float drw = DOOR_WIDTH, drh = WALL_THICKNESS;
+            if (di >= 2) { /* left/right doors: center on vertical span */
+                dcx = door_pos[di][0] + WALL_THICKNESS / 2.0f;
+                dcy = door_pos[di][1] + DOOR_WIDTH / 2.0f;
+                drw = WALL_THICKNESS; drh = DOOR_WIDTH;
+            }
+            float dpulse = sinf((float)g->frame * 0.08f) * 0.35f + 0.65f;
+
+            if (neighbor_type == ROOM_DEVIL) {
+                /* Devil door: near-black wash + deep-red sigil */
+                C2D_DrawRectSolid(door_pos[di][0], door_pos[di][1], 0, drw, drh,
+                                  C2D_Color32(10, 4, 8, 180));
+                C2D_DrawCircleSolid(dcx, dcy, 0, 9.0f,
+                                    C2D_Color32(140, 5, 20, (int)(dpulse * 130)));
+                C2D_DrawCircleSolid(dcx, dcy, 0, 5.0f,
+                                    C2D_Color32(200, 20, 30, (int)(dpulse * 170)));
+            } else if (neighbor_type == ROOM_ANGEL) {
+                /* Angel door: white wash + soft yellow glow */
+                C2D_DrawRectSolid(door_pos[di][0], door_pos[di][1], 0, drw, drh,
+                                  C2D_Color32(255, 255, 255, 128));
+                C2D_DrawCircleSolid(dcx, dcy, 0, 12.0f,
+                                    C2D_Color32(255, 240, 150, (int)(dpulse * 60)));
+                C2D_DrawCircleSolid(dcx, dcy, 0, 6.0f,
+                                    C2D_Color32(255, 250, 200, (int)(dpulse * 100)));
+            } else if (spr_variant == 2) {
+                /* (e) Boss-door sigil: pulsing red glow at door center */
+                C2D_DrawCircleSolid(dcx, dcy, 0, 9.0f,
+                                    C2D_Color32(220, 30, 30, (int)(dpulse * 70)));
+                C2D_DrawCircleSolid(dcx, dcy, 0, 5.0f,
+                                    C2D_Color32(255, 80, 60, (int)(dpulse * 110)));
+            }
         }
 
         /* Obstacles - use rock sprite */
         for (int i = 0; i < r->obstacle_count; i++) {
             Obstacle *o = &r->obstacles[i];
             if (!o->active) continue;
-            spr_draw(sheet_environment, environment_atlas_env_rock_idx,
-                     o->x, o->y, OBSTACLE_SIZE / 32.0f, OBSTACLE_SIZE / 32.0f);
+            /* Grounding drop shadow (rocks/poop sit on the floor; spikes are flush) */
+            if (o->type != OBST_SPIKES)
+                C2D_DrawEllipseSolid(o->x - OBSTACLE_SIZE * 0.55f, o->y + OBSTACLE_SIZE * 0.35f, 0,
+                                     OBSTACLE_SIZE * 1.1f, OBSTACLE_SIZE * 0.4f,
+                                     C2D_Color32(0, 0, 0, 70));
+            int oidx = environment_atlas_env_rock_idx;
+            float osc = OBSTACLE_SIZE / 32.0f;
+            if (o->type == OBST_POOP) {
+                oidx = (o->hp >= 3) ? environment_atlas_env_poop_1_idx
+                     : (o->hp == 2) ? environment_atlas_env_poop_2_idx
+                                    : environment_atlas_env_poop_3_idx;
+                osc = OBSTACLE_SIZE / 16.0f;   /* poop/spike art is 16x16 */
+            } else if (o->type == OBST_SPIKES) {
+                oidx = environment_atlas_env_spikes_idx;
+                osc = OBSTACLE_SIZE / 16.0f;
+            } else if (o->type == OBST_SLOT_MACHINE) {
+                /* No dedicated slot-machine sprite yet: reuse the gold chest
+                   art so it reads as a distinct paid interactable. */
+                oidx = environment_atlas_env_chest_gold_idx;
+                osc = OBSTACLE_SIZE / 16.0f;
+            }
+            spr_draw(sheet_environment, oidx, o->x, o->y, osc, osc);
         }
 
         /* Pedestal */
@@ -6855,27 +10793,29 @@ static void render_room(Game *g) {
             u32 glowInner = C2D_Color32(255, 255, 200, (int)(pulse * 80));
             C2D_DrawCircleSolid(px, py, 0, 18, glowInner);
 
-            /* Light rays (4 rotating lines as thin rects) */
-            float rayAng = t * 0.03f;
-            u32 rayCol = C2D_Color32(255, 255, 200, (int)(pulse * 35));
-            for (int ri = 0; ri < 4; ri++) {
-                float a = rayAng + ri * (3.14159f / 4.0f);
-                float dx = cosf(a) * 22.0f;
-                float dy = sinf(a) * 22.0f;
-                C2D_DrawLine(px - dx, py - dy, rayCol, px + dx, py + dy, rayCol, 1.5f, 0);
+            /* Sparkle glints: 1-2 white crosses that blink for 2 frames
+               every ~40, offset phases (Rebirth pedestal shimmer) */
+            for (int si = 0; si < 2; si++) {
+                int phase = ((int)t + si * 23) % 40;
+                if (phase < 2) {
+                    float sxp = px + (si ? -10.0f : 8.0f);
+                    float syp = py + (si ? -2.0f : -14.0f);
+                    u32 spc = C2D_Color32(255, 255, 255, 230);
+                    C2D_DrawRectSolid(sxp - 3.0f, syp - 0.5f, 0, 6, 1, spc);
+                    C2D_DrawRectSolid(sxp - 0.5f, syp - 3.0f, 0, 1, 6, spc);
+                }
             }
 
             /* Pedestal base - use ui_item_pickup sprite */
             spr_draw(sheet_ui_items, ui_items_atlas_ui_item_pickup_idx,
                      px, py + 5, 1.0f, 1.0f);
 
-            /* Bobbing item sprite (or "?" if Curse of the Blind) */
-            float bob = sinf(t * 0.06f) * 3.0f;
+            /* Item sits still on its pedestal (no bob), subtle scale pulse */
             float scPulse = 1.0f + sinf(t * 0.08f) * 0.05f;
             if (g->active_curse == CURSE_BLIND) {
                 /* Draw a question mark instead */
                 float qx = px;
-                float qy = py - 6 + bob;
+                float qy = py - 6;
                 C2D_DrawCircleSolid(qx, qy, 0, 8,
                                     C2D_Color32(255, 255, 200, 230));
                 C2D_DrawCircleSolid(qx, qy, 0, 6,
@@ -6893,7 +10833,7 @@ static void render_room(Game *g) {
                                   C2D_Color32(255, 255, 200, 255));
             } else {
                 int itemIdx = item_sprite_idx(r->pedestal.item);
-                spr_draw(sheet_ui_items, itemIdx, px, py - 6 + bob, scPulse, scPulse);
+                spr_draw(sheet_ui_items, itemIdx, px, py - 6, scPulse, scPulse);
             }
         }
 
@@ -6912,11 +10852,20 @@ static void render_room(Game *g) {
                 heart_idx = ui_items_atlas_heart_red_full_idx;
             } else if (h->type == HEART_RED_HALF) {
                 heart_idx = ui_items_atlas_heart_red_half_idx;
+            } else if (h->type == HEART_BLACK) {
+                heart_idx = ui_items_atlas_heart_black_full_idx;   /* E5 */
             } else {
                 heart_idx = ui_items_atlas_heart_soul_full_idx;
             }
             
-            spr_draw(sheet_ui_items, heart_idx, h->x, h->y + bob_offset, 1.0f, 1.0f);
+            /* Grounding shadow so the bobbing heart doesn't float */
+            C2D_DrawEllipseSolid(h->x - 5, h->y + 6, 0, 10, 3,
+                                 C2D_Color32(0, 0, 0, 70));
+            /* Heartbeat pulse: sharp cubed-sine thump instead of a bob */
+            float hb = sinf((float)h->anim_timer * 0.1f);
+            float hbs = 1.0f + 0.10f * ((hb > 0.0f) ? hb * hb * hb : 0.0f);
+            spr_draw(sheet_ui_items, heart_idx, h->x, h->y + bob_offset * 0.3f,
+                     hbs, hbs);
         }
 
         /* Consumable pickups (bombs, keys, coins, pills, cards) */
@@ -6925,15 +10874,39 @@ static void render_room(Game *g) {
             if (!c->active) continue;
             c->anim_timer++;
             float bob_off = sinf((float)c->anim_timer * CONSUMABLE_BOB_SPEED) * CONSUMABLE_BOB_AMP;
+            /* Grounding shadow under every pickup */
+            C2D_DrawEllipseSolid(c->x - 5, c->y + 5, 0, 10, 3,
+                                 C2D_Color32(0, 0, 0, 70));
+            /* Chests: grounded (no bob), drawn from the environment atlas */
+            if (c->type == PICKUP_CHEST || c->type == PICKUP_CHEST_GOLD) {
+                int chIdx = (c->type == PICKUP_CHEST_GOLD)
+                          ? environment_atlas_env_chest_gold_idx
+                          : environment_atlas_env_chest_wood_idx;
+                spr_draw(sheet_environment, chIdx, c->x, c->y, 1.2f, 1.2f);
+                continue;
+            }
+            if (c->type == PICKUP_TRINKET) {
+                /* grounding shadow + bobbing charm */
+                C2D_DrawEllipseSolid(c->x - 5, c->y + 6, 0, 10, 3,
+                                     C2D_Color32(0, 0, 0, 70));
+                draw_trinket_icon(c->x, c->y + bob_off, c->sub_type, 1.0f);
+                continue;
+            }
             /* Pills and cards drawn as colored shapes (no atlas yet) */
             if (c->type == PICKUP_PILL) {
-                /* Pill: two-tone capsule. Color from scrambled map per run */
-                static const u32 pcols[12] = {
-                    0xFFFFFFFF, 0xFFD05050, 0xFF5070E0, 0xFF50C870, 0xFFE0E060,
-                    0xFFE060C0, 0xFFE08020, 0xFF8050E0, 0xFF40D0D0, 0xFFA0A0A0,
-                    0xFFB05858, 0xFFE0E0E0
+                /* Pill: two-tone capsule. Color from scrambled map per run.
+                   Order matches pill_color_names[] exactly so the pickup
+                   message always names the color actually drawn. */
+                static const u32 pcols[PILL_EFFECT_COUNT] = {
+                    0xFF5050D0, /* red */     0xFFE07050, /* blue */
+                    0xFF60E0E0, /* yellow */  0xFF70C850, /* green */
+                    0xFF2080E0, /* orange */  0xFFC0A0F0, /* pink */
+                    0xFFFFFFFF, /* white */   0xFF303030, /* black */
+                    0xFFE05080, /* purple */  0xFFD0D040, /* cyan */
+                    0xFF3060A0, /* brown */   0xFFA0A0A0, /* grey */
+                    0xFFE040E0  /* magenta */
                 };
-                int colidx = g->pill_color_map[c->sub_type % PILL_EFFECT_COUNT] % 12;
+                int colidx = g->pill_color_map[c->sub_type % PILL_EFFECT_COUNT] % PILL_EFFECT_COUNT;
                 u32 col = pcols[colidx];
                 float cy = c->y + bob_off;
                 C2D_DrawRectSolid(c->x - 6, cy - 3, 0, 6, 6, col);
@@ -6948,15 +10921,35 @@ static void render_room(Game *g) {
                 C2D_DrawRectSolid(c->x - 1, cy - 4, 0, 2, 6, 0xFF606060);
                 continue;
             }
+            if (c->type == PICKUP_BATTERY) {
+                /* Battery: small green rect */
+                float by = c->y + bob_off;
+                C2D_DrawRectSolid(c->x - 4, by - 6, 0, 8, 12, 0xFF208020);
+                C2D_DrawRectSolid(c->x - 2, by - 8, 0, 4, 2, 0xFF60E060);
+                continue;
+            }
             int cidx;
             switch (c->type) {
                 case PICKUP_BOMB:  case PICKUP_BOMB2: cidx = ui_items_atlas_item_bomb_idx; break;
-                case PICKUP_KEY:   cidx = ui_items_atlas_item_key_idx; break;
+                case PICKUP_KEY:   case PICKUP_KEY5:  cidx = ui_items_atlas_item_key_idx; break;
                 case PICKUP_COIN:  case PICKUP_COIN5: cidx = ui_items_atlas_item_coin_idx; break;
                 default: cidx = ui_items_atlas_item_coin_idx; break;
             }
-            float csc = (c->type == PICKUP_COIN5 || c->type == PICKUP_BOMB2) ? 1.2f : 0.9f;
-            spr_draw(sheet_ui_items, cidx, c->x, c->y + bob_off, csc, csc);
+            float csc = (c->type == PICKUP_COIN5 || c->type == PICKUP_BOMB2 ||
+                         c->type == PICKUP_KEY5) ? 1.2f : 0.9f;
+            if (c->type == PICKUP_COIN || c->type == PICKUP_COIN5) {
+                /* Fake Y-axis spin: width follows cos, mirrored on the
+                   far side of the turn; keys/bombs keep the plain bob */
+                float spin = cosf((float)c->anim_timer * 0.15f);
+                float sw = csc * fabsf(spin);
+                if (sw < 0.15f) sw = 0.15f;   /* never vanish edge-on */
+                if (spin < 0)
+                    spr_draw_fliph(sheet_ui_items, cidx, c->x, c->y + bob_off, sw, csc);
+                else
+                    spr_draw(sheet_ui_items, cidx, c->x, c->y + bob_off, sw, csc);
+            } else {
+                spr_draw(sheet_ui_items, cidx, c->x, c->y + bob_off, csc, csc);
+            }
         }
 
         /* Shop items (item on pedestal + price, or sold-out indicator) */
@@ -6970,9 +10963,12 @@ static void render_room(Game *g) {
                          si->x, si->y + 5, 0.8f, 0.8f);
                 /* Item bobbing on pedestal */
                 spr_draw(sheet_ui_items, sIdx, si->x, si->y - 4 + bob_s, 0.9f, 0.9f);
-                /* Price tag: coin icon + number drawn via render_shop_prices */
-                spr_draw(sheet_ui_items, ui_items_atlas_item_coin_idx,
-                         si->x - 8, si->y + 16, 0.5f, 0.5f);
+                /* Price tag: coin icon + number drawn via render_shop_prices
+                   (devil rooms show heart prices instead of coins) */
+                if (r->type != ROOM_DEVIL) {
+                    spr_draw(sheet_ui_items, ui_items_atlas_item_coin_idx,
+                             si->x - 8, si->y + 16, 0.5f, 0.5f);
+                }
             } else {
                 /* Sold-out: dim empty pedestal */
                 spr_draw(sheet_ui_items, ui_items_atlas_ui_item_pickup_idx,
@@ -6983,16 +10979,18 @@ static void render_room(Game *g) {
             }
         }
 
-        /* Active bomb (flashing before explosion) */
-        if (g->bomb_timer > 0) {
-            int flash = (g->bomb_flash / 4) % 2;
+        /* Active bombs (flashing before explosion) */
+        for (int bi = 0; bi < MAX_BOMBS; bi++) {
+            ActiveBomb *b = &g->bombs[bi];
+            if (!b->active) continue;
+            int flash = (b->flash / 4) % 2;
             float bsc = 1.0f + (flash ? 0.15f : 0.0f);
             spr_draw(sheet_ui_items, ui_items_atlas_item_bomb_idx,
-                     g->bomb_x, g->bomb_y, bsc, bsc);
+                     b->x, b->y, bsc, bsc);
             /* Warning circle when close to exploding */
-            if (g->bomb_timer < 30) {
+            if (b->timer < 30) {
                 u32 warnCol = C2D_Color32(255, 100, 50, (int)(80 + flash * 60));
-                C2D_DrawCircleSolid(g->bomb_x, g->bomb_y, 0, 48.0f * (1.0f - (float)g->bomb_timer / 30.0f), warnCol);
+                C2D_DrawCircleSolid(b->x, b->y, 0, 48.0f * (1.0f - (float)b->timer / 30.0f), warnCol);
             }
         }
 
@@ -7003,6 +11001,19 @@ static void render_room(Game *g) {
             float pulse = sinf((float)g->frame * 0.08f) * 0.15f + 1.0f;
             spr_draw(sheet_environment, environment_atlas_env_trapdoor_idx,
                      cx, cy, pulse, pulse);
+        }
+
+        /* E2: end-run "beam of light" (Ending 1) beside the trapdoor */
+        if (r->has_ending_beam) {
+            float ebx = (ROOM_LEFT + ROOM_RIGHT) / 2.0f + 60.0f;
+            float eby = (ROOM_TOP + ROOM_BOTTOM) / 2.0f;
+            float bp = 0.75f + 0.25f * sinf((float)g->frame * 0.08f);
+            C2D_DrawRectSolid(ebx - 10, ROOM_TOP, 0, 20, eby - ROOM_TOP,
+                              C2D_Color32(255, 250, 210, (int)(60 * bp)));
+            C2D_DrawCircleSolid(ebx, eby, 0, 16,
+                                C2D_Color32(255, 250, 210, (int)(120 * bp)));
+            C2D_DrawCircleSolid(ebx, eby, 0, 9,
+                                C2D_Color32(255, 255, 240, 230));
         }
 
     } else {
@@ -7019,6 +11030,12 @@ static void render_room(Game *g) {
         else if (r->type == ROOM_SHOP) floorCol = C2D_Color32(90, 120, 140, 255);
         else if (r->type == ROOM_SECRET) floorCol = C2D_Color32(100, 100, 100, 255);
         else if (r->type == ROOM_CURSE) floorCol = C2D_Color32(110, 60, 90, 255);
+        else if (r->type == ROOM_DEVIL) floorCol = C2D_Color32(90, 30, 30, 255);
+        else if (r->type == ROOM_ANGEL) floorCol = C2D_Color32(200, 190, 150, 255);
+        else if (r->type == ROOM_SACRIFICE) floorCol = C2D_Color32(100, 40, 40, 255);
+        else if (r->type == ROOM_BOSSRUSH) floorCol = C2D_Color32(150, 70, 20, 255);
+        else if (r->type == ROOM_ARCADE) floorCol = C2D_Color32(150, 70, 120, 255);
+        else if (r->type == ROOM_LIBRARY) floorCol = C2D_Color32(90, 70, 130, 255);
 
         u32 wallCol = COL_WALL;
         if (fl >= 2 && fl <= 3) wallCol = C2D_Color32(70, 70, 80, 255);
@@ -7048,7 +11065,7 @@ static void render_room(Game *g) {
         float midX = (ROOM_LEFT + ROOM_RIGHT) / 2.0f;
         float midY = (ROOM_TOP + ROOM_BOTTOM) / 2.0f;
         Dungeon *dd_fb = &g->dungeon;
-        int rx_fb = dd_fb->cur_x, ry_fb = dd_fb->cur_y;
+        int rx_fb = room_gx, ry_fb = room_gy;
         int fb_dxs[] = {0, 0, -1, 1};
         int fb_dys[] = {-1, 1, 0, 0};
         for (int di = 0; di < 4; di++) {
@@ -7064,12 +11081,22 @@ static void render_room(Game *g) {
                     ntype = dd_fb->rooms[nny][nnx].type;
                 if (ntype == ROOM_TREASURE)
                     doorCol = C2D_Color32(220, 180, 50, 255);  /* gold/yellow */
-                else if (ntype == ROOM_BOSS)
+                else if (ntype == ROOM_BOSS || ntype == ROOM_DEVIL)
                     doorCol = C2D_Color32(200, 60, 60, 255);   /* red */
                 else if (ntype == ROOM_CURSE)
                     doorCol = C2D_Color32(160, 50, 140, 255);  /* purple */
                 else if (ntype == ROOM_SHOP)
                     doorCol = C2D_Color32(60, 180, 60, 255);   /* green */
+                else if (ntype == ROOM_ANGEL)
+                    doorCol = C2D_Color32(255, 245, 200, 255); /* white/gold */
+                else if (ntype == ROOM_SACRIFICE)
+                    doorCol = C2D_Color32(180, 40, 40, 255);   /* dark red */
+                else if (ntype == ROOM_BOSSRUSH)
+                    doorCol = C2D_Color32(230, 100, 30, 255);  /* orange */
+                else if (ntype == ROOM_ARCADE)
+                    doorCol = C2D_Color32(255, 100, 200, 255); /* pink */
+                else if (ntype == ROOM_LIBRARY)
+                    doorCol = C2D_Color32(140, 100, 220, 255); /* purple */
                 else
                     doorCol = COL_DOOR;
             }
@@ -7151,13 +11178,20 @@ static void render_room(Game *g) {
                 C2D_DrawRectSolid(c->x - 5, c->y + bob_off - 7, 0, 10, 14, 0xFFFFFFFF);
                 continue;
             }
+            if (c->type == PICKUP_BATTERY) {
+                /* Battery: small green rect */
+                C2D_DrawRectSolid(c->x - 4, c->y + bob_off - 6, 0, 8, 12, 0xFF208020);
+                C2D_DrawRectSolid(c->x - 2, c->y + bob_off - 8, 0, 4, 2, 0xFF60E060);
+                continue;
+            }
             u32 ccol;
             switch (c->type) {
                 case PICKUP_BOMB:  case PICKUP_BOMB2: ccol = C2D_Color32(80, 80, 80, 255); break;
-                case PICKUP_KEY:   ccol = C2D_Color32(255, 215, 0, 255); break;
+                case PICKUP_KEY:   case PICKUP_KEY5:  ccol = C2D_Color32(255, 215, 0, 255); break;
                 default:           ccol = C2D_Color32(255, 200, 50, 255); break;
             }
-            float csz = (c->type == PICKUP_COIN5 || c->type == PICKUP_BOMB2) ? 7 : 5;
+            float csz = (c->type == PICKUP_COIN5 || c->type == PICKUP_BOMB2 ||
+                         c->type == PICKUP_KEY5) ? 7 : 5;
             C2D_DrawCircleSolid(c->x, c->y + bob_off, 0, csz, ccol);
         }
 
@@ -7187,11 +11221,13 @@ static void render_room(Game *g) {
             }
         }
 
-        /* Active bomb (fallback) */
-        if (g->bomb_timer > 0) {
-            int flash = (g->bomb_flash / 4) % 2;
+        /* Active bombs (fallback) */
+        for (int bi = 0; bi < MAX_BOMBS; bi++) {
+            ActiveBomb *b = &g->bombs[bi];
+            if (!b->active) continue;
+            int flash = (b->flash / 4) % 2;
             u32 bc = flash ? C2D_Color32(255, 100, 50, 255) : C2D_Color32(80, 80, 80, 255);
-            C2D_DrawCircleSolid(g->bomb_x, g->bomb_y, 0, 8, bc);
+            C2D_DrawCircleSolid(b->x, b->y, 0, 8, bc);
         }
 
         /* Trapdoor */
@@ -7202,6 +11238,19 @@ static void render_room(Game *g) {
             C2D_DrawCircleSolid(cx, cy, 0, 12, C2D_Color32(20, 15, 10, 255));
             C2D_DrawCircleSolid(cx, cy, 0, 6, C2D_Color32(0, 0, 0, 255));
         }
+
+        /* E2: end-run "beam of light" (Ending 1), procedural fallback */
+        if (r->has_ending_beam) {
+            float ebx = (ROOM_LEFT + ROOM_RIGHT) / 2.0f + 60.0f;
+            float eby = (ROOM_TOP + ROOM_BOTTOM) / 2.0f;
+            float bp = 0.75f + 0.25f * sinf((float)g->frame * 0.08f);
+            C2D_DrawRectSolid(ebx - 10, ROOM_TOP, 0, 20, eby - ROOM_TOP,
+                              C2D_Color32(255, 250, 210, (int)(60 * bp)));
+            C2D_DrawCircleSolid(ebx, eby, 0, 16,
+                                C2D_Color32(255, 250, 210, (int)(120 * bp)));
+            C2D_DrawCircleSolid(ebx, eby, 0, 9,
+                                C2D_Color32(255, 255, 240, 230));
+        }
     }
 }
 
@@ -7209,12 +11258,26 @@ static void render_room(Game *g) {
  * Render: Game objects
  * ================================================================ */
 
+/* Render the room the player is currently in */
+static void render_room(Game *g) {
+    render_room_at(g, g->dungeon.cur_x, g->dungeon.cur_y);
+}
+
 static void render_player(Game *g) {
     Player *p = &g->player;
 
     /* Shadow under player */
     C2D_DrawEllipseSolid(p->x - PLAYER_SIZE, p->y + PLAYER_SIZE * 0.4f, 0,
                          PLAYER_SIZE * 2, PLAYER_SIZE * 0.6f, COL_SHADOW);
+
+    /* D1 Brimstone charge-up: dark red glow that tightens and deepens as the
+       charge builds. Smooth ease, no strobing (photosensitivity-safe). */
+    if (g->laser_charge > 0) {
+        float cf = (float)g->laser_charge / 15.0f;
+        if (cf > 1.0f) cf = 1.0f;
+        C2D_DrawCircleSolid(p->x, p->y, 0, PLAYER_SIZE + 7.0f - cf * 4.0f,
+                            C2D_Color32(200, 30, 30, (int)(30 + cf * 70)));
+    }
 
     /* Blink during iframes - faster blink for better feedback */
     if (p->iframes > 0 && (p->iframes / 3) % 2 == 0) return;
@@ -7250,13 +11313,23 @@ static void render_player(Game *g) {
             idx = player_sprite_idx(dir, frame);
         }
 
-        if (p->iframes > 0) {
-            /* Tint red when hurt - intensity scales with how recent the hit was */
-            float intensity = (float)p->iframes / (float)PLAYER_IFRAMES;
-            spr_draw_tinted(sheet_sprites, idx, p->x, p->y, scale, scale,
-                           C2D_Color32(255, 60, 60, 255), 0.3f + intensity * 0.5f);
+        /* Game-feel walk-bob: gentle vertical bounce while moving (idle: none) */
+        float bob = p->moving ? fabsf(sinf(p->anim_timer * 0.35f)) * 2.0f : 0.0f;
+        float draw_y = p->y - bob;
+
+        if (p->iframes > PLAYER_IFRAMES - 8) {
+            /* Red hurt tint only for the first 8 frames of the iframe
+               window; after that the blink alone reads as invulnerable */
+            float intensity = (float)(p->iframes - (PLAYER_IFRAMES - 8)) / 8.0f;
+            spr_draw_tinted(sheet_sprites, idx, p->x, draw_y, scale, scale,
+                           C2D_Color32(255, 60, 60, 255), 0.4f + intensity * 0.4f);
+        } else if (p->character != CHAR_ISAAC) {
+            /* Character identity tint (??? reads paler blue, stronger) */
+            float ti = (p->character == CHAR_BLUE_BABY) ? 0.45f : 0.30f;
+            spr_draw_tinted(sheet_sprites, idx, p->x, draw_y, scale, scale,
+                           character_tint(p->character), ti);
         } else {
-            spr_draw(sheet_sprites, idx, p->x, p->y, scale, scale);
+            spr_draw(sheet_sprites, idx, p->x, draw_y, scale, scale);
         }
 
         /* Item aura effects (procedural overlays) */
@@ -7287,6 +11360,136 @@ static void render_player(Game *g) {
             C2D_DrawCircleSolid(p->x, p->y, 0, PLAYER_SIZE + 2,
                                C2D_Color32(255, 255, 255, 30));
         }
+    }
+}
+
+/* D1/D2: layered beam from the player to the (possibly bent) endpoint.
+ * Photosensitivity-safe: constant intensity with a smooth ease-out fade on
+ * the final frames — never a strobe. */
+static void render_laser(Game *g) {
+    if (!g->laser_active) return;
+    Player *p = &g->player;
+    float ox = p->x;
+    float oy = p->y - PLAYER_SIZE * 0.3f;
+    float ex = g->laser_ex, ey = g->laser_ey;
+    float fade = 1.0f;
+    if (!g->laser_is_tech && g->laser_timer < 4)
+        fade = (float)g->laser_timer / 4.0f;   /* Brimstone tail ease-out */
+    int a = (int)(255.0f * fade);
+
+    if (g->laser_is_tech) {
+        /* Technology: thin tech beam — red sheath, 1px white core */
+        u32 outer = C2D_Color32(220, 40, 40, (int)(200.0f * fade));
+        u32 core  = C2D_Color32(255, 255, 255, a);
+        C2D_DrawLine(ox, oy, outer, ex, ey, outer, 3.0f, 0);
+        C2D_DrawLine(ox, oy, core,  ex, ey, core,  1.0f, 0);
+    } else {
+        /* Brimstone: dark red 8px + red 4px + white 2px core */
+        u32 dark = C2D_Color32(120, 10, 10, a);
+        u32 red  = C2D_Color32(220, 30, 30, a);
+        u32 core = C2D_Color32(255, 240, 240, a);
+        C2D_DrawLine(ox, oy, dark, ex, ey, dark, 8.0f, 0);
+        C2D_DrawLine(ox, oy, red,  ex, ey, red,  4.0f, 0);
+        C2D_DrawLine(ox, oy, core, ex, ey, core, 2.0f, 0);
+        /* Impact splash where the beam terminates */
+        C2D_DrawCircleSolid(ex, ey, 0, 6.0f * fade, red);
+        C2D_DrawCircleSolid(ex, ey, 0, 3.0f * fade, core);
+    }
+}
+
+/* E3 (Satan): enemy Brimstone beam. Telegraph = deterministic thin red
+ * line; fire = layered thick beam (same layered-line approach as the
+ * player's Brimstone renderer, separate state). Photosensitivity-safe:
+ * smooth alpha, no strobing. */
+static void render_enemy_beam(Game *g) {
+    if (!g->ebeam_state) return;
+    float ox = g->ebeam_x, oy = g->ebeam_y;
+    float ex = g->ebeam_ex, ey = g->ebeam_ey;
+    if (g->ebeam_state == 1) {
+        /* Telegraph: thin warning line, eases in over the 30 frames */
+        float tfrac = 1.0f - (float)g->ebeam_timer / 30.0f;
+        int a = (int)(90 + 100 * tfrac);
+        u32 warn = C2D_Color32(255, 40, 40, a);
+        C2D_DrawLine(ox, oy, warn, ex, ey, warn, 1.5f, 0);
+    } else {
+        /* Fire: dark red 10px + red 5px + pale core 2px */
+        float fade = (g->ebeam_timer < 3) ? (float)g->ebeam_timer / 3.0f : 1.0f;
+        int a = (int)(255.0f * fade);
+        u32 dark = C2D_Color32(100, 5, 5, a);
+        u32 red  = C2D_Color32(210, 25, 25, a);
+        u32 core = C2D_Color32(255, 230, 230, a);
+        C2D_DrawLine(ox, oy, dark, ex, ey, dark, 10.0f, 0);
+        C2D_DrawLine(ox, oy, red,  ex, ey, red,  5.0f, 0);
+        C2D_DrawLine(ox, oy, core, ex, ey, core, 2.0f, 0);
+        C2D_DrawCircleSolid(ex, ey, 0, 7.0f * fade, red);
+    }
+}
+
+/* E6: familiars drawn as small tinted baby sprites at their trail slots */
+static void render_familiars(Game *g) {
+    Player *p = &g->player;
+    for (int i = 0; i < MAX_FAMILIARS; i++) {
+        if (p->familiar[i] == ITEM_NONE) continue;
+        float fx, fy;
+        familiar_pos(g, i, &fx, &fy);
+        float bob = sinf((float)(g->frame + i * 17) * 0.12f) * 2.0f;
+        /* Shadow */
+        C2D_DrawEllipseSolid(fx - 6.0f, fy + 6.0f, 0, 12.0f, 4.0f, COL_SHADOW);
+        if (g_sprites_loaded) {
+            float sc = 0.55f;
+            switch (p->familiar[i]) {
+            case ITEM_GHOST_BABY:
+                /* Pale blue, translucent (spectral) */
+                spr_draw_rotated_tinted(sheet_sprites, sprites_atlas_enemy_baby_idx,
+                                        fx, fy - bob, sc, sc, 0.0f,
+                                        C2D_Color32(150, 200, 255, 255), 0.45f);
+                break;
+            case ITEM_DEMON_BABY:
+                /* Dark red demon tint */
+                spr_draw_rotated_tinted(sheet_sprites, sprites_atlas_enemy_baby_idx,
+                                        fx, fy - bob, sc, sc, 0.0f,
+                                        C2D_Color32(150, 30, 30, 255), 0.5f);
+                break;
+            default: /* Brother Bobby: plain */
+                spr_draw(sheet_sprites, sprites_atlas_enemy_baby_idx,
+                         fx, fy - bob, sc, sc);
+                break;
+            }
+        } else {
+            u32 fc = (p->familiar[i] == ITEM_DEMON_BABY)
+                       ? C2D_Color32(150, 30, 30, 255)
+                   : (p->familiar[i] == ITEM_GHOST_BABY)
+                       ? C2D_Color32(150, 200, 255, 200)
+                       : C2D_Color32(220, 200, 170, 255);
+            C2D_DrawCircleSolid(fx, fy - bob, 0, 6.0f, fc);
+        }
+    }
+}
+
+/* D3 Mom's Knife: drawn from the actual knife item sprite rotated to the
+ * travel direction (falls back to a stretched large tear, then to a plain
+ * line, when atlases are missing). Visible while held and in flight. */
+static void render_knife(Game *g) {
+    if (!(g->player.stats.flags & ITEM_FLAG_KNIFE)) return;
+    float ang = atan2f(g->knife_dy, g->knife_dx);
+    /* Small shadow under the blade */
+    C2D_DrawEllipseSolid(g->knife_x - 6.0f, g->knife_y + 4.0f, 0,
+                         12.0f, 4.0f, C2D_Color32(0, 0, 0, 40));
+    if (sheet_ui_items) {
+        /* Item icon's blade points up: +90 deg leads with the blade */
+        spr_draw_rotated(sheet_ui_items, ui_items_atlas_item_moms_knife_idx,
+                         g->knife_x, g->knife_y, 0.9f, 0.9f,
+                         ang + 1.5707963f);
+    } else if (sheet_bullets) {
+        /* Stretched largest tear reads as a blade */
+        spr_draw_rotated(sheet_bullets, bulletatlas_tear_blue_1_idx + 5,
+                         g->knife_x, g->knife_y, 2.2f, 0.6f, ang);
+    } else {
+        u32 kc = C2D_Color32(220, 220, 230, 255);
+        C2D_DrawLine(g->knife_x - cosf(ang) * 10.0f,
+                     g->knife_y - sinf(ang) * 10.0f, kc,
+                     g->knife_x + cosf(ang) * 10.0f,
+                     g->knife_y + sinf(ang) * 10.0f, kc, 4.0f, 0);
     }
 }
 
@@ -7556,24 +11759,36 @@ static void render_enemies(Game *g) {
                                 draw_scaleX, draw_scaleY);
                     }
 
-                    /* Larry Jr: render body segments */
-                    if (e->type == ENEMY_BOSS_LARRY) {
+                    /* Larry Jr / Chub / Scolex: body segments as flat
+                       circles (skin-tone fill + darker rim) so only the
+                       head wears the face. Skipped while burrowed. */
+                    if ((e->type == ENEMY_BOSS_LARRY ||
+                         e->type == ENEMY_BOSS_CHUB ||
+                         e->type == ENEMY_BOSS_SCOLEX) && !e->hidden) {
+                        u32 segFill, segRim;
+                        if (e->type == ENEMY_BOSS_CHUB) {
+                            segFill = C2D_Color32(224, 178, 186, 255);
+                            segRim  = C2D_Color32(160, 106, 116, 255);
+                        } else if (e->type == ENEMY_BOSS_SCOLEX) {
+                            segFill = C2D_Color32(206, 186, 128, 255);
+                            segRim  = C2D_Color32(146, 126, 76, 255);
+                        } else { /* Larry Jr */
+                            segFill = C2D_Color32(198, 166, 134, 255);
+                            segRim  = C2D_Color32(138, 108, 82, 255);
+                        }
                         for (int s = 0; s < e->seg_count; s++) {
                             LarrySegment *seg = &e->segments[s];
                             /* Shadow for each segment */
                             float segSz = ENEMY_SIZE * 1.5f;
                             C2D_DrawEllipseSolid(seg->x - segSz * 0.5f, seg->y + segSz * 0.15f, 0,
                                                 segSz, segSz * 0.3f, COL_SHADOW);
-                            /* Segment body - use boss sprite scaled down, or procedural circle */
-                            float segScale = scale * (0.7f - s * 0.06f); /* segments get smaller */
-                            if (e->flash > 0) {
-                                spr_draw_tinted(sheet_sprites, idx, seg->x, seg->y,
-                                               segScale, segScale,
-                                               C2D_Color32(255, 255, 255, 255), 0.7f);
-                            } else {
-                                spr_draw(sheet_sprites, idx, seg->x, seg->y,
-                                        segScale, segScale);
-                            }
+                            /* Shrinking flat body circles */
+                            float segR = ENEMY_SIZE * (1.3f - s * 0.12f);
+                            u32 fill = (e->flash > 0)
+                                     ? C2D_Color32(255, 255, 255, 255) : segFill;
+                            C2D_DrawCircleSolid(seg->x, seg->y, 0, segR, segRim);
+                            C2D_DrawCircleSolid(seg->x, seg->y - 1.0f, 0,
+                                                segR * 0.72f, fill);
                         }
                     }
 
@@ -7616,13 +11831,59 @@ static void render_enemies(Game *g) {
                 } else {
                     /* Regular enemy sprite */
                     float draw_y = e->y;
-                    /* Hopper/Leaper: offset Y by jump_arc for airborne effect */
-                    if (e->type == ENEMY_HOPPER || e->type == ENEMY_LEAPER) {
+                    /* Hopper/Leaper/Trite: offset Y by jump_arc for airborne effect */
+                    if (e->type == ENEMY_HOPPER || e->type == ENEMY_LEAPER ||
+                        e->type == ENEMY_TRITE) {
                         draw_y -= e->jump_arc;
                     }
-                    /* Host: draw at half alpha when hidden */
-                    if (e->type == ENEMY_HOST && e->hidden) {
-                        spr_draw_tinted(sheet_sprites, idx, e->x, draw_y, scale, scale,
+                    /* Game-feel hit-squash: briefly widen + flatten on hit
+                       (mirrors the Clotty squash). Render only — no hitbox change. */
+                    float sx = scale;
+                    float sy = scale;
+                    if (e->flash > 0) {
+                        sx *= 1.0f + 0.15f * (e->flash / 14.0f);
+                        sy *= 1.0f - 0.12f * (e->flash / 14.0f);
+                    }
+
+                    /* ── Procedural animation (all driven by anim_timer) ──
+                       Flyers: sine bob + mirrored wing-beat every 8f.
+                       Walkers: squash-stretch scaled by how fast they move.
+                       Shooters: 6f scale-up + warm tint telegraph before
+                       shoot_timer fires. Clotty/Pacer keep their real
+                       frame animations (handled above, never reach here). */
+                    int flyer = (e->type == ENEMY_FLY || e->type == ENEMY_ATTACK_FLY ||
+                                 e->type == ENEMY_POOTER || e->type == ENEMY_BOOM_FLY ||
+                                 e->type == ENEMY_SUCKER || e->type == ENEMY_VIS ||
+                                 e->type == ENEMY_EYE || e->type == ENEMY_LIL_HAUNT);
+                    int shooter = (e->type == ENEMY_POOTER || e->type == ENEMY_MAW ||
+                                   e->type == ENEMY_RED_MAW || e->type == ENEMY_VIS ||
+                                   e->type == ENEMY_SUCKER || e->type == ENEMY_SPITTY ||
+                                   e->type == ENEMY_MULLIGAN || e->type == ENEMY_EYE ||
+                                   (e->type == ENEMY_HOST && !e->hidden));
+                    int flip = 0;
+                    if (flyer) {
+                        draw_y += sinf((float)e->anim_timer * 0.12f) * 2.0f;
+                        flip = (e->anim_timer / 8) & 1;   /* wing-beat mirror */
+                    } else if (e->type != ENEMY_HOPPER && e->type != ENEMY_LEAPER &&
+                               e->type != ENEMY_TRITE) {
+                        float spd = sqrtf(e->dx * e->dx + e->dy * e->dy);
+                        if (spd > 1.0f) spd = 1.0f;
+                        float sq = 1.0f + 0.06f * spd *
+                                   sinf((float)e->anim_timer * 0.25f);
+                        sx *= 1.0f / sq;
+                        sy *= sq;
+                    }
+                    float tele = 0.0f;
+                    if (shooter && e->shoot_timer > 0 && e->shoot_timer <= 6) {
+                        tele = (float)(7 - e->shoot_timer) / 6.0f;
+                        if (tele > 1.0f) tele = 1.0f;
+                        sx *= 1.0f + 0.18f * tele;
+                        sy *= 1.0f + 0.18f * tele;
+                    }
+
+                    /* Host / Round Worm: draw at half alpha when hidden */
+                    if ((e->type == ENEMY_HOST || e->type == ENEMY_ROUND_WORM) && e->hidden) {
+                        spr_draw_tinted(sheet_sprites, idx, e->x, draw_y, sx, sy,
                                        C2D_Color32(128, 128, 128, 180), 0.6f);
                     } else if (e->type == ENEMY_GLOBIN && e->state == 1) {
                         /* Globin collapsed: draw squished */
@@ -7630,10 +11891,15 @@ static void render_enemies(Game *g) {
                                        scale * 1.3f, scale * 0.5f,
                                        C2D_Color32(200, 80, 80, 200), 0.5f);
                     } else if (e->flash > 0) {
-                        spr_draw_tinted(sheet_sprites, idx, e->x, draw_y, scale, scale,
+                        spr_draw_tinted(sheet_sprites, idx, e->x, draw_y, sx, sy,
                                        C2D_Color32(255, 255, 255, 255), 0.7f);
+                    } else if (tele > 0.0f) {
+                        spr_draw_tinted(sheet_sprites, idx, e->x, draw_y, sx, sy,
+                                       C2D_Color32(255, 140, 80, 255), 0.3f * tele);
+                    } else if (flip) {
+                        spr_draw_fliph(sheet_sprites, idx, e->x, draw_y, sx, sy);
                     } else {
-                        spr_draw(sheet_sprites, idx, e->x, draw_y, scale, scale);
+                        spr_draw(sheet_sprites, idx, e->x, draw_y, sx, sy);
                     }
                 }
             }
@@ -7661,6 +11927,9 @@ static void render_enemies(Game *g) {
                     case ENEMY_RED_MAW:      col = C2D_Color32(200, 40, 60, 255); break;
                     case ENEMY_LEAPER:       col = C2D_Color32(100, 140, 80, 255); break;
                     case ENEMY_VIS:          col = C2D_Color32(140, 60, 140, 255); break;
+                    case ENEMY_TRITE:        col = C2D_Color32(60, 80, 100, 255); break;
+                    case ENEMY_FATTY:        col = C2D_Color32(120, 160, 90, 255); break;
+                    case ENEMY_CHARGER:      col = C2D_Color32(150, 120, 70, 255); break;
                     case ENEMY_BOSS_DUKE:       col = C2D_Color32(80, 120, 80, 255); break;
                     case ENEMY_BOSS_MONSTRO:    col = C2D_Color32(160, 100, 80, 255); break;
                     case ENEMY_BOSS_GEMINI:     col = C2D_Color32(200, 80, 80, 255); break;
@@ -7671,9 +11940,23 @@ static void render_enemies(Game *g) {
                     case ENEMY_BOSS_PIN:        col = C2D_Color32(190, 220, 180, 255); break;
                     case ENEMY_BOSS_HAUNT:      col = C2D_Color32(70, 70, 90, 255); break;
                     case ENEMY_BOSS_WIDOW:      col = C2D_Color32(120, 80, 120, 255); break;
+                    case ENEMY_BOSS_GISH:       col = C2D_Color32(40, 80, 50, 255); break;
+                    case ENEMY_BOSS_LOKI:       col = C2D_Color32(90, 40, 110, 255); break;
+                    case ENEMY_BOSS_STEVEN:     col = C2D_Color32(190, 90, 60, 255); break;
+                    case ENEMY_BOSS_CHUB:       col = C2D_Color32(170, 130, 50, 255); break;
+                    case ENEMY_BOSS_FISTULA:    col = C2D_Color32(150, 70, 90, 255); break;
+                    case ENEMY_BOSS_SCOLEX:     col = C2D_Color32(160, 150, 90, 255); break;
                     case ENEMY_BOSS_MEGA_SATAN: col = C2D_Color32(40, 0, 0, 255); break;
+                    case ENEMY_BOSS_MOM:        col = C2D_Color32(200, 150, 130, 255); break;
+                    case ENEMY_BOSS_MOMS_HEART: col = C2D_Color32(170, 30, 40, 255); break;
+                    case ENEMY_BOSS_SATAN:      col = C2D_Color32(60, 10, 10, 255); break;
                     case ENEMY_EYE:             col = C2D_Color32(230, 220, 220, 255); break;
                     case ENEMY_LIL_HAUNT:       col = C2D_Color32(120, 100, 130, 255); break;
+                    case ENEMY_KEEPER:          col = C2D_Color32(200, 170, 40, 255); break;
+                    case ENEMY_SUCKER:          col = C2D_Color32(110, 70, 120, 255); break;
+                    case ENEMY_FISTULA_BALL:    col = C2D_Color32(150, 70, 90, 255); break;
+                    case ENEMY_ROUND_WORM:      col = C2D_Color32(130, 110, 70, 255); break;
+                    case ENEMY_SPITTY:          col = C2D_Color32(90, 130, 100, 255); break;
                     default:                    col = COL_ENEMY_FLY; break;
                 }
             }
@@ -7726,10 +12009,6 @@ void render_floor_transition(Game *g, C2D_TextBuf textBuf) {
 
     const FloorInfo *fi = get_floor_info(g->current_floor);
 
-    C2D_Text t1;
-    C2D_TextParse(&t1, textBuf, fi->name);
-    C2D_TextOptimize(&t1);
-
     /* Fade in effect */
     float alpha = 1.0f;
     if (g->floor_transition_timer > 100) {
@@ -7739,9 +12018,32 @@ void render_floor_transition(Game *g, C2D_TextBuf textBuf) {
     }
     if (alpha < 0) alpha = 0;
     if (alpha > 1) alpha = 1;
+    u8 a8 = (u8)(alpha * 255);
 
-    u32 textCol = C2D_Color32(255, 220, 150, (int)(alpha * 255));
-    C2D_DrawText(&t1, C2D_WithColor, 130, 90, 0, 0.9f, 0.9f, textCol);
+    /* ── Parchment note (same look as the game-over last will) ── */
+    float ppx = 108, ppy = 26, ppw = 184, pph = 176;
+    C2D_DrawRectSolid(ppx - 4, ppy - 4, 0, ppw + 8, pph + 8,
+                      C2D_Color32(60, 45, 30, a8));              /* border */
+    C2D_DrawRectSolid(ppx, ppy, 0, ppw, pph,
+                      C2D_Color32(222, 209, 172, a8));           /* paper */
+    C2D_DrawRectSolid(ppx, ppy + pph * 0.33f, 0, ppw, 1,
+                      C2D_Color32(190, 175, 138, a8));           /* creases */
+    C2D_DrawRectSolid(ppx, ppy + pph * 0.66f, 0, ppw, 1,
+                      C2D_Color32(190, 175, 138, a8));
+
+    /* Floor name, inked at the top of the note */
+    C2D_Text t1;
+    gtext_parse(&t1, textBuf, fi->name);
+    C2D_TextOptimize(&t1);
+    float nw = t1.width * 0.7f;
+    C2D_DrawText(&t1, C2D_WithColor, TOP_SCREEN_WIDTH / 2.0f - nw / 2,
+                 ppy + 10, 0, 0.7f, 0.7f, C2D_Color32(90, 60, 40, a8));
+
+    /* Isaac descending, centered on the note */
+    if (g_sprites_loaded && alpha > 0.5f) {
+        spr_draw(sheet_sprites, player_sprite_idx(DIR_DOWN, 0),
+                 TOP_SCREEN_WIDTH / 2.0f, ppy + 78, 2.0f, 2.0f);
+    }
 
     /* Floor number (show total in infinite mode) */
     C2D_Text t2;
@@ -7752,10 +12054,33 @@ void render_floor_transition(Game *g, C2D_TextBuf textBuf) {
     } else {
         snprintf(floorBuf, sizeof(floorBuf), "Floor %d", g->current_floor + 1);
     }
-    C2D_TextParse(&t2, textBuf, floorBuf);
+    gtext_parse(&t2, textBuf, floorBuf);
     C2D_TextOptimize(&t2);
-    C2D_DrawText(&t2, C2D_WithColor, 140, 130, 0, 0.6f, 0.6f,
-                C2D_Color32(180, 180, 180, (int)(alpha * 255)));
+    float fw = t2.width * 0.55f;
+    C2D_DrawText(&t2, C2D_WithColor, TOP_SCREEN_WIDTH / 2.0f - fw / 2,
+                 ppy + 116, 0, 0.55f, 0.55f, C2D_Color32(120, 90, 60, a8));
+
+    /* Row of pickup counters carried down the ladder */
+    if (g_sprites_loaded && sheet_ui_items) {
+        const int icons[3] = { ui_items_atlas_item_coin_idx,
+                               ui_items_atlas_item_bomb_idx,
+                               ui_items_atlas_item_key_idx };
+        const int counts[3] = { g->player.coins, g->player.bombs,
+                                g->player.keys };
+        for (int pi = 0; pi < 3; pi++) {
+            float ix = TOP_SCREEN_WIDTH / 2.0f - 58.0f + pi * 46.0f;
+            float iy = ppy + 148;
+            if (alpha > 0.5f)
+                spr_draw(sheet_ui_items, icons[pi], ix, iy, 0.8f, 0.8f);
+            char cb[8];
+            snprintf(cb, sizeof(cb), "%d", counts[pi]);
+            C2D_Text ct;
+            gtext_parse(&ct, textBuf, cb);
+            C2D_TextOptimize(&ct);
+            C2D_DrawText(&ct, C2D_WithColor, ix + 8, iy - 6, 0, 0.5f, 0.5f,
+                         C2D_Color32(90, 70, 50, a8));
+        }
+    }
 }
 
 /* ================================================================
@@ -7763,54 +12088,80 @@ void render_floor_transition(Game *g, C2D_TextBuf textBuf) {
  * ================================================================ */
 
 void render_gameover(Game *g, C2D_TextBuf textBuf) {
+    /* ── Rebirth-style "last will" death note on parchment ── */
     C2D_Text t1, t2, t3;
-    char scoreBuf[32];
-    snprintf(scoreBuf, sizeof(scoreBuf), "Score: %d", g->score);
 
-    /* Draw death sprite */
-    if (g_sprites_loaded) {
-        float dscale = 2.0f;
-        spr_draw(sheet_sprites, player_death_sprite_idx(),
-                 TOP_SCREEN_WIDTH / 2.0f, 50, dscale, dscale);
-    }
+    /* Parchment panel */
+    float ppx = 64, ppy = 14, ppw = 272, pph = 196;
+    C2D_DrawRectSolid(ppx - 4, ppy - 4, 0, ppw + 8, pph + 8,
+                      C2D_Color32(60, 45, 30, 255));           /* border */
+    C2D_DrawRectSolid(ppx, ppy, 0, ppw, pph,
+                      C2D_Color32(222, 209, 172, 255));         /* paper */
+    /* fold creases */
+    C2D_DrawRectSolid(ppx, ppy + pph * 0.33f, 0, ppw, 1,
+                      C2D_Color32(190, 175, 138, 255));
+    C2D_DrawRectSolid(ppx, ppy + pph * 0.66f, 0, ppw, 1,
+                      C2D_Color32(190, 175, 138, 255));
 
-    C2D_TextParse(&t1, textBuf, "YOU DIED");
+    gtext_parse(&t1, textBuf, "YOU DIED");
     C2D_TextOptimize(&t1);
-    C2D_DrawText(&t1, C2D_WithColor, 135, 70, 0, 0.9f, 0.9f, COL_HEART_FULL);
+    C2D_DrawText(&t1, C2D_WithColor, 148, ppy + 6, 0, 0.85f, 0.85f,
+                 C2D_Color32(140, 20, 20, 255));
 
-    /* Show floor reached */
+    /* Dead Isaac drawing, left side of the note */
+    if (g_sprites_loaded) {
+        spr_draw(sheet_sprites, player_death_sprite_idx(),
+                 ppx + 52, ppy + 92, 2.2f, 2.2f);
+    }
+
+    /* Last item held, Rebirth-style, right side of the note */
+    if (g->player.item_count > 0 && g_sprites_loaded) {
+        ItemType last = g->player.items[g->player.item_count - 1];
+        const ItemDef *ldef = get_item_def(last);
+        C2D_Text liText;
+        gtext_parse(&liText, textBuf, "Last item:");
+        C2D_TextOptimize(&liText);
+        C2D_DrawText(&liText, C2D_WithColor, ppx + 150, ppy + 44, 0, 0.45f, 0.45f,
+                     C2D_Color32(90, 70, 50, 255));
+        spr_draw(sheet_ui_items, item_sprite_idx(last),
+                 ppx + 170, ppy + 74, 1.4f, 1.4f);
+        if (ldef && ldef->name) {
+            C2D_Text lnText;
+            gtext_parse(&lnText, textBuf, ldef->name);
+            C2D_TextOptimize(&lnText);
+            C2D_DrawText(&lnText, C2D_WithColor, ppx + 132, ppy + 92, 0,
+                         0.4f, 0.4f, C2D_Color32(90, 70, 50, 255));
+        }
+    }
+
+    /* Run stats, written like a note */
     const FloorInfo *fi = get_floor_info(g->current_floor);
-    C2D_Text flText;
-    char flBuf[64];
+    char line[64];
+    int secs = g->play_time_frames / 60;
     if (g->game_mode == MODE_INFINITE) {
-        int total = g->best_floor + 1;
-        snprintf(flBuf, sizeof(flBuf), "Deepest Floor: %d (%s)", total, fi->name);
+        snprintf(line, sizeof(line), "Deepest: F%d %s   Kills: %d   %d:%02d",
+                 g->best_floor + 1, fi->name, g->kills, secs / 60, secs % 60);
     } else {
-        snprintf(flBuf, sizeof(flBuf), "Reached: %s", fi->name);
+        snprintf(line, sizeof(line), "%s   Kills: %d   %d:%02d",
+                 fi->name, g->kills, secs / 60, secs % 60);
     }
-    C2D_TextParse(&flText, textBuf, flBuf);
-    C2D_TextOptimize(&flText);
-    C2D_DrawText(&flText, C2D_WithColor, 90, 100, 0, 0.55f, 0.55f,
-                C2D_Color32(200, 200, 200, 255));
+    C2D_Text stText;
+    gtext_parse(&stText, textBuf, line);
+    C2D_TextOptimize(&stText);
+    C2D_DrawText(&stText, C2D_WithColor, ppx + 18, ppy + 142, 0, 0.45f, 0.45f,
+                 C2D_Color32(90, 70, 50, 255));
 
-    C2D_TextParse(&t2, textBuf, scoreBuf);
+    char scoreBuf[48];
+    snprintf(scoreBuf, sizeof(scoreBuf), "Score: %d   Items: %d",
+             g->score, g->player.item_count);
+    gtext_parse(&t2, textBuf, scoreBuf);
     C2D_TextOptimize(&t2);
-    C2D_DrawText(&t2, C2D_WithColor, 155, 130, 0, 0.6f, 0.6f, COL_TEXT);
+    C2D_DrawText(&t2, C2D_WithColor, ppx + 18, ppy + 162, 0, 0.5f, 0.5f,
+                 C2D_Color32(120, 40, 40, 255));
 
-    /* Items collected */
-    if (g->player.item_count > 0) {
-        C2D_Text itemsText;
-        char ibuf[32];
-        snprintf(ibuf, sizeof(ibuf), "Items: %d", g->player.item_count);
-        C2D_TextParse(&itemsText, textBuf, ibuf);
-        C2D_TextOptimize(&itemsText);
-        C2D_DrawText(&itemsText, C2D_WithColor, 160, 155, 0, 0.5f, 0.5f,
-                    C2D_Color32(180, 180, 255, 255));
-    }
-
-    C2D_TextParse(&t3, textBuf, "Press START for menu");
+    gtext_parse(&t3, textBuf, "Press START for menu");
     C2D_TextOptimize(&t3);
-    C2D_DrawText(&t3, C2D_WithColor, 110, 200, 0, 0.55f, 0.55f,
+    C2D_DrawText(&t3, C2D_WithColor, 118, 218, 0, 0.55f, 0.55f,
                  C2D_Color32(255, 220, 100, 255));
 }
 
@@ -7819,19 +12170,24 @@ void render_win(Game *g, C2D_TextBuf textBuf) {
     char scoreBuf[32];
     snprintf(scoreBuf, sizeof(scoreBuf), "Final Score: %d", g->score);
 
-    C2D_TextParse(&t1, textBuf, "YOU ESCAPED!");
+    gtext_parse(&t1, textBuf, "YOU ESCAPED!");
     C2D_TextOptimize(&t1);
     C2D_DrawText(&t1, C2D_WithColor, 110, 40, 0, 0.9f, 0.9f,
                  C2D_Color32(100, 255, 100, 255));
 
-    C2D_TextParse(&t2, textBuf, scoreBuf);
+    gtext_parse(&t2, textBuf, scoreBuf);
     C2D_TextOptimize(&t2);
     C2D_DrawText(&t2, C2D_WithColor, 135, 85, 0, 0.6f, 0.6f, COL_TEXT);
 
     C2D_Text t4;
     char floorBuf[48];
-    snprintf(floorBuf, sizeof(floorBuf), "All %d floors conquered!", MAX_FLOORS);
-    C2D_TextParse(&t4, textBuf, floorBuf);
+    /* E2: distinguish the Mom's Heart light-beam finish ("Ending 1") from
+       the full every-floor escape. */
+    if (g->win_ending == 1)
+        snprintf(floorBuf, sizeof(floorBuf), "ENDING 1 - Isaac chose the light.");
+    else
+        snprintf(floorBuf, sizeof(floorBuf), "All %d floors conquered!", MAX_FLOORS);
+    gtext_parse(&t4, textBuf, floorBuf);
     C2D_TextOptimize(&t4);
     C2D_DrawText(&t4, C2D_WithColor, 100, 115, 0, 0.55f, 0.55f,
                  C2D_Color32(200, 200, 200, 255));
@@ -7840,12 +12196,12 @@ void render_win(Game *g, C2D_TextBuf textBuf) {
     C2D_Text itemsText;
     char ibuf[48];
     snprintf(ibuf, sizeof(ibuf), "Items Collected: %d", g->player.item_count);
-    C2D_TextParse(&itemsText, textBuf, ibuf);
+    gtext_parse(&itemsText, textBuf, ibuf);
     C2D_TextOptimize(&itemsText);
     C2D_DrawText(&itemsText, C2D_WithColor, 120, 145, 0, 0.5f, 0.5f,
                 C2D_Color32(180, 180, 255, 255));
 
-    C2D_TextParse(&t3, textBuf, "Press START for menu");
+    gtext_parse(&t3, textBuf, "Press START for menu");
     C2D_TextOptimize(&t3);
     C2D_DrawText(&t3, C2D_WithColor, 108, 190, 0, 0.55f, 0.55f,
                  C2D_Color32(255, 220, 100, 255));
@@ -7892,7 +12248,19 @@ static void render_enemy_shots(Game *g) {
 /* Draw shop price numbers and "SOLD" text (needs textBuf, called from game_render_top) */
 static void render_shop_prices(Game *g, C2D_TextBuf textBuf) {
     Room *r = current_room(g);
-    if (r->type != ROOM_SHOP) return;
+    if (r->type == ROOM_DEVIL) {
+        /* Devil deal: prices shown as heart containers */
+        for (int i = 0; i < r->shop_count; i++) {
+            ShopItem *si = &r->shop_items[i];
+            if (!si->active) continue;
+            for (int h = 0; h < si->cost; h++) {
+                draw_heart(si->x - 6 + h * 13, si->y + 22, 11,
+                           C2D_Color32(220, 30, 30, 255));
+            }
+        }
+        return;
+    }
+    if (r->type != ROOM_SHOP && !r->is_black_market) return;
 
     for (int i = 0; i < r->shop_count; i++) {
         ShopItem *si = &r->shop_items[i];
@@ -7901,7 +12269,7 @@ static void render_shop_prices(Game *g, C2D_TextBuf textBuf) {
             char price_str[8];
             snprintf(price_str, sizeof(price_str), "%d", si->cost);
             C2D_Text priceText;
-            C2D_TextParse(&priceText, textBuf, price_str);
+            gtext_parse(&priceText, textBuf, price_str);
             C2D_TextOptimize(&priceText);
             /* Color: green if affordable, red if not */
             u32 pcol = (g->player.coins >= si->cost)
@@ -7912,7 +12280,7 @@ static void render_shop_prices(Game *g, C2D_TextBuf textBuf) {
         } else {
             /* "SOLD" text on empty pedestal */
             C2D_Text soldText;
-            C2D_TextParse(&soldText, textBuf, "SOLD");
+            gtext_parse(&soldText, textBuf, "SOLD");
             C2D_TextOptimize(&soldText);
             C2D_DrawText(&soldText, C2D_WithColor,
                          si->x - 10, si->y + 2, 0, 0.35f, 0.35f,
@@ -7934,6 +12302,10 @@ void game_render_top(Game *g, C2D_TextBuf textBuf) {
 
     case STATE_MODE_SELECT:
         render_mode_select(g, textBuf);
+        break;
+
+    case STATE_CHALLENGE_SELECT:
+        render_challenge_select(g, textBuf);
         break;
 
     case STATE_CHARACTER_SELECT:
@@ -7965,23 +12337,123 @@ void game_render_top(Game *g, C2D_TextBuf textBuf) {
             C2D_ViewTranslate(sox, soy);
         }
 
-        render_room(g);
-        render_shop_prices(g, textBuf);  /* price text overlay on shop items */
-        render_tears(g);
-        render_enemy_shots(g);
-        render_blood_particles(g);
-        render_enemies(g);
-        render_player(g);
+        if (g->slide_timer > 0) {
+            /* ── Rebirth-style sliding camera pan between rooms ──
+               Old room slides out opposite the travel direction while the
+               new room (player already positioned at its entrance) slides
+               in. Entities/tears are skipped during the ~1/3s pan. */
+            float st = 1.0f - (float)g->slide_timer / (float)SLIDE_FRAMES;
+            st = st * st * (3.0f - 2.0f * st);   /* smoothstep ease */
+            float sdx = (g->slide_dir == DIR_RIGHT) ? 1.0f :
+                        (g->slide_dir == DIR_LEFT)  ? -1.0f : 0.0f;
+            float sdy = (g->slide_dir == DIR_DOWN)  ? 1.0f :
+                        (g->slide_dir == DIR_UP)    ? -1.0f : 0.0f;
+            float ox_old = -sdx * st * TOP_SCREEN_WIDTH;
+            float oy_old = -sdy * st * TOP_SCREEN_HEIGHT;
 
-        /* Floor tint overlay for Womb (red) and Sheol (dark) */
-        if (g->current_floor == 5) {
-            /* Womb: red flesh tint */
-            C2D_DrawRectSolid(0, 0, 0, TOP_SCREEN_WIDTH, TOP_SCREEN_HEIGHT,
-                              C2D_Color32(140, 30, 40, 50));
-        } else if (g->current_floor == 6) {
-            /* Sheol: dark hellish tint */
-            C2D_DrawRectSolid(0, 0, 0, TOP_SCREEN_WIDTH, TOP_SCREEN_HEIGHT,
-                              C2D_Color32(20, 0, 0, 90));
+            C2D_ViewReset();
+            C2D_ViewTranslate(sox + ox_old, soy + oy_old);
+            render_room_at(g, g->slide_from_x, g->slide_from_y);
+
+            C2D_ViewReset();
+            C2D_ViewTranslate(sox + ox_old + sdx * TOP_SCREEN_WIDTH,
+                              soy + oy_old + sdy * TOP_SCREEN_HEIGHT);
+            render_room_at(g, g->dungeon.cur_x, g->dungeon.cur_y);
+            render_player(g);
+
+            /* Restore plain shake view for the overlays below */
+            C2D_ViewReset();
+            if (sox != 0 || soy != 0) C2D_ViewTranslate(sox, soy);
+        } else {
+            render_room(g);
+            render_shop_prices(g, textBuf);  /* price text overlay on shop items */
+            render_tears(g);
+            render_enemy_shots(g);
+            render_blood_particles(g);
+            render_enemies(g);
+            render_familiars(g);  /* E6: followers under the player */
+            render_player(g);
+            render_knife(g);   /* D3: knife rides above the player sprite */
+            render_laser(g);   /* D1/D2: beam over everything in the room */
+            render_enemy_beam(g); /* E3: Satan's Brimstone telegraph/beam */
+        }
+
+        /* Per-floor ambient tint (Rebirth's chapters each have a palette).
+           Clipped to the play rect (ROOM_TOP..ROOM_BOTTOM) so it dyes the
+           room, not the HUD. Floors 0/1 (Basement/Cellar) get a subtle
+           warm-brown grade of their own. */
+        {
+            float pty = ROOM_TOP, pth = ROOM_BOTTOM - ROOM_TOP;
+            if (g->current_floor == 0 || g->current_floor == 1) {
+                /* Basement/Cellar: subtle warm brown */
+                C2D_DrawRectSolid(0, pty, 0, TOP_SCREEN_WIDTH, pth,
+                                  C2D_Color32(120, 85, 45, 24));
+            } else if (g->current_floor == 2 || g->current_floor == 3) {
+                /* Caves: warm earthy brown */
+                C2D_DrawRectSolid(0, pty, 0, TOP_SCREEN_WIDTH, pth,
+                                  C2D_Color32(120, 85, 40, 28));
+            } else if (g->current_floor == 4) {
+                /* Depths: cold near-black gray */
+                C2D_DrawRectSolid(0, pty, 0, TOP_SCREEN_WIDTH, pth,
+                                  C2D_Color32(25, 25, 35, 55));
+            } else if (g->current_floor == 5) {
+                /* Womb: red flesh tint */
+                C2D_DrawRectSolid(0, pty, 0, TOP_SCREEN_WIDTH, pth,
+                                  C2D_Color32(140, 30, 40, 50));
+            } else if (g->current_floor == 6) {
+                /* Sheol: dark hellish tint */
+                C2D_DrawRectSolid(0, pty, 0, TOP_SCREEN_WIDTH, pth,
+                                  C2D_Color32(20, 0, 0, 90));
+            } else if (g->current_floor == 7) {
+                /* The Chest: deep gold/white tint */
+                C2D_DrawRectSolid(0, pty, 0, TOP_SCREEN_WIDTH, pth,
+                                  C2D_Color32(90, 80, 40, 70));
+            }
+        }
+
+        /* Rebirth-style vignette: soft dark edges all the time, heavier on
+           deeper floors. Three nested edge bands fake a radial falloff. */
+        {
+            int va = 26 + g->current_floor * 5;
+            if (va > 60) va = 60;
+            for (int vi = 0; vi < 3; vi++) {
+                int band = 10 + vi * 12;
+                int a = va / (vi + 1);
+                u32 vc = C2D_Color32(0, 0, 0, a);
+                C2D_DrawRectSolid(0, 0, 0, TOP_SCREEN_WIDTH, band, vc);
+                C2D_DrawRectSolid(0, TOP_SCREEN_HEIGHT - band, 0,
+                                  TOP_SCREEN_WIDTH, band, vc);
+                C2D_DrawRectSolid(0, band, 0, band,
+                                  TOP_SCREEN_HEIGHT - band * 2, vc);
+                C2D_DrawRectSolid(TOP_SCREEN_WIDTH - band, band, 0, band,
+                                  TOP_SCREEN_HEIGHT - band * 2, vc);
+            }
+
+            /* (f) Radial corner vignette: stamp four darker ellipses at the
+               room corners so corners read darkest (more radial falloff). */
+            u32 corner_vc = C2D_Color32(0, 0, 0, va);
+            float ew = 70.0f, eh = 55.0f;
+            C2D_DrawEllipseSolid(0 - ew * 0.4f, 0 - eh * 0.4f, 0,
+                                 ew, eh, corner_vc);
+            C2D_DrawEllipseSolid(TOP_SCREEN_WIDTH - ew * 0.6f, 0 - eh * 0.4f, 0,
+                                 ew, eh, corner_vc);
+            C2D_DrawEllipseSolid(0 - ew * 0.4f, TOP_SCREEN_HEIGHT - eh * 0.6f, 0,
+                                 ew, eh, corner_vc);
+            C2D_DrawEllipseSolid(TOP_SCREEN_WIDTH - ew * 0.6f,
+                                 TOP_SCREEN_HEIGHT - eh * 0.6f, 0,
+                                 ew, eh, corner_vc);
+        }
+
+        /* Red hurt pulse: screen edges flash red briefly when damaged */
+        if (g->hurt_flash_timer > 0) {
+            float hf = (float)g->hurt_flash_timer / (float)HURT_FLASH_FRAMES;
+            int ha = (int)(90 * hf);
+            u32 hc = C2D_Color32(180, 10, 10, ha);
+            C2D_DrawRectSolid(0, 0, 0, TOP_SCREEN_WIDTH, 14, hc);
+            C2D_DrawRectSolid(0, TOP_SCREEN_HEIGHT - 14, 0, TOP_SCREEN_WIDTH, 14, hc);
+            C2D_DrawRectSolid(0, 14, 0, 14, TOP_SCREEN_HEIGHT - 28, hc);
+            C2D_DrawRectSolid(TOP_SCREEN_WIDTH - 14, 14, 0, 14,
+                              TOP_SCREEN_HEIGHT - 28, hc);
         }
 
         /* Curse: Darkness - real circular vignette centered on the player.
@@ -8044,7 +12516,7 @@ void game_render_top(Game *g, C2D_TextBuf textBuf) {
             snprintf(banner, sizeof(banner), "%s",
                      curse_name(g->active_curse));
             C2D_Text ctext;
-            C2D_TextParse(&ctext, textBuf, banner);
+            gtext_parse(&ctext, textBuf, banner);
             C2D_TextOptimize(&ctext);
             /* Background panel */
             C2D_DrawRectSolid(50, 60, 0, 300, 30,
@@ -8057,6 +12529,36 @@ void game_render_top(Game *g, C2D_TextBuf textBuf) {
                          C2D_Color32(255, 200, 200, alpha));
         }
 
+        /* Floor-intro nameplate: Rebirth-style floor title on entry */
+        if (g->floor_intro_timer > 0 && g->boss_intro_timer <= 0) {
+            int t = g->floor_intro_timer;
+            float af = 1.0f;
+            if (t > 130) af = (150 - t) / 20.0f;
+            else if (t < 30) af = t / 30.0f;
+            if (af < 0) af = 0;
+            if (af > 1) af = 1;
+            int fa = (int)(af * 235);
+
+            const FloorInfo *fint = get_floor_info(g->current_floor);
+            char fname[48];
+            if (g->game_mode == MODE_INFINITE && g->infinite_loop > 0)
+                snprintf(fname, sizeof(fname), "%s +%d", fint->name, g->infinite_loop);
+            else
+                snprintf(fname, sizeof(fname), "%s", fint->name);
+
+            C2D_Text fiText;
+            gtext_parse(&fiText, textBuf, fname);
+            C2D_TextOptimize(&fiText);
+            float fw = 0.0f, fh = 0.0f;
+            C2D_TextGetDimensions(&fiText, 0.95f, 0.95f, &fw, &fh);
+            float fx = (TOP_SCREEN_WIDTH - fw) / 2.0f;
+            /* soft dark banner behind the title */
+            C2D_DrawRectSolid(fx - 18, 96, 0, fw + 36, fh + 10,
+                              C2D_Color32(0, 0, 0, fa / 2));
+            C2D_DrawText(&fiText, C2D_WithColor, fx, 100, 0, 0.95f, 0.95f,
+                         C2D_Color32(235, 225, 205, fa));
+        }
+
         /* Room fade-in overlay */
         if (g->room_fade > 0) {
             int alpha = (g->room_fade * 16);
@@ -8065,27 +12567,83 @@ void game_render_top(Game *g, C2D_TextBuf textBuf) {
                               C2D_Color32(0, 0, 0, alpha));
         }
 
-        /* Boss intro overlay: dimmed screen + "BOSS" text */
+        /* Boss intro: Rebirth-style VS splash (portrait + name art) */
         if (g->boss_intro_timer > 0) {
-            int alpha = 100;
+            int alpha = 160;
             if (g->boss_intro_timer > BOSS_INTRO_FRAMES - 15) {
-                alpha = (BOSS_INTRO_FRAMES - g->boss_intro_timer) * 8;
+                alpha = (BOSS_INTRO_FRAMES - g->boss_intro_timer) * 11;
             } else if (g->boss_intro_timer < 15) {
-                alpha = g->boss_intro_timer * 7;
+                alpha = g->boss_intro_timer * 11;
             }
             if (alpha < 0) alpha = 0;
-            if (alpha > 140) alpha = 140;
-            C2D_DrawRectSolid(0, 0, 0, TOP_SCREEN_WIDTH, TOP_SCREEN_HEIGHT,
-                              C2D_Color32(80, 0, 0, alpha));
+            if (alpha > 175) alpha = 175;
+            float fade = (float)alpha / 175.0f;
 
-            /* BOSS text */
-            C2D_Text bossText;
-            C2D_TextParse(&bossText, textBuf, "! BOSS !");
-            C2D_TextOptimize(&bossText);
-            float pulseScale = 1.0f + sinf((float)g->frame * 0.3f) * 0.1f;
-            C2D_DrawText(&bossText, C2D_WithColor, 130, 90, 0,
+            C2D_DrawRectSolid(0, 0, 0, TOP_SCREEN_WIDTH, TOP_SCREEN_HEIGHT,
+                              C2D_Color32(30, 0, 0, alpha));
+
+            /* Sides slide in during the first quarter second */
+            float sp = (float)(BOSS_INTRO_FRAMES - g->boss_intro_timer) / 15.0f;
+            if (sp > 1.0f) sp = 1.0f;
+            float slide_off = (1.0f - sp) * 90.0f;
+
+            /* Official portrait + name art where available */
+            int pidx = -1, nidx = -1;
+            switch (g->current_boss_type) {
+            case ENEMY_BOSS_GEMINI:
+                pidx = boss_splash_atlas_portrait_gemini_idx;
+                nidx = boss_splash_atlas_name_gemini_idx; break;
+            case ENEMY_BOSS_LARRY:
+                pidx = boss_splash_atlas_portrait_larry_idx;
+                nidx = boss_splash_atlas_name_larry_idx; break;
+            case ENEMY_BOSS_FAMINE:
+                pidx = boss_splash_atlas_portrait_famine_idx;
+                nidx = boss_splash_atlas_name_famine_idx; break;
+            case ENEMY_BOSS_PEEP:
+                pidx = boss_splash_atlas_portrait_peep_idx;
+                nidx = boss_splash_atlas_name_peep_idx; break;
+            case ENEMY_BOSS_GURDY:
+                pidx = boss_splash_atlas_portrait_gurdy_idx;
+                nidx = boss_splash_atlas_name_gurdy_idx; break;
+            default: break;
+            }
+
+            if (g_sprites_loaded) {
+                /* Player on the left, sliding in */
+                spr_draw_alpha(sheet_sprites, player_sprite_idx(DIR_RIGHT, 0),
+                               95.0f - slide_off, 115.0f, 2.4f, 2.4f, fade);
+
+                /* Boss on the right: official portrait, else in-game sprite */
+                if (pidx >= 0 && sheet_boss_splash) {
+                    spr_draw_alpha(sheet_boss_splash, pidx,
+                                   305.0f + slide_off, 115.0f, 1.0f, 1.0f, fade);
+                } else {
+                    spr_draw_alpha(sheet_sprites,
+                                   boss_sprite_idx(g->current_boss_type),
+                                   305.0f + slide_off, 115.0f, 1.6f, 1.6f, fade);
+                }
+            }
+
+            /* "VS" center text, pulsing */
+            C2D_Text vsText;
+            gtext_parse(&vsText, textBuf, "VS");
+            C2D_TextOptimize(&vsText);
+            float pulseScale = 1.1f + sinf((float)g->frame * 0.3f) * 0.12f;
+            C2D_DrawText(&vsText, C2D_WithColor, 186, 100, 0,
                          pulseScale, pulseScale,
-                         C2D_Color32(255, 60, 60, 240));
+                         C2D_Color32(255, 60, 60, (int)(240 * fade)));
+
+            /* Boss name: official art, else HUD name text */
+            if (nidx >= 0 && sheet_boss_splash && g_sprites_loaded) {
+                spr_draw_alpha(sheet_boss_splash, nidx,
+                               TOP_SCREEN_WIDTH / 2.0f, 195.0f, 1.0f, 1.0f, fade);
+            } else if (g->boss_name) {
+                C2D_Text bnText;
+                gtext_parse(&bnText, textBuf, g->boss_name);
+                C2D_TextOptimize(&bnText);
+                C2D_DrawText(&bnText, C2D_WithColor, 160, 186, 0, 0.7f, 0.7f,
+                             C2D_Color32(255, 230, 230, (int)(240 * fade)));
+            }
         }
 
         /* Pickup flash overlay */
@@ -8113,7 +12671,7 @@ void game_render_top(Game *g, C2D_TextBuf textBuf) {
                 C2D_Text pickedText;
                 char pbuf[64];
                 snprintf(pbuf, sizeof(pbuf), "+ %s", itemDef->name);
-                C2D_TextParse(&pickedText, textBuf, pbuf);
+                gtext_parse(&pickedText, textBuf, pbuf);
                 C2D_TextOptimize(&pickedText);
                 float yPos = 70.0f - progress * 8.0f;
                 C2D_DrawText(&pickedText, C2D_WithColor, 110, yPos, 0,
@@ -8126,12 +12684,12 @@ void game_render_top(Game *g, C2D_TextBuf textBuf) {
         if (current_room(g)->cleared && current_room(g)->type != ROOM_START) {
             C2D_Text cleared;
             if (current_room(g)->has_trapdoor) {
-                C2D_TextParse(&cleared, textBuf, "TRAPDOOR OPEN!");
+                gtext_parse(&cleared, textBuf, "TRAPDOOR OPEN!");
                 C2D_TextOptimize(&cleared);
                 C2D_DrawText(&cleared, C2D_WithColor, 140, ROOM_BOTTOM - 18, 0,
                              0.4f, 0.4f, C2D_Color32(255, 200, 50, 200));
             } else {
-                C2D_TextParse(&cleared, textBuf, "CLEARED");
+                gtext_parse(&cleared, textBuf, "CLEARED");
                 C2D_TextOptimize(&cleared);
                 C2D_DrawText(&cleared, C2D_WithColor, 165, ROOM_BOTTOM - 18, 0,
                              0.4f, 0.4f, C2D_Color32(100, 255, 100, 180));
@@ -8143,7 +12701,7 @@ void game_render_top(Game *g, C2D_TextBuf textBuf) {
             const ItemDef *def = get_item_def(current_room(g)->pedestal.item);
             if (def) {
                 C2D_Text itemName;
-                C2D_TextParse(&itemName, textBuf, def->name);
+                gtext_parse(&itemName, textBuf, def->name);
                 C2D_TextOptimize(&itemName);
                 C2D_DrawText(&itemName, C2D_WithColor,
                             current_room(g)->pedestal.x - 30,
@@ -8152,7 +12710,7 @@ void game_render_top(Game *g, C2D_TextBuf textBuf) {
             }
         } else if (current_room(g)->pedestal.active && g->active_curse == CURSE_BLIND) {
             C2D_Text qm;
-            C2D_TextParse(&qm, textBuf, "???");
+            gtext_parse(&qm, textBuf, "???");
             C2D_TextOptimize(&qm);
             C2D_DrawText(&qm, C2D_WithColor,
                         current_room(g)->pedestal.x - 8,
@@ -8172,19 +12730,23 @@ void game_render_top(Game *g, C2D_TextBuf textBuf) {
         render_enemy_shots(g);
         render_blood_particles(g);
         render_enemies(g);
+        render_familiars(g);
         render_player(g);
+        render_knife(g);
+        render_laser(g);
+        render_enemy_beam(g);
         render_hud(g, textBuf);
         /* Dim overlay */
         C2D_DrawRectSolid(0, 0, 0, TOP_SCREEN_WIDTH, TOP_SCREEN_HEIGHT,
                           C2D_Color32(0, 0, 0, 140));
         /* Paused label */
         C2D_Text pausedText;
-        C2D_TextParse(&pausedText, textBuf, "PAUSED");
+        gtext_parse(&pausedText, textBuf, "PAUSED");
         C2D_TextOptimize(&pausedText);
         C2D_DrawText(&pausedText, C2D_WithColor, 145, 95, 0, 1.1f, 1.1f,
                      C2D_Color32(255, 230, 180, 255));
         C2D_Text resumeText;
-        C2D_TextParse(&resumeText, textBuf, "Press START or B to resume");
+        gtext_parse(&resumeText, textBuf, "Press START or B to resume");
         C2D_TextOptimize(&resumeText);
         C2D_DrawText(&resumeText, C2D_WithColor, 95, 130, 0, 0.5f, 0.5f,
                      C2D_Color32(200, 180, 150, 255));
@@ -8242,12 +12804,12 @@ void render_minimap(Game *g, C2D_TextBuf textBuf) {
         draw_doodle_bug(BOT_SCREEN_WIDTH - 20.0f, 220.0f, doodle_col);
 
         C2D_Text t1, t2, t3, t4, t5;
-        C2D_TextParse(&t1, textBuf, "The Binding of Isaac");
+        gtext_parse(&t1, textBuf, "The Binding of Isaac");
         C2D_TextOptimize(&t1);
         C2D_DrawText(&t1, C2D_WithColor, 60, 30, 0, 0.7f, 0.7f, text_col);
 
         C2D_Text sub;
-        C2D_TextParse(&sub, textBuf, "REBIRTH  -  3DS Edition");
+        gtext_parse(&sub, textBuf, "REBIRTH  -  3DS Edition");
         C2D_TextOptimize(&sub);
         C2D_DrawText(&sub, C2D_WithColor, 75, 60, 0, 0.5f, 0.5f, text_dim);
 
@@ -8256,19 +12818,19 @@ void render_minimap(Game *g, C2D_TextBuf textBuf) {
 
         char floorIntro[48];
         snprintf(floorIntro, sizeof(floorIntro), "%d floors of darkness await...", MAX_FLOORS);
-        C2D_TextParse(&t2, textBuf, floorIntro);
+        gtext_parse(&t2, textBuf, floorIntro);
         C2D_TextOptimize(&t2);
         C2D_DrawText(&t2, C2D_WithColor, 50, 100, 0, 0.45f, 0.45f, text_col);
 
-        C2D_TextParse(&t3, textBuf, "Collect items to grow stronger.");
+        gtext_parse(&t3, textBuf, "Collect items to grow stronger.");
         C2D_TextOptimize(&t3);
         C2D_DrawText(&t3, C2D_WithColor, 50, 122, 0, 0.45f, 0.45f, text_col);
 
-        C2D_TextParse(&t4, textBuf, "Defeat bosses to descend.");
+        gtext_parse(&t4, textBuf, "Defeat bosses to descend.");
         C2D_TextOptimize(&t4);
         C2D_DrawText(&t4, C2D_WithColor, 50, 144, 0, 0.45f, 0.45f, text_col);
 
-        C2D_TextParse(&t5, textBuf, "Defeat Mega Satan to win!");
+        gtext_parse(&t5, textBuf, "Defeat Mega Satan to win!");
         C2D_TextOptimize(&t5);
         C2D_DrawText(&t5, C2D_WithColor, 50, 166, 0, 0.45f, 0.45f, text_col);
 
@@ -8283,7 +12845,7 @@ void render_minimap(Game *g, C2D_TextBuf textBuf) {
 
     if (g->state == STATE_FLOOR_TRANSITION) {
         C2D_Text info;
-        C2D_TextParse(&info, textBuf, "Descending...");
+        gtext_parse(&info, textBuf, "Descending...");
         C2D_TextOptimize(&info);
         C2D_DrawText(&info, C2D_WithColor, 100, 110, 0, 0.6f, 0.6f,
                      C2D_Color32(200, 200, 200, 255));
@@ -8292,7 +12854,7 @@ void render_minimap(Game *g, C2D_TextBuf textBuf) {
 
     if (g->state != STATE_PLAYING) {
         C2D_Text info;
-        C2D_TextParse(&info, textBuf, "Press START to continue");
+        gtext_parse(&info, textBuf, "Press START to continue");
         C2D_TextOptimize(&info);
         C2D_DrawText(&info, C2D_WithColor, 60, 110, 0, 0.55f, 0.55f,
                      C2D_Color32(180, 180, 180, 255));
@@ -8306,11 +12868,11 @@ void render_minimap(Game *g, C2D_TextBuf textBuf) {
         /* faint scrambled overlay */
         C2D_DrawRectSolid(0, 18, 0, BOT_SCREEN_WIDTH, 222,
                           C2D_Color32(8, 0, 8, 255));
-        C2D_TextParse(&lost1, textBuf, "Map Hidden");
+        gtext_parse(&lost1, textBuf, "Map Hidden");
         C2D_TextOptimize(&lost1);
         C2D_DrawText(&lost1, C2D_WithColor, 100, 90, 0, 0.7f, 0.7f,
                      C2D_Color32(120, 30, 30, 220));
-        C2D_TextParse(&lost2, textBuf, "(Curse of the Lost)");
+        gtext_parse(&lost2, textBuf, "(Curse of the Lost)");
         C2D_TextOptimize(&lost2);
         C2D_DrawText(&lost2, C2D_WithColor, 80, 130, 0, 0.5f, 0.5f,
                      C2D_Color32(140, 100, 100, 200));
@@ -8324,12 +12886,12 @@ void render_minimap(Game *g, C2D_TextBuf textBuf) {
     const FloorInfo *fi = get_floor_info(g->current_floor);
     char titleBuf[48];
     snprintf(titleBuf, sizeof(titleBuf), "= %s =", fi->name);
-    C2D_TextParse(&mapTitle, textBuf, titleBuf);
+    gtext_parse(&mapTitle, textBuf, titleBuf);
     C2D_TextOptimize(&mapTitle);
     C2D_DrawText(&mapTitle, C2D_WithColor, 105, 3, 0, 0.5f, 0.5f,
                  C2D_Color32(200, 200, 200, 255));
 
-    float cellW = 26;
+    float cellW = 18;
     float cellH = 18;
     float mapOffX = (BOT_SCREEN_WIDTH - DUNGEON_W * cellW) / 2;
     float mapOffY = 20;
@@ -8344,7 +12906,8 @@ void render_minimap(Game *g, C2D_TextBuf textBuf) {
             int isCurrent = (rx == d->cur_x && ry == d->cur_y);
 
             if (!rm->visited) {
-                /* Show unvisited rooms as dim outlines if adjacent to a visited room */
+                /* Show unvisited rooms as a dim 1px outline only (no fill, no "?")
+                   if adjacent to a visited room */
                 int adjVis = 0;
                 if (ry > 0 && d->rooms[ry-1][rx].visited && d->rooms[ry-1][rx].doors[1]) adjVis = 1;
                 if (ry < DUNGEON_H-1 && d->rooms[ry+1][rx].visited && d->rooms[ry+1][rx].doors[0]) adjVis = 1;
@@ -8355,73 +12918,97 @@ void render_minimap(Game *g, C2D_TextBuf textBuf) {
                 if (rm->type == ROOM_SECRET && !rm->secret_revealed) adjVis = 0;
 
                 if (adjVis) {
-                    C2D_DrawRectSolid(x + 1, y + 1, 0, cellW - 2, cellH - 2,
-                                     C2D_Color32(45, 45, 45, 200));
-                    /* Question mark for unknown rooms */
-                    C2D_DrawRectSolid(x + cellW/2, y + cellH/2 - 3, 0, 2, 4,
-                                     C2D_Color32(80, 80, 80, 200));
-                    C2D_DrawRectSolid(x + cellW/2, y + cellH/2 + 3, 0, 2, 2,
-                                     C2D_Color32(80, 80, 80, 200));
+                    u32 dimOutline = C2D_Color32(90, 90, 90, 160);
+                    C2D_DrawRectSolid(x + 2, y + 2, 0, cellW - 4, 1, dimOutline);
+                    C2D_DrawRectSolid(x + 2, y + cellH - 3, 0, cellW - 4, 1, dimOutline);
+                    C2D_DrawRectSolid(x + 2, y + 2, 0, 1, cellH - 4, dimOutline);
+                    C2D_DrawRectSolid(x + cellW - 3, y + 2, 0, 1, cellH - 4, dimOutline);
                 }
                 continue;
             }
 
             u32 roomCol;
             if (isCurrent) {
-                /* Pulsing white for current room */
+                /* Pulsing bright fill for current room */
                 float pulse = sinf((float)g->frame * 0.12f) * 30.0f;
                 int v = 225 + (int)pulse;
                 roomCol = C2D_Color32(v, v, v, 255);
             } else {
                 switch (rm->type) {
                     case ROOM_START:    roomCol = C2D_Color32(100, 200, 100, 255); break;
-                    case ROOM_BOSS:     roomCol = C2D_Color32(255, 60, 60, 255); break;
-                    case ROOM_TREASURE: roomCol = C2D_Color32(255, 215, 0, 255); break;
-                    case ROOM_SHOP:     roomCol = C2D_Color32(100, 180, 255, 255); break;
-                    case ROOM_SECRET:   roomCol = C2D_Color32(160, 160, 160, 255); break;
-                    case ROOM_CURSE:    roomCol = C2D_Color32(180, 60, 180, 255); break;
+                    case ROOM_BOSS:     roomCol = C2D_Color32(150, 40, 40, 255); break;
+                    case ROOM_TREASURE: roomCol = C2D_Color32(150, 125, 20, 255); break;
+                    case ROOM_SHOP:     roomCol = C2D_Color32(60, 100, 150, 255); break;
+                    case ROOM_SECRET:   roomCol = C2D_Color32(110, 110, 110, 255); break;
+                    case ROOM_CURSE:    roomCol = C2D_Color32(110, 40, 110, 255); break;
+                    case ROOM_DEVIL:    roomCol = C2D_Color32(90, 15, 15, 255); break;
+                    case ROOM_ANGEL:    roomCol = C2D_Color32(200, 195, 165, 255); break;
+                    case ROOM_SACRIFICE: roomCol = C2D_Color32(130, 30, 30, 255); break;
+                    case ROOM_BOSSRUSH: roomCol = C2D_Color32(200, 90, 20, 255); break;
+                    case ROOM_ARCADE:   roomCol = C2D_Color32(200, 80, 160, 255); break;
+                    case ROOM_LIBRARY:  roomCol = C2D_Color32(100, 80, 170, 255); break;
                     default:
                         roomCol = rm->cleared
-                                ? C2D_Color32(100, 100, 100, 255)
-                                : C2D_Color32(120, 120, 120, 255);
+                                ? C2D_Color32(90, 90, 90, 255)
+                                : C2D_Color32(110, 110, 110, 255);
                         break;
                 }
             }
 
-            C2D_DrawRectSolid(x + 1, y + 1, 0, cellW - 2, cellH - 2, roomCol);
+            /* Square-ish cell: dark outline rect behind, fill inset inside it —
+               gives a slightly rounded, tightened-up look versus a flat rect. */
+            u32 outlineCol = isCurrent ? C2D_Color32(255, 255, 255, 255)
+                                        : C2D_Color32(15, 15, 15, 255);
+            C2D_DrawRectSolid(x + 1, y + 1, 0, cellW - 2, cellH - 2, outlineCol);
+            C2D_DrawRectSolid(x + 2, y + 2, 0, cellW - 4, cellH - 4, roomCol);
 
-            /* Room type icons (larger than top-screen minimap) */
+            /* Special-room markers: small distinct shape/color centered in the cell */
             float icx = x + cellW / 2;
             float icy = y + cellH / 2;
 
             if (rm->type == ROOM_BOSS && !isCurrent) {
-                /* Skull: small rectangle */
-                C2D_DrawRectSolid(icx - 2, icy - 2, 0, 5, 4, C2D_Color32(255, 200, 200, 255));
+                /* Red skull-ish marker: multi-rect */
+                C2D_DrawRectSolid(icx - 2, icy - 2, 0, 4, 3, C2D_Color32(255, 80, 80, 255));
+                C2D_DrawRectSolid(icx - 1, icy + 1, 0, 1, 1, C2D_Color32(255, 80, 80, 255));
+                C2D_DrawRectSolid(icx,     icy + 1, 0, 1, 1, C2D_Color32(255, 80, 80, 255));
             } else if (rm->type == ROOM_TREASURE && !isCurrent) {
-                /* Cross/star sparkle */
-                C2D_DrawRectSolid(icx, icy - 2, 0, 1, 5, C2D_Color32(255, 255, 150, 255));
-                C2D_DrawRectSolid(icx - 2, icy, 0, 5, 1, C2D_Color32(255, 255, 150, 255));
+                /* Gold dot */
+                C2D_DrawCircleSolid(icx, icy, 0, 2.5f, C2D_Color32(255, 215, 0, 255));
             } else if (rm->type == ROOM_SHOP && !isCurrent) {
-                /* $ line */
-                C2D_DrawRectSolid(icx, icy - 2, 0, 1, 5, C2D_Color32(255, 255, 200, 255));
-                C2D_DrawRectSolid(icx - 1, icy - 1, 0, 3, 1, C2D_Color32(255, 255, 200, 255));
-                C2D_DrawRectSolid(icx - 1, icy + 1, 0, 3, 1, C2D_Color32(255, 255, 200, 255));
-            } else if (rm->type == ROOM_SECRET && !isCurrent) {
-                /* ? mark */
-                C2D_DrawRectSolid(icx - 1, icy - 2, 0, 3, 3, C2D_Color32(220, 220, 220, 255));
-                C2D_DrawRectSolid(icx, icy + 2, 0, 1, 2, C2D_Color32(220, 220, 220, 255));
+                /* Blue dot */
+                C2D_DrawCircleSolid(icx, icy, 0, 2.5f, C2D_Color32(100, 180, 255, 255));
             } else if (rm->type == ROOM_CURSE && !isCurrent) {
-                /* X mark */
-                C2D_DrawRectSolid(icx - 2, icy - 2, 0, 2, 2, C2D_Color32(255, 200, 255, 255));
-                C2D_DrawRectSolid(icx + 1, icy - 2, 0, 2, 2, C2D_Color32(255, 200, 255, 255));
-                C2D_DrawRectSolid(icx - 1, icy - 1, 0, 3, 2, C2D_Color32(255, 200, 255, 255));
-                C2D_DrawRectSolid(icx - 2, icy + 1, 0, 2, 2, C2D_Color32(255, 200, 255, 255));
-                C2D_DrawRectSolid(icx + 1, icy + 1, 0, 2, 2, C2D_Color32(255, 200, 255, 255));
+                /* Purple dot */
+                C2D_DrawCircleSolid(icx, icy, 0, 2.5f, C2D_Color32(220, 100, 220, 255));
+            } else if (rm->type == ROOM_DEVIL && !isCurrent) {
+                /* Dark red dot */
+                C2D_DrawCircleSolid(icx, icy, 0, 2.5f, C2D_Color32(180, 20, 20, 255));
+            } else if (rm->type == ROOM_ANGEL && !isCurrent) {
+                /* White/gold dot */
+                C2D_DrawCircleSolid(icx, icy, 0, 2.5f, C2D_Color32(255, 250, 210, 255));
+            } else if (rm->type == ROOM_SACRIFICE && !isCurrent) {
+                /* Small red cross marker */
+                C2D_DrawRectSolid(icx - 2, icy, 0, 4, 1, C2D_Color32(230, 60, 60, 255));
+                C2D_DrawRectSolid(icx, icy - 2, 0, 1, 4, C2D_Color32(230, 60, 60, 255));
+            } else if (rm->type == ROOM_BOSSRUSH && !isCurrent) {
+                /* Orange skull-ish marker (same shape as boss, different color) */
+                C2D_DrawRectSolid(icx - 2, icy - 2, 0, 4, 3, C2D_Color32(255, 150, 40, 255));
+                C2D_DrawRectSolid(icx - 1, icy + 1, 0, 1, 1, C2D_Color32(255, 150, 40, 255));
+                C2D_DrawRectSolid(icx,     icy + 1, 0, 1, 1, C2D_Color32(255, 150, 40, 255));
+            } else if (rm->type == ROOM_ARCADE && !isCurrent) {
+                /* Pink dot */
+                C2D_DrawCircleSolid(icx, icy, 0, 2.5f, C2D_Color32(255, 100, 200, 255));
+            } else if (rm->type == ROOM_LIBRARY && !isCurrent) {
+                /* Purple dot */
+                C2D_DrawCircleSolid(icx, icy, 0, 2.5f, C2D_Color32(150, 110, 230, 255));
+            } else if (rm->type == ROOM_SECRET && !isCurrent) {
+                /* Faint dot */
+                C2D_DrawCircleSolid(icx, icy, 0, 1.5f, C2D_Color32(150, 150, 150, 160));
             } else if (rm->cleared && rm->type != ROOM_START && !isCurrent) {
-                C2D_DrawRectSolid(icx - 2, icy - 2, 0, 4, 4, C2D_Color32(0, 255, 0, 200));
+                C2D_DrawCircleSolid(icx, icy, 0, 1.5f, C2D_Color32(80, 220, 80, 200));
             }
 
-            /* Current room pulsing outline */
+            /* Current room: bright pulsing outline on top of the cell */
             if (isCurrent) {
                 float pulse = sinf((float)g->frame * 0.12f) * 0.4f + 0.6f;
                 u8 a = (u8)(pulse * 255);
@@ -8445,39 +13032,10 @@ void render_minimap(Game *g, C2D_TextBuf textBuf) {
         }
     }
 
-    /* Room legend */
-    {
-        float lx = mapOffX;
-        float ly = mapOffY + DUNGEON_H * cellH + 2;
-        float ls = 6.0f;
-        float lspacing = 50.0f;
-
-        struct { u32 col; const char *label; } legend[] = {
-            { C2D_Color32(100, 200, 100, 255), "Start" },
-            { C2D_Color32(255, 60, 60, 255),   "Boss" },
-            { C2D_Color32(255, 215, 0, 255),   "Item" },
-            { C2D_Color32(100, 180, 255, 255), "Shop" },
-            { C2D_Color32(180, 60, 180, 255),  "Curse" },
-            { C2D_Color32(160, 160, 160, 255), "Secret" },
-        };
-        int legendCount = 6;
-
-        for (int li = 0; li < legendCount; li++) {
-            float llx = lx + li * lspacing;
-            if (llx + lspacing > BOT_SCREEN_WIDTH) break;
-            C2D_DrawRectSolid(llx, ly + 1, 0, ls, ls, legend[li].col);
-            C2D_Text lt;
-            C2D_TextParse(&lt, textBuf, legend[li].label);
-            C2D_TextOptimize(&lt);
-            C2D_DrawText(&lt, C2D_WithColor, llx + ls + 2, ly, 0, 0.3f, 0.3f,
-                         C2D_Color32(160, 160, 160, 255));
-        }
-    }
-
     /* Player stats section */
     float statsY = mapOffY + DUNGEON_H * cellH + 16;
     C2D_Text statsTitle;
-    C2D_TextParse(&statsTitle, textBuf, "STATS");
+    gtext_parse(&statsTitle, textBuf, "STATS");
     C2D_TextOptimize(&statsTitle);
     C2D_DrawText(&statsTitle, C2D_WithColor, 10, statsY, 0, 0.4f, 0.4f,
                 C2D_Color32(200, 200, 200, 255));
@@ -8491,7 +13049,7 @@ void render_minimap(Game *g, C2D_TextBuf textBuf) {
     /* DMG */
     {
         C2D_Text lbl;
-        C2D_TextParse(&lbl, textBuf, "DMG");
+        gtext_parse(&lbl, textBuf, "DMG");
         C2D_TextOptimize(&lbl);
         C2D_DrawText(&lbl, C2D_WithColor, statX, statsY, 0, 0.35f, 0.35f,
                     C2D_Color32(255, 100, 100, 255));
@@ -8506,7 +13064,7 @@ void render_minimap(Game *g, C2D_TextBuf textBuf) {
     /* SPD */
     {
         C2D_Text lbl;
-        C2D_TextParse(&lbl, textBuf, "SPD");
+        gtext_parse(&lbl, textBuf, "SPD");
         C2D_TextOptimize(&lbl);
         C2D_DrawText(&lbl, C2D_WithColor, statX + 90, statsY, 0, 0.35f, 0.35f,
                     C2D_Color32(100, 255, 100, 255));
@@ -8521,7 +13079,7 @@ void render_minimap(Game *g, C2D_TextBuf textBuf) {
     /* RATE */
     {
         C2D_Text lbl;
-        C2D_TextParse(&lbl, textBuf, "RATE");
+        gtext_parse(&lbl, textBuf, "RATE");
         C2D_TextOptimize(&lbl);
         C2D_DrawText(&lbl, C2D_WithColor, statX + 180, statsY, 0, 0.35f, 0.35f,
                     C2D_Color32(100, 100, 255, 255));
@@ -8539,7 +13097,7 @@ void render_minimap(Game *g, C2D_TextBuf textBuf) {
     /* RANGE */
     {
         C2D_Text lbl;
-        C2D_TextParse(&lbl, textBuf, "RNG");
+        gtext_parse(&lbl, textBuf, "RNG");
         C2D_TextOptimize(&lbl);
         C2D_DrawText(&lbl, C2D_WithColor, statX, statsY, 0, 0.35f, 0.35f,
                     C2D_Color32(255, 200, 100, 255));
@@ -8558,7 +13116,7 @@ void render_minimap(Game *g, C2D_TextBuf textBuf) {
             C2D_Text itemLbl;
             char ibuf[48];
             snprintf(ibuf, sizeof(ibuf), "Last: %s", last->name);
-            C2D_TextParse(&itemLbl, textBuf, ibuf);
+            gtext_parse(&itemLbl, textBuf, ibuf);
             C2D_TextOptimize(&itemLbl);
             C2D_DrawText(&itemLbl, C2D_WithColor, statX + 90, statsY, 0, 0.35f, 0.35f,
                         C2D_Color32(255, 215, 0, 255));
@@ -8568,7 +13126,7 @@ void render_minimap(Game *g, C2D_TextBuf textBuf) {
     /* Controls reminder */
     statsY += 16;
     C2D_Text ctrl;
-    C2D_TextParse(&ctrl, textBuf, "ABXY: Shoot | D-Pad: Move | SELECT: Bomb");
+    gtext_parse(&ctrl, textBuf, "ABXY: Shoot | D-Pad: Move | SELECT: Bomb");
     C2D_TextOptimize(&ctrl);
     C2D_DrawText(&ctrl, C2D_WithColor, 15, statsY, 0, 0.35f, 0.35f,
                  C2D_Color32(100, 100, 100, 255));
@@ -8581,7 +13139,8 @@ void render_minimap(Game *g, C2D_TextBuf textBuf) {
 static const char *pill_color_names[PILL_EFFECT_COUNT] = {
     "Red Pill", "Blue Pill", "Yellow Pill", "Green Pill",
     "Orange Pill", "Pink Pill", "White Pill", "Black Pill",
-    "Purple Pill", "Cyan Pill"
+    "Purple Pill", "Cyan Pill", "Brown Pill", "Grey Pill",
+    "Magenta Pill"
 };
 
 const char *pill_color_name(int color_idx) {
@@ -8592,7 +13151,8 @@ const char *pill_color_name(int color_idx) {
 static const char *pill_effect_text[PILL_EFFECT_COUNT] = {
     "Health Up", "Health Down", "Speed Up", "Speed Down",
     "Tears Up", "Tears Down", "Range Up", "Luck Up",
-    "Full Health", "Telepills"
+    "Full Health", "Telepills", "Bad Trip", "Bombs Are Key",
+    "Explosive Diarrhea"
 };
 
 const char *pill_name(PillEffect e, int known) {
@@ -8604,7 +13164,8 @@ const char *pill_name(PillEffect e, int known) {
 
 static const char *tarot_names[TAROT_COUNT] = {
     "The Fool", "The Magician", "The High Priestess", "The Emperor",
-    "The Hierophant", "The Lovers", "The Tower", "The World"
+    "The Hierophant", "The Lovers", "The Tower", "The World",
+    "Death", "The Star", "The Sun", "The Hanged Man"
 };
 const char *tarot_name(TarotCard c) {
     if (c < 0 || c >= TAROT_COUNT) return "?";
@@ -8677,22 +13238,16 @@ void creep_update(Game *g) {
             float r2 = dx * dx + dy * dy;
             float lim = g->creep[i].radius + PLAYER_SIZE / 2.0f;
             if (r2 < lim * lim) {
-                if (p->holy_mantle_active) {
-                    p->holy_mantle_active = 0;
-                } else {
-                    p->hp -= g->creep[i].dmg;
-                    p->iframes = PLAYER_IFRAMES;
-                    audio_play(SFX_HURT);
-                    trigger_shake(g, 2.0f, 8);
-                    if (p->hp <= 0) {
-                        if (p->lives > 0) {
-                            p->lives--;
-                            p->hp = p->stats.max_hp;
-                        } else {
-                            g->state = STATE_GAMEOVER;
-                            audio_play(SFX_PLAYER_DEATH);
-                        }
-                    }
+                /* Route through player_absorb_dmg so soul hearts + Holy Mantle
+                   are honoured (they were previously ignored by creep). */
+                p->hp -= player_absorb_dmg(p, g->creep[i].dmg);
+                p->iframes = PLAYER_IFRAMES;
+                g->hitstop = 3;
+                audio_play(SFX_HURT);
+                trigger_shake(g, 2.0f, 8);
+                if (player_check_death(p)) {
+                    g->state = STATE_GAMEOVER;
+                    audio_play(SFX_PLAYER_DEATH);
                 }
             }
         }
@@ -8708,20 +13263,44 @@ static void do_warp_cleanup(Game *g) {
     Room *nr = current_room(g);
     if (!nr) return;
     nr->visited = 1;
+    /* Warping into a secret room must open its doors (see reveal_secret_room) */
+    reveal_secret_room(g, g->dungeon.cur_x, g->dungeon.cur_y);
+    /* Arcade slot machine is once per VISIT, not once per run */
+    if (nr->type == ROOM_ARCADE) nr->arcade_slot_used = 0;
     if (!nr->enemies_spawned) room_spawn_enemies(g, nr);
 
     /* Clear projectiles, creep and reset Holy Mantle */
     for (int i = 0; i < MAX_TEARS; i++)        g->tears[i].active = 0;
     for (int i = 0; i < MAX_ENEMY_SHOTS; i++)  g->enemy_shots[i].active = 0;
     for (int i = 0; i < MAX_CREEP; i++)        g->creep[i].active = 0;
+    /* A live beam/knife/bomb must not persist across a warp (Phase D) */
+    for (int i = 0; i < MAX_BOMBS; i++)        g->bombs[i].active = 0;
+    g->laser_active = 0;
+    g->laser_timer = 0;
+    g->laser_charge = 0;
+    g->knife_state = 0;
+    g->knife_hit_cd = 0;
 
     if (g->player.stats.flags & ITEM_FLAG_MANTLE) g->player.holy_mantle_active = 1;
+
+    /* Warping out mid-Boss-Rush (or mid-boss-fight) must not leave stale
+       boss/wave state behind — same reset as the door re-entry path */
+    g->boss_active = 0;
+    g->bossrush_active = 0;
+    g->bossrush_wave = 0;
+    g->bossrush_spawn_timer = 0;
+    /* E3: a live enemy beam must not persist across a warp */
+    g->ebeam_state = 0;
+    g->ebeam_timer = 0;
 
     /* Center player and brief fade */
     g->player.x = (ROOM_LEFT + ROOM_RIGHT) / 2.0f;
     g->player.y = (ROOM_TOP + ROOM_BOTTOM) / 2.0f;
     g->player.iframes = 30;
     g->room_fade = 16;
+
+    /* E6: snap the familiar trail to the warped-in position */
+    familiars_reset_trail(g);
 
     /* Trigger boss intro/music if we landed on an uncleared boss room */
     if (nr->type == ROOM_BOSS && !nr->cleared) {
@@ -8804,6 +13383,36 @@ void apply_pill_effect(Game *g, PillEffect e) {
             }
             break;
         }
+        case PILL_BAD_TRIP:
+            /* Bad Trip: lose 1 heart (can kill, like any other damage) */
+            p->hp -= player_absorb_dmg(p, 1);
+            audio_play(SFX_HURT);
+            if (player_check_death(p)) {
+                audio_play(SFX_PLAYER_DEATH);
+                g->state = STATE_GAMEOVER;
+            }
+            break;
+        case PILL_BOMBS_ARE_KEY: {
+            /* Swap bomb and key counts */
+            int tmp = p->bombs;
+            p->bombs = p->keys;
+            p->keys = tmp;
+            break;
+        }
+        case PILL_EXPLOSIVE_DIARRHEA: {
+            /* Drop a spread of LIVE troll bombs around the player — they
+               explode on the normal fuse and can hurt you */
+            Room *r = current_room(g);
+            if (r) {
+                for (int i = 0; i < 5; i++) {
+                    float ang = randf(0.0f, 6.28f);
+                    float dst = randf(20.0f, 44.0f);
+                    if (!spawn_troll_bomb(g, p->x + cosf(ang) * dst,
+                                          p->y + sinf(ang) * dst)) break;
+                }
+            }
+            break;
+        }
         default: break;
     }
 }
@@ -8851,12 +13460,12 @@ void apply_tarot_card(Game *g, TarotCard c) {
             }
             break;
         case TAROT_TOWER:
-            /* Spawn 6 troll bombs around player (damages player too) */
+            /* Spawn live troll bombs around the player (damages player too) */
             for (int i = 0; i < 6; i++) {
-                float ang = (i / 6.0f) * 2.0f * 3.14159f;
-                float bx = p->x + cosf(ang) * 40.0f;
-                float by = p->y + sinf(ang) * 40.0f;
-                if (r) spawn_consumable(r, bx, by, PICKUP_BOMB);
+                float ang = randf(0.0f, 6.28f);
+                float dst = randf(24.0f, 52.0f);
+                if (!spawn_troll_bomb(g, p->x + cosf(ang) * dst,
+                                      p->y + sinf(ang) * dst)) break;
             }
             break;
         case TAROT_WORLD:
@@ -8868,6 +13477,46 @@ void apply_tarot_card(Game *g, TarotCard c) {
                         g->dungeon.rooms[yy][xx].visited = 1;
                     }
                 }
+            }
+            break;
+        case TAROT_DEATH:
+            /* Damage all enemies in the room heavily (shared helper routes
+               deaths through kill_enemy; splits spawned by the deaths are
+               not re-hit by the same card). */
+            if (r) {
+                damage_all_enemies(g, 6.0f);
+                trigger_shake(g, 4.0f, 16);
+            }
+            break;
+        case TAROT_STAR:
+            /* Full map reveal + spawn a heart */
+            g->map_revealed = 1;
+            for (int yy = 0; yy < DUNGEON_H; yy++) {
+                for (int xx = 0; xx < DUNGEON_W; xx++) {
+                    if (g->dungeon.rooms[yy][xx].type != ROOM_NONE) {
+                        g->dungeon.rooms[yy][xx].visited = 1;
+                    }
+                }
+            }
+            if (r) spawn_heart(r, p->x + 12, p->y, HEART_RED_FULL);
+            break;
+        case TAROT_SUN:
+            /* Full heal + full map reveal */
+            p->hp = p->stats.max_hp;
+            g->map_revealed = 1;
+            for (int yy = 0; yy < DUNGEON_H; yy++) {
+                for (int xx = 0; xx < DUNGEON_W; xx++) {
+                    if (g->dungeon.rooms[yy][xx].type != ROOM_NONE) {
+                        g->dungeon.rooms[yy][xx].visited = 1;
+                    }
+                }
+            }
+            break;
+        case TAROT_HANGED_MAN:
+            /* Spawn two soul hearts */
+            if (r) {
+                spawn_heart(r, p->x + 12, p->y, HEART_SOUL);
+                spawn_heart(r, p->x - 12, p->y, HEART_SOUL);
             }
             break;
         default: break;
@@ -8919,11 +13568,18 @@ int main(int argc, char *argv[]) {
 
     gfxInitDefault();
     C3D_Init(C3D_DEFAULT_CMDBUF_SIZE);
-    C2D_Init(C2D_DEFAULT_MAX_OBJECTS);
+    /* F8: 4096 default silently drops draws — budget is SHARED across both
+       screens per frame, so raise it (platform rule). */
+    C2D_Init(16384);
     C2D_Prepare();
 
     /* Initialize romfs for loading sprite assets */
     romfsInit();
+
+    /* Best-effort load of custom bitmap font. On any failure this stays
+     * NULL and gtext_parse() transparently falls back to the default
+     * citro2d system font — identical to pre-existing behavior. */
+    g_font = C2D_FontLoad("romfs:/gamefont.bcfnt");
 
     /* Load user config from SD card (or use defaults) */
     config_init(&g_config);
@@ -8989,6 +13645,7 @@ int main(int argc, char *argv[]) {
     /* Cleanup */
     audio_exit();
     sprites_free();
+    if (g_font) { C2D_FontFree(g_font); g_font = NULL; }
     C2D_TextBufDelete(textBuf);
     C2D_Fini();
     C3D_Fini();
