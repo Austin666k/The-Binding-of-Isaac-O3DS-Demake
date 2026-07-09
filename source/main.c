@@ -61,6 +61,13 @@ static void familiars_reset_trail(Game *g);
 static void familiar_pos(Game *g, int slot, float *fx, float *fy);
 /* Warp path (E7 Teleport! uses it from the active-item switch) */
 static void do_warp_cleanup(Game *g);
+/* R8 gauntlet (#9): lifetime counters bumped mid-gameplay (devil deals)
+ * no longer pay a blocking SD config_save at the purchase site — they
+ * mark the config dirty and ride the existing save points (floor
+ * advance, boss first-defeat, settings, game over) plus the main-loop
+ * exit save, which now also fires when this flag is set. */
+static int g_config_dirty = 0;
+
 /* R10 (C4): devil-deal purchases feed the Azazel unlock counter */
 static int apply_unlock_gates(void);
 /* R8 (M3): golden-door Mega Satan room (defined after drain_black_burst) */
@@ -960,6 +967,11 @@ void recalc_player_stats(Player *p) {
     p->stats.range     += p->pill_range_bonus;
     p->stats.luck      += p->pill_luck_bonus;
     p->stats.max_hp    += p->pill_max_hp_bonus;
+    /* R8 gauntlet: easy-mode +1 container is a persistent field like the
+       pill bonus — the old start_new_game direct max_hp mutation was wiped
+       by the first recalc (per-frame HP watcher). The Lost override below
+       still forces his max to 0. */
+    p->stats.max_hp    += p->easy_hp_bonus;
 
     /* Trinket passives */
     if (p->trinket == TRINKET_LUCKY_TOE)     p->stats.luck      += 1.0f;
@@ -1004,10 +1016,19 @@ void recalc_player_stats(Player *p) {
  * per frame in the STATE_PLAYING update. */
 static int g_black_burst_pending = 0;
 
+/* R8 gauntlet (#4): set on every REAL damage application (every damage
+ * site funnels through player_absorb_dmg right where iframes get set).
+ * The Samson Bloody-Lust pool watcher only counts a pool drop as a hit
+ * when this flag coincides — devil-deal payments and the Time-Attack
+ * drain lower the pool WITHOUT passing through here and no longer stack
+ * Bloody Lust. Consumed (cleared) by the watcher each frame. */
+static int g_took_real_hit = 0;
+
 /* Damage absorption: holy_mantle blocks all; black hearts absorb first
  * (Rebirth order: black BEFORE soul), then soul hearts.
  * Returns damage that actually reaches red HP. */
 static int player_absorb_dmg(Player *p, int dmg) {
+    g_took_real_hit = 1;
     if (p->holy_mantle_active) {
         p->holy_mantle_active = 0;
         return 0;
@@ -1036,7 +1057,15 @@ static int player_has_item(const Player *p, ItemType type) {
 
 /* Check if player is dead. If lives > 0, respawn at full HP. Returns 1 if truly dead. */
 static int player_check_death(Player *p) {
-    if (p->hp > 0) return 0;
+    /* R8 gauntlet (#1) The Lost: max_hp is 0, so hp==0 is his NORMAL
+       living state. A fully-absorbed hit (Holy Mantle) leaves hp at
+       exactly 0 — alive. Only hp < 0 (damage actually got through the
+       mantle) kills him. Everyone else still dies at hp <= 0. */
+    if (p->stats.max_hp == 0) {
+        if (p->hp >= 0) return 0;
+    } else if (p->hp > 0) {
+        return 0;
+    }
     if (p->lives > 0) {
         p->lives--;
         p->hp = p->stats.max_hp;
@@ -2689,17 +2718,19 @@ void start_new_game(Game *g) {
             g->player.hp = g->player.stats.max_hp;
     }
 
+    /* R8 gauntlet (#2): easy-mode +1 container is a PERSISTENT field that
+       recalc_player_stats re-adds every pass (mutating stats.max_hp
+       directly here got wiped by the first per-frame-watcher recalc).
+       R10 (C4): The Lost never gains health — easy mode must not smuggle
+       him 2 hp (that would break his whole identity; recalc forces his
+       max to 0 regardless). */
+    if (g->difficulty == DIFF_EASY && g->player.character != CHAR_LOST)
+        g->player.easy_hp_bonus = 2;
+
     recalc_player_stats(&g->player);
 
     /* Set HP to max for character */
     g->player.hp = g->player.stats.max_hp;
-    /* R10 (C4): The Lost never gains health — easy mode must not smuggle
-       him 2 hp (that would break his whole identity). */
-    if (g->difficulty == DIFF_EASY && g->player.character != CHAR_LOST) {
-        g->player.hp += 2;
-        if (g->player.hp > PLAYER_MAX_HP_CAP) g->player.hp = PLAYER_MAX_HP_CAP;
-        if (g->player.hp > g->player.stats.max_hp) g->player.stats.max_hp = g->player.hp;
-    }
     /* R10 (C4): seed the hp-conditional stat watcher (Eve/Samson) */
     g->prev_hp_total = g->player.hp + g->player.soul_hp + g->player.black_hp;
 
@@ -2728,6 +2759,14 @@ void start_new_game(Game *g) {
     /* E6: seed the familiar trail at the spawn position */
     familiars_reset_trail(g);
     g_black_burst_pending = 0;
+    g_took_real_hit = 0;    /* R8 gauntlet (#4): stale hit flag can't leak */
+
+    /* R8 gauntlet (#7): distinct per-run id so render-side statics (HUD
+       heart jiggle) detect the new run and re-sync without popping. */
+    {
+        static int run_seq = 0;
+        g->run_id = ++run_seq;
+    }
 
     /* E9 challenge 5 "Cat Got Your Tongue": no tears — start with the
        Demon Baby + Brother Bobby familiars as the only weapons. */
@@ -2884,6 +2923,9 @@ static void finish_floor_transition(Game *g) {
     g->laser_charge = 0;
     g->knife_state = 0;
     g->knife_hit_cd = 0;
+    /* R8 gauntlet (#6): Head of Krampus burst visual must not leak into
+       the next floor's start room. */
+    g->pbeam_timer = 0;
 
     /* Reset boss state */
     g->boss_active = 0;
@@ -3383,7 +3425,7 @@ void player_update(Game *g, u32 kHeld, circlePosition circlePos) {
                             g->took_devil_deal = 1;
                             g_config.devil_deals_taken++;
                             apply_unlock_gates();
-                            config_save(&g_config);
+                            g_config_dirty = 1;  /* no mid-game SD write */
                             g->last_pickup = si->item;
                             g->pickup_flash = PICKUP_FLASH_FRAMES;
                             p->pickup_anim = 40;
@@ -3403,7 +3445,7 @@ void player_update(Game *g, u32 kHeld, circlePosition circlePos) {
                             g->took_devil_deal = 1;  /* R8: angels stop appearing */
                             g_config.devil_deals_taken++;   /* R10 (C4) Azazel gate */
                             apply_unlock_gates();
-                            config_save(&g_config);
+                            g_config_dirty = 1;  /* no mid-game SD write */
                             g->last_pickup = si->item;
                             g->pickup_flash = PICKUP_FLASH_FRAMES;
                             p->pickup_anim = 40;
@@ -3434,7 +3476,7 @@ void player_update(Game *g, u32 kHeld, circlePosition circlePos) {
                         g->took_devil_deal = 1;  /* R8: angels stop appearing */
                         g_config.devil_deals_taken++;   /* R10 (C4) Azazel gate */
                         apply_unlock_gates();
-                        config_save(&g_config);
+                        g_config_dirty = 1;  /* no mid-game SD write */
                         g->last_pickup = si->item;
                         g->pickup_flash = PICKUP_FLASH_FRAMES;
                         p->pickup_anim = 40;
@@ -3910,6 +3952,10 @@ static void blue_flies_update(Game *g) {
     Room *r = current_room(g);
     if (!r) return;
     Player *p = &g->player;
+    /* R8 gauntlet (#8): fairness consistency with the player's own
+       weapons — no biting during the boss intro slide (flies just orbit),
+       and never target an enemy still inside its spawn grace. */
+    int intro = (g->boss_intro_timer > 0);
     for (int i = 0; i < MAX_BLUE_FLIES; i++) {
         BlueFly *f = &g->blue_flies[i];
         if (!f->active) continue;
@@ -3918,9 +3964,10 @@ static void blue_flies_update(Game *g) {
         /* Nearest live, targetable enemy in the current room */
         Enemy *best = NULL;
         float bestD2 = 1e12f;
-        for (int j = 0; j < r->enemy_count; j++) {
+        if (!intro) for (int j = 0; j < r->enemy_count; j++) {
             Enemy *e = &r->enemies[j];
             if (!e->active || e->hidden) continue;
+            if (e->spawn_grace > 0) continue;
             float dx = e->x - f->x, dy = e->y - f->y;
             float d2 = dx * dx + dy * dy;
             if (d2 < bestD2) { bestD2 = d2; best = e; }
@@ -5076,11 +5123,28 @@ static int kill_enemy(Game *g, Room *r, Enemy *e) {
            Coal / Head of Krampus (the ONLY source of both). His brimstone
            cross dies with him (shared ebeam machine). */
         if (e->type == ENEMY_BOSS_KRAMPUS) {
-            r->pedestal.x = (ROOM_LEFT + ROOM_RIGHT) / 2.0f;
-            r->pedestal.y = (ROOM_TOP + ROOM_BOTTOM) / 2.0f;
-            r->pedestal.item = randi(0, 1) ? ITEM_HEAD_OF_KRAMPUS
-                                           : ITEM_LUMP_OF_COAL;
-            r->pedestal.active = (g->challenge != 6);
+            /* R8 gauntlet (#5): never duplicate a held drop — Head of
+               Krampus lives in the active slot, Lump of Coal in the
+               passive list. Roll, swap to the other if already owned;
+               both owned -> a black heart consolation instead. */
+            ItemType kdrop = randi(0, 1) ? ITEM_HEAD_OF_KRAMPUS
+                                         : ITEM_LUMP_OF_COAL;
+            int has_head = (g->player.active_item == ITEM_HEAD_OF_KRAMPUS);
+            int has_coal = player_has_item(&g->player, ITEM_LUMP_OF_COAL);
+            if (kdrop == ITEM_HEAD_OF_KRAMPUS && has_head)
+                kdrop = ITEM_LUMP_OF_COAL;
+            if (kdrop == ITEM_LUMP_OF_COAL && has_coal)
+                kdrop = has_head ? ITEM_NONE : ITEM_HEAD_OF_KRAMPUS;
+            float kx = (ROOM_LEFT + ROOM_RIGHT) / 2.0f;
+            float ky = (ROOM_TOP + ROOM_BOTTOM) / 2.0f;
+            if (kdrop == ITEM_NONE) {
+                if (g->challenge != 6) spawn_heart(r, kx, ky, HEART_BLACK);
+            } else {
+                r->pedestal.x = kx;
+                r->pedestal.y = ky;
+                r->pedestal.item = kdrop;
+                r->pedestal.active = (g->challenge != 6);
+            }
             g->ebeam_state = 0;
             g->ebeam_timer = 0;
             g->ebeam_cross = 0;
@@ -5544,13 +5608,26 @@ static void laser_update(Game *g) {
     else if (g->laser_dy > 0) ey = ROOM_BOTTOM;
     else                      ey = ROOM_TOP;
 
-    /* R10 (C4) Azazel: his innate Brimstone is SHORT-RANGE — clamp the
-       beam to ~55% of the wall distance unless the real Brimstone item
-       was picked up (which restores the full-length beam). */
+    /* R10 (C4) Azazel: his innate Brimstone is SHORT-RANGE. R8 gauntlet
+       (#10): FIXED length (110px), still clamped by the wall — the old
+       55%-of-wall-distance rule collapsed to a ~0-length beam when he
+       hugged a wall. A 12px floor keeps point-blank hits alive (the
+       damage loop early-outs on slen2 < 1). Picking up the real
+       Brimstone item restores the full-length beam. */
     if (!g->laser_is_tech && p->character == CHAR_AZAZEL &&
         !player_has_item(p, ITEM_BRIMSTONE)) {
-        ex = ox + (ex - ox) * 0.55f;
-        ey = oy + (ey - oy) * 0.55f;
+        float wdx = ex - ox, wdy = ey - oy;
+        float wall = sqrtf(wdx * wdx + wdy * wdy); /* dist to wall (cardinal) */
+        float len = (wall < 110.0f) ? wall : 110.0f;
+        if (len < 12.0f) len = 12.0f;
+        if (wall > 0.5f) {
+            ex = ox + (wdx / wall) * len;
+            ey = oy + (wdy / wall) * len;
+        } else {
+            /* Flush against the wall: aim direction still defines a stub */
+            ex = ox + (g->laser_dx > 0 ?  len : g->laser_dx < 0 ? -len : 0);
+            ey = oy + (g->laser_dy > 0 ?  len : g->laser_dy < 0 ? -len : 0);
+        }
     }
 
     /* D7 Brimstone + Spoon Bender/Sacred Heart (synergy grants HOMING in
@@ -9610,7 +9687,11 @@ static int try_door_unlock(Game *g, Room *r, int dir) {
         Player *p = &g->player;
         /* B7: Holy Mantle absorbs the toll for free (Rebirth-correct), so
            refuse entry only when the toll would actually kill: no mantle,
-           no soul/black hearts, and at the last half red heart. */
+           no soul/black hearts, and at the last half red heart.
+           R8 gauntlet (#1) The Lost: hp==0 <= 1 so a mantle-less Lost is
+           refused here (the toll WOULD kill him); with the mantle armed
+           he enters free — the absorbed toll leaves hp at exactly 0,
+           which player_check_death now treats as alive for max_hp==0. */
         if (!p->holy_mantle_active &&
             p->black_hp <= 0 && p->soul_hp <= 0 && p->hp <= 1) {
             audio_play(SFX_HURT); /* Feedback: can't afford HP cost */
@@ -10200,12 +10281,18 @@ void game_update(Game *g, u32 kDown, u32 kHeld, circlePosition circlePos) {
             }
             int hp_tot = pp->hp + pp->soul_hp + pp->black_hp;
             if (hp_tot != g->prev_hp_total) {
-                if (hp_tot < g->prev_hp_total &&
+                /* R8 gauntlet (#4): a pool DROP only counts as a Samson
+                   hit when it coincides with a real damage application
+                   (g_took_real_hit, set in player_absorb_dmg). Devil-deal
+                   payments / Time-Attack drain lower the pool without the
+                   flag and no longer stack Bloody Lust. */
+                if (hp_tot < g->prev_hp_total && g_took_real_hit &&
                     pp->character == CHAR_SAMSON && pp->samson_hits < 7)
                     pp->samson_hits++;
                 g->prev_hp_total = hp_tot;
                 recalc_player_stats(pp);
             }
+            g_took_real_hit = 0;   /* consumed — one-frame lifetime */
         }
 
         /* Challenge: Time Attack / Speed! — 20 minutes to win, or it's over.
@@ -10214,7 +10301,9 @@ void game_update(Game *g, u32 kDown, u32 kHeld, circlePosition circlePos) {
            of the timeout re-killing the player every frame. */
         if ((g->challenge == 3 || g->challenge == 4)
             && g->play_time_frames >= 20 * 60 * 60) {
-            g->player.hp = 0;
+            /* hp goes NEGATIVE, not 0: The Lost's death rule treats hp==0
+               as alive (max_hp==0), and the timeout must kill him too. */
+            g->player.hp = -2;
             g->player.soul_hp = 0;
             g->player.black_hp = 0;
             if (player_check_death(&g->player)) {
@@ -11473,17 +11562,21 @@ void render_character_select(Game *g, C2D_TextBuf textBuf) {
 
     /* R10 (C4): scroll chevrons when cards sit off-screen either side */
     {
+        /* R8 gauntlet (#3): with start_x=6 the old chevrons spanned
+           x[-8,0] / x[400,408] — entirely off the 400px top screen.
+           Pull them inboard: apexes at ~x=3 / ~x=396, bases overlapping
+           the outer card edges slightly. */
         float ay = card_y + card_h / 2;
         if (first > 0) {
-            C2D_DrawTriangle(start_x - 14, ay, INK,
-                             start_x - 6,  ay - 6, INK,
-                             start_x - 6,  ay + 6, INK, 0);
+            C2D_DrawTriangle(start_x - 3, ay, INK,
+                             start_x + 5, ay - 6, INK,
+                             start_x + 5, ay + 6, INK, 0);
         }
         if (first + visible < CHAR_COUNT) {
             float rx = start_x + total_w;
-            C2D_DrawTriangle(rx + 14, ay, INK,
-                             rx + 6,  ay - 6, INK,
-                             rx + 6,  ay + 6, INK, 0);
+            C2D_DrawTriangle(rx + 2, ay, INK,
+                             rx - 6, ay - 6, INK,
+                             rx - 6, ay + 6, INK, 0);
         }
     }
 
@@ -11986,6 +12079,17 @@ void render_hud(Game *g, C2D_TextBuf textBuf) {
        eased scale pop (0.75 -> ~0.95 -> 0.75). Render-side only. */
     static int jig_prev_red = -1, jig_prev_soul = -1, jig_prev_black = -1;
     static int jig_timer = 0, jig_lo = 0, jig_hi = -1;
+    /* R8 gauntlet (#7): statics persist across runs — on a new run
+       (run_id changed) re-sync without popping: jig_prev_red = -1 makes
+       the detector below skip one frame and just latch fresh values. */
+    static int jig_run_id = -1;
+    if (jig_run_id != g->run_id) {
+        jig_run_id = g->run_id;
+        jig_prev_red = jig_prev_soul = jig_prev_black = -1;
+        jig_timer = 0;
+        jig_lo = 0;
+        jig_hi = -1;
+    }
     {
         int curRed = g->player.hp;
         int curSoul = g->player.soul_hp;
@@ -16584,7 +16688,10 @@ int main(int argc, char *argv[]) {
 
     /* HOME-menu / SELECT exit: persist any settings changed in the settings
        menu that were never saved (the user backed out via HOME, not B). */
-    if (game.settings_changed) config_save(&g_config);
+    /* R8 gauntlet (#9): also flush lifetime counters (devil deals) that
+       were marked dirty mid-run instead of paying a blocking mid-game
+       SD write at their increment site. */
+    if (game.settings_changed || g_config_dirty) config_save(&g_config);
 
     /* Cleanup */
     audio_exit();

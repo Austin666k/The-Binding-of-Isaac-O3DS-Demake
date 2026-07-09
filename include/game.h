@@ -746,6 +746,10 @@ typedef struct {
     /* R10 (C4) Lazarus' Rags: permanent +0.5 dmg per death-respawn this
        run (applied in recalc; accumulates if he gains more lives). */
     float lazarus_dmg_bonus;
+    /* R8 gauntlet: easy-mode +1 container. Persistent field added by
+       recalc_player_stats (like pill_max_hp_bonus) so the per-frame HP
+       watcher's recalc can't wipe it. Set once in start_new_game. */
+    int   easy_hp_bonus;
 } Player;
 
 /* ---------- R8 (M8) friendly blue flies (Guppy / Guppy's Head) ---------- */
@@ -1058,6 +1062,10 @@ typedef struct {
     /* R10 (C4): latch so a game over increments the lifetime death counter
        exactly once (zeroed by start_new_game's memset). */
     int   death_counted;
+    /* R8 gauntlet: per-run identity (monotonic, set by start_new_game).
+       Render-side statics (HUD heart jiggle) compare it to detect a new
+       run and re-sync without a spurious pop. */
+    int   run_id;
 } Game;
 
 /* ---------- Function Declarations ---------- */

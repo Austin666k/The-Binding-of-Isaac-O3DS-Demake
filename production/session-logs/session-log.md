@@ -1836,3 +1836,41 @@ source/main.c
 source/sprite.c
 ---
 
+## Session End: 20260708_194103
+### Commits
+359e4b0 Round 8 content 2/2: red chests, full tarot, transformations, 3 chars
+8ad90a8 Round 8 content 1/2: routes, 7 new bosses, golden door, Krampus
+b6dc289 Round 8 fixes: 41 audit findings across economy, bosses, UI
+e60f70e Round 7: Isaac-Rebirth procedural paper UI overhaul + 8 bug fixes
+6a2b325 Fix build_cia.ps1: stale repo path, makerom arg quoting, fail loudly
+705ed15 Massive expansion rounds 1-6: bugs, Isaac parity, story arc, weapons, content
+### Uncommitted Changes
+production/session-logs/agent-audit.log
+---
+
+## Session End: 20260708_195348
+### Commits
+359e4b0 Round 8 content 2/2: red chests, full tarot, transformations, 3 chars
+8ad90a8 Round 8 content 1/2: routes, 7 new bosses, golden door, Krampus
+b6dc289 Round 8 fixes: 41 audit findings across economy, bosses, UI
+e60f70e Round 7: Isaac-Rebirth procedural paper UI overhaul + 8 bug fixes
+6a2b325 Fix build_cia.ps1: stale repo path, makerom arg quoting, fail loudly
+705ed15 Massive expansion rounds 1-6: bugs, Isaac parity, story arc, weapons, content
+### Uncommitted Changes
+production/session-logs/agent-audit.log
+production/session-logs/session-log.md
+---
+
+## Session End: 20260708_195447
+### Commits
+359e4b0 Round 8 content 2/2: red chests, full tarot, transformations, 3 chars
+8ad90a8 Round 8 content 1/2: routes, 7 new bosses, golden door, Krampus
+b6dc289 Round 8 fixes: 41 audit findings across economy, bosses, UI
+e60f70e Round 7: Isaac-Rebirth procedural paper UI overhaul + 8 bug fixes
+6a2b325 Fix build_cia.ps1: stale repo path, makerom arg quoting, fail loudly
+705ed15 Massive expansion rounds 1-6: bugs, Isaac parity, story arc, weapons, content
+### Uncommitted Changes
+production/session-logs/agent-audit.log
+production/session-logs/session-log.md
+---
+
