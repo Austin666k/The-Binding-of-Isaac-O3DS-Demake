@@ -44,6 +44,18 @@ Generated from a 20-agent parallel audit (bugs adversarially verified). Line num
   - Review-pass layout fixes: active-item box vs 3rd heart row (shared hudShift), ability dots vs Time-Attack countdown, challenge-row overlap, spawn-grace AoE window narrowed to same-frame, dead particle fields removed
   - Gauntlet: 2 auditors + 2 reviewers + fix pass; build clean (zero warnings) at every phase. CIA rebuilt. NOT hardware-tested: the entire new UI needs eyes-on.
 
+- [x] Round 8 (2026-07-08) — "The Other Half of Isaac": 6-agent audit → 3 fix phases + 4 content phases + 2-reviewer gauntlet, all built clean:
+  - Audits: 0 crash-class findings (all 18 enum tables verified in sync — first clean crash audit), 41 bug/polish findings total
+  - FIX-1 economy/save: arcade-slot infinite-item exploit, pay-and-get-nothing at 32-item cap (collect_item now returns success), retroactive unlocks at load, atomic config save (tmp+rename), bombs/keys 99 clamp, stat clamps on load
+  - FIX-2 bosses: airborne bosses no longer deal invisible ground contact (shadow telegraphs + landing thump added), Gemini/Steven second head killable (Steven's was never rendered), 4 spawners routed through alloc_dynamic_enemy, boss music restored after warp-out, blue champion 1.3x real, segment bosses honor boss_speed_scale, Ending-1 beam gated on room clear, Boss Rush wave state in Room (warp-safe), phase-transition juice (hitstop/flash/roar/shot-wipe)
+  - FIX-3 UI: Curse of Darkness vignette rebuilt (was inverted — punch-out circles are no-ops in citro2d), heart row-wrap from total slots, curse banner clears minimap, paused-frame tint/vignette/shop-price parity, per-chapter wall tints, HUD heart damage jiggle, pedestal spotlight+bob, tear trails (unused atlas sprites), deterministic screen shake
+  - C1 routes: light/dark route choice after Mom's Heart (beam=Cathedral→Chest, trapdoor=Sheol→Dark Room), bosses ISAAC (vbeam light columns) / THE LAMB (ebeam cross + detachable body) / IT LIVES (total_wins>=1 replaces Mom's Heart), 2 new endings; route-aware floors/palettes/spawns
+  - C2: angel statue fights (Uriel/Gabriel share vbeam w/ state guards) → Key Pieces (HUD icons) → golden Mega Satan door floor-7 both routes; ??? (Blue Baby) is Chest boss; Krampus ambush (10% devil rooms) drops Lump of Coal / Head of Krampus (player pbeam 4-way); devil-deal angel lockout. 27 bosses.
+  - C3: red chests (spiders/troll bomb/black heart/coins/devil item/devil warp) in curse+devil rooms; tarot completed to all 22 arcana; Guppy + Fun Guy transformations (flight flag, 6-slot friendly BlueFly pool, 3 Guppy items → 72 items)
+  - C4: Azazel (flight + 110px brimstone), Lazarus (life + rags dmg), The Lost (0 HP + innate mantle + free devil deals), Eve Whore of Babylon, Samson Bloody Lust, scrolling 10-char select, lifetime devil-deal/death counters, wall decor
+  - Gauntlet found 10 (fixed): CRITICAL The Lost died through mantle (hp==0 = dead at every damage site); easy-mode hp bonus wiped by recalc watcher; Samson stacked from devil payments; Krampus dup drops; chevrons off-screen; Azazel wall-hug zero beam; devil-purchase SD hitch; pbeam floor leak; jiggle cross-run pop; blue-fly intro bites
+  - NOT hardware-tested: both routes, all 7 new bosses, golden door flow, The Lost mantle rhythm, transformations, darkness vignette. CIA rebuilt.
+
 ## Font hardware note
 The .bcfnt (~512KB, single glyph sheet) loads into the shared 6MB Old-3DS VRAM alongside sprite atlases.
 If sprites go black on Old-3DS hardware (VRAM exhaustion), DELETE `romfs/gamefont.bcfnt` and rebuild —
