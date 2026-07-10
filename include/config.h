@@ -15,12 +15,16 @@ typedef struct {
     float music_volume;     /* 0.0 - 1.0 */
     /* Unlocks / Achievements (Phase 2) */
     int unlocked_chars;          /* bitmask: bit 0=Isaac, 1=Magdalene, 2=Cain, 3=Judas,
-                                     4=Eve, 5=Samson, 6=Blue Baby (???) */
+                                     4=Eve, 5=Samson, 6=Blue Baby (???),
+                                     7=Azazel, 8=Lazarus, 9=The Lost (R10 C4) */
     int total_wins;              /* total runs completed successfully */
     int bosses_defeated;         /* bitmask of bosses defeated (by enum index) */
     int characters_completed;    /* bitmask of characters who beat a run */
     int floors_reached;          /* deepest floor index ever reached (0-7) */
     int total_runs_started;      /* total number of runs ever started */
+    /* R10 (C4) lifetime unlock counters */
+    int devil_deals_taken;       /* devil-room purchases ever made (Azazel @ 3) */
+    int total_deaths;            /* game overs ever suffered (Lazarus @ 10) */
 } GameConfig;
 
 /* Default values */
@@ -30,9 +34,15 @@ typedef struct {
 /* Default unlocked characters: only Isaac (bit 0) */
 #define CONFIG_DEFAULT_UNLOCKED_CHARS 0x01
 
-/* Config file path */
-#define CONFIG_DIR   "sdmc:/3ds/binding_of_isaac"
-#define CONFIG_PATH  "sdmc:/3ds/binding_of_isaac/config.ini"
+/* Config file path (saves go through a temp file + rename so a power-off
+ * mid-write can never destroy the existing config/unlock data) */
+#define CONFIG_DIR      "sdmc:/3ds/binding_of_isaac"
+#define CONFIG_PATH     "sdmc:/3ds/binding_of_isaac/config.ini"
+#define CONFIG_TMP_PATH "sdmc:/3ds/binding_of_isaac/config.ini.tmp"
+
+/* Highest legal floors_reached value. config.c cannot see game.h;
+ * keep in sync with MAX_FLOORS - 1 (game.h). */
+#define CONFIG_FLOORS_MAX_INDEX 7
 
 /* ---------- API ---------- */
 

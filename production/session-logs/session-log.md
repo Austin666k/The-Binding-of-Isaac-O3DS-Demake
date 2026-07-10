@@ -1571,3 +1571,323 @@ source/main.c
 source/sprite.c
 ---
 
+## Session End: 20260708_134957
+### Commits
+705ed15 Massive expansion rounds 1-6: bugs, Isaac parity, story arc, weapons, content
+---
+
+## Session End: 20260708_135900
+### Commits
+6a2b325 Fix build_cia.ps1: stale repo path, makerom arg quoting, fail loudly
+705ed15 Massive expansion rounds 1-6: bugs, Isaac parity, story arc, weapons, content
+### Uncommitted Changes
+production/session-logs/agent-audit.log
+production/session-logs/session-log.md
+---
+
+## Session End: 20260708_143749
+### Commits
+6a2b325 Fix build_cia.ps1: stale repo path, makerom arg quoting, fail loudly
+705ed15 Massive expansion rounds 1-6: bugs, Isaac parity, story arc, weapons, content
+### Uncommitted Changes
+production/session-logs/agent-audit.log
+production/session-logs/session-log.md
+---
+
+## Session End: 20260708_144734
+### Commits
+6a2b325 Fix build_cia.ps1: stale repo path, makerom arg quoting, fail loudly
+705ed15 Massive expansion rounds 1-6: bugs, Isaac parity, story arc, weapons, content
+### Uncommitted Changes
+production/session-logs/agent-audit.log
+production/session-logs/session-log.md
+---
+
+## Session End: 20260708_144822
+### Commits
+6a2b325 Fix build_cia.ps1: stale repo path, makerom arg quoting, fail loudly
+705ed15 Massive expansion rounds 1-6: bugs, Isaac parity, story arc, weapons, content
+### Uncommitted Changes
+production/session-logs/agent-audit.log
+production/session-logs/session-log.md
+---
+
+## Session End: 20260708_145839
+### Commits
+6a2b325 Fix build_cia.ps1: stale repo path, makerom arg quoting, fail loudly
+705ed15 Massive expansion rounds 1-6: bugs, Isaac parity, story arc, weapons, content
+### Uncommitted Changes
+production/session-logs/agent-audit.log
+production/session-logs/session-log.md
+source/main.c
+---
+
+## Session End: 20260708_150934
+### Commits
+6a2b325 Fix build_cia.ps1: stale repo path, makerom arg quoting, fail loudly
+705ed15 Massive expansion rounds 1-6: bugs, Isaac parity, story arc, weapons, content
+### Uncommitted Changes
+production/session-logs/agent-audit.log
+production/session-logs/session-log.md
+source/main.c
+---
+
+## Session End: 20260708_152934
+### Commits
+6a2b325 Fix build_cia.ps1: stale repo path, makerom arg quoting, fail loudly
+705ed15 Massive expansion rounds 1-6: bugs, Isaac parity, story arc, weapons, content
+### Uncommitted Changes
+production/session-logs/agent-audit.log
+production/session-logs/session-log.md
+source/main.c
+---
+
+## Session End: 20260708_154804
+### Commits
+6a2b325 Fix build_cia.ps1: stale repo path, makerom arg quoting, fail loudly
+705ed15 Massive expansion rounds 1-6: bugs, Isaac parity, story arc, weapons, content
+### Uncommitted Changes
+include/game.h
+production/session-logs/agent-audit.log
+production/session-logs/session-log.md
+source/main.c
+---
+
+## Session End: 20260708_155901
+### Commits
+6a2b325 Fix build_cia.ps1: stale repo path, makerom arg quoting, fail loudly
+705ed15 Massive expansion rounds 1-6: bugs, Isaac parity, story arc, weapons, content
+### Uncommitted Changes
+include/game.h
+production/session-logs/agent-audit.log
+production/session-logs/session-log.md
+source/main.c
+---
+
+## Session End: 20260708_160045
+### Commits
+6a2b325 Fix build_cia.ps1: stale repo path, makerom arg quoting, fail loudly
+705ed15 Massive expansion rounds 1-6: bugs, Isaac parity, story arc, weapons, content
+### Uncommitted Changes
+include/game.h
+production/session-logs/agent-audit.log
+production/session-logs/session-log.md
+source/main.c
+---
+
+## Session End: 20260708_160823
+### Commits
+6a2b325 Fix build_cia.ps1: stale repo path, makerom arg quoting, fail loudly
+705ed15 Massive expansion rounds 1-6: bugs, Isaac parity, story arc, weapons, content
+### Uncommitted Changes
+ISAAC_EXPANSION_PLAN.md
+include/game.h
+production/session-logs/agent-audit.log
+production/session-logs/session-log.md
+source/main.c
+---
+
+## Session End: 20260708_161649
+### Commits
+6a2b325 Fix build_cia.ps1: stale repo path, makerom arg quoting, fail loudly
+705ed15 Massive expansion rounds 1-6: bugs, Isaac parity, story arc, weapons, content
+### Uncommitted Changes
+ISAAC_EXPANSION_PLAN.md
+include/game.h
+production/session-logs/agent-audit.log
+production/session-logs/session-log.md
+source/main.c
+---
+
+## Session End: 20260708_163554
+### Commits
+e60f70e Round 7: Isaac-Rebirth procedural paper UI overhaul + 8 bug fixes
+6a2b325 Fix build_cia.ps1: stale repo path, makerom arg quoting, fail loudly
+705ed15 Massive expansion rounds 1-6: bugs, Isaac parity, story arc, weapons, content
+### Uncommitted Changes
+production/session-logs/agent-audit.log
+---
+
+## Session End: 20260708_164736
+### Commits
+e60f70e Round 7: Isaac-Rebirth procedural paper UI overhaul + 8 bug fixes
+6a2b325 Fix build_cia.ps1: stale repo path, makerom arg quoting, fail loudly
+705ed15 Massive expansion rounds 1-6: bugs, Isaac parity, story arc, weapons, content
+### Uncommitted Changes
+production/session-logs/agent-audit.log
+production/session-logs/session-log.md
+---
+
+## Session End: 20260708_164938
+### Commits
+e60f70e Round 7: Isaac-Rebirth procedural paper UI overhaul + 8 bug fixes
+6a2b325 Fix build_cia.ps1: stale repo path, makerom arg quoting, fail loudly
+705ed15 Massive expansion rounds 1-6: bugs, Isaac parity, story arc, weapons, content
+### Uncommitted Changes
+production/session-logs/agent-audit.log
+production/session-logs/session-log.md
+---
+
+## Session End: 20260708_165310
+### Commits
+e60f70e Round 7: Isaac-Rebirth procedural paper UI overhaul + 8 bug fixes
+6a2b325 Fix build_cia.ps1: stale repo path, makerom arg quoting, fail loudly
+705ed15 Massive expansion rounds 1-6: bugs, Isaac parity, story arc, weapons, content
+### Uncommitted Changes
+production/session-logs/agent-audit.log
+production/session-logs/session-log.md
+---
+
+## Session End: 20260708_165400
+### Commits
+e60f70e Round 7: Isaac-Rebirth procedural paper UI overhaul + 8 bug fixes
+6a2b325 Fix build_cia.ps1: stale repo path, makerom arg quoting, fail loudly
+705ed15 Massive expansion rounds 1-6: bugs, Isaac parity, story arc, weapons, content
+### Uncommitted Changes
+production/session-logs/agent-audit.log
+production/session-logs/session-log.md
+---
+
+## Session End: 20260708_165737
+### Commits
+e60f70e Round 7: Isaac-Rebirth procedural paper UI overhaul + 8 bug fixes
+6a2b325 Fix build_cia.ps1: stale repo path, makerom arg quoting, fail loudly
+705ed15 Massive expansion rounds 1-6: bugs, Isaac parity, story arc, weapons, content
+### Uncommitted Changes
+production/session-logs/agent-audit.log
+production/session-logs/session-log.md
+---
+
+## Session End: 20260708_171623
+### Commits
+e60f70e Round 7: Isaac-Rebirth procedural paper UI overhaul + 8 bug fixes
+6a2b325 Fix build_cia.ps1: stale repo path, makerom arg quoting, fail loudly
+705ed15 Massive expansion rounds 1-6: bugs, Isaac parity, story arc, weapons, content
+### Uncommitted Changes
+include/config.h
+include/game.h
+production/session-logs/agent-audit.log
+production/session-logs/session-log.md
+source/config.c
+source/main.c
+---
+
+## Session End: 20260708_174420
+### Commits
+e60f70e Round 7: Isaac-Rebirth procedural paper UI overhaul + 8 bug fixes
+6a2b325 Fix build_cia.ps1: stale repo path, makerom arg quoting, fail loudly
+705ed15 Massive expansion rounds 1-6: bugs, Isaac parity, story arc, weapons, content
+### Uncommitted Changes
+include/config.h
+include/game.h
+production/session-logs/agent-audit.log
+production/session-logs/session-log.md
+source/config.c
+source/main.c
+---
+
+## Session End: 20260708_175952
+### Commits
+b6dc289 Round 8 fixes: 41 audit findings across economy, bosses, UI
+e60f70e Round 7: Isaac-Rebirth procedural paper UI overhaul + 8 bug fixes
+6a2b325 Fix build_cia.ps1: stale repo path, makerom arg quoting, fail loudly
+705ed15 Massive expansion rounds 1-6: bugs, Isaac parity, story arc, weapons, content
+### Uncommitted Changes
+production/session-logs/agent-audit.log
+---
+
+## Session End: 20260708_183018
+### Commits
+b6dc289 Round 8 fixes: 41 audit findings across economy, bosses, UI
+e60f70e Round 7: Isaac-Rebirth procedural paper UI overhaul + 8 bug fixes
+6a2b325 Fix build_cia.ps1: stale repo path, makerom arg quoting, fail loudly
+705ed15 Massive expansion rounds 1-6: bugs, Isaac parity, story arc, weapons, content
+### Uncommitted Changes
+include/game.h
+production/session-logs/agent-audit.log
+production/session-logs/session-log.md
+source/main.c
+source/sprite.c
+---
+
+## Session End: 20260708_190016
+### Commits
+8ad90a8 Round 8 content 1/2: routes, 7 new bosses, golden door, Krampus
+b6dc289 Round 8 fixes: 41 audit findings across economy, bosses, UI
+e60f70e Round 7: Isaac-Rebirth procedural paper UI overhaul + 8 bug fixes
+6a2b325 Fix build_cia.ps1: stale repo path, makerom arg quoting, fail loudly
+705ed15 Massive expansion rounds 1-6: bugs, Isaac parity, story arc, weapons, content
+### Uncommitted Changes
+production/session-logs/agent-audit.log
+---
+
+## Session End: 20260708_192215
+### Commits
+8ad90a8 Round 8 content 1/2: routes, 7 new bosses, golden door, Krampus
+b6dc289 Round 8 fixes: 41 audit findings across economy, bosses, UI
+e60f70e Round 7: Isaac-Rebirth procedural paper UI overhaul + 8 bug fixes
+6a2b325 Fix build_cia.ps1: stale repo path, makerom arg quoting, fail loudly
+705ed15 Massive expansion rounds 1-6: bugs, Isaac parity, story arc, weapons, content
+### Uncommitted Changes
+include/game.h
+production/session-logs/agent-audit.log
+production/session-logs/session-log.md
+source/main.c
+source/sprite.c
+---
+
+## Session End: 20260708_194103
+### Commits
+359e4b0 Round 8 content 2/2: red chests, full tarot, transformations, 3 chars
+8ad90a8 Round 8 content 1/2: routes, 7 new bosses, golden door, Krampus
+b6dc289 Round 8 fixes: 41 audit findings across economy, bosses, UI
+e60f70e Round 7: Isaac-Rebirth procedural paper UI overhaul + 8 bug fixes
+6a2b325 Fix build_cia.ps1: stale repo path, makerom arg quoting, fail loudly
+705ed15 Massive expansion rounds 1-6: bugs, Isaac parity, story arc, weapons, content
+### Uncommitted Changes
+production/session-logs/agent-audit.log
+---
+
+## Session End: 20260708_195348
+### Commits
+359e4b0 Round 8 content 2/2: red chests, full tarot, transformations, 3 chars
+8ad90a8 Round 8 content 1/2: routes, 7 new bosses, golden door, Krampus
+b6dc289 Round 8 fixes: 41 audit findings across economy, bosses, UI
+e60f70e Round 7: Isaac-Rebirth procedural paper UI overhaul + 8 bug fixes
+6a2b325 Fix build_cia.ps1: stale repo path, makerom arg quoting, fail loudly
+705ed15 Massive expansion rounds 1-6: bugs, Isaac parity, story arc, weapons, content
+### Uncommitted Changes
+production/session-logs/agent-audit.log
+production/session-logs/session-log.md
+---
+
+## Session End: 20260708_195447
+### Commits
+359e4b0 Round 8 content 2/2: red chests, full tarot, transformations, 3 chars
+8ad90a8 Round 8 content 1/2: routes, 7 new bosses, golden door, Krampus
+b6dc289 Round 8 fixes: 41 audit findings across economy, bosses, UI
+e60f70e Round 7: Isaac-Rebirth procedural paper UI overhaul + 8 bug fixes
+6a2b325 Fix build_cia.ps1: stale repo path, makerom arg quoting, fail loudly
+705ed15 Massive expansion rounds 1-6: bugs, Isaac parity, story arc, weapons, content
+### Uncommitted Changes
+production/session-logs/agent-audit.log
+production/session-logs/session-log.md
+---
+
+## Session End: 20260708_200628
+### Commits
+ae1b265 Document Round 8 in expansion plan
+4e6f369 Round 8 gauntlet: fix 10 reviewer findings incl. unplayable Lost
+359e4b0 Round 8 content 2/2: red chests, full tarot, transformations, 3 chars
+8ad90a8 Round 8 content 1/2: routes, 7 new bosses, golden door, Krampus
+b6dc289 Round 8 fixes: 41 audit findings across economy, bosses, UI
+e60f70e Round 7: Isaac-Rebirth procedural paper UI overhaul + 8 bug fixes
+6a2b325 Fix build_cia.ps1: stale repo path, makerom arg quoting, fail loudly
+705ed15 Massive expansion rounds 1-6: bugs, Isaac parity, story arc, weapons, content
+---
+
+## Session End: 20260710_130659
+### Commits
+bd01608 chore: update session log
+---
+

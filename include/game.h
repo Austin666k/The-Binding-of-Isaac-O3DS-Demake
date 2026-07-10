@@ -121,7 +121,6 @@ typedef enum {
 
 /* ---------- Items ---------- */
 #define MAX_ITEMS_HELD     32       /* max items player can collect */
-#define MAX_ITEM_POOL      85       /* total unique items in the game */
 
 /* ---------- Familiars ---------- */
 #define MAX_FAMILIARS      2        /* follower slots (Phase E6) */
@@ -137,6 +136,14 @@ typedef enum {
     CHAR_EVE,
     CHAR_SAMSON,
     CHAR_BLUE_BABY,
+    /* --- R10 (C4) characters. PARALLEL TABLES: every new entry needs
+       character_name / character_blurb / character_tint cases, recalc +
+       apply_character_start blocks, select-card portrait + heart row,
+       unlocks-screen chars[] entry, character_unlock_name case,
+       apply_unlock_gates bit and a config unlock bit (7-9). --- */
+    CHAR_AZAZEL,     /* flight + innate short-range Brimstone */
+    CHAR_LAZARUS,    /* 1 extra life; respawns stronger (Lazarus' Rags) */
+    CHAR_LOST,       /* no health at all; flight + mantle + free devil deals */
     CHAR_COUNT
 } CharacterType;
 
@@ -172,6 +179,19 @@ typedef enum {
     TAROT_STAR,             /* full map reveal + spawn a heart */
     TAROT_SUN,              /* full heal + full map reveal */
     TAROT_HANGED_MAN,       /* spawn two soul hearts */
+    /* --- R8 (M6): the 10 missing major arcana (deck complete at 22).
+       Every entry here needs BOTH a tarot_names[] string (main.c) and an
+       apply_tarot_card case — the table is sized by TAROT_COUNT. --- */
+    TAROT_EMPRESS,          /* +0.3 dmg +0.2 spd temp buff (~10s) */
+    TAROT_CHARIOT,          /* 6s invincibility (big iframes) + speed */
+    TAROT_JUSTICE,          /* spawn 1 coin + bomb + key + half heart */
+    TAROT_HERMIT,           /* warp to the shop (no shop: 3 coins) */
+    TAROT_WHEEL_OF_FORTUNE, /* spawn a usable slot machine in-room */
+    TAROT_STRENGTH,         /* heal half heart + 0.3 dmg temp buff */
+    TAROT_DEVIL,            /* +2.0 dmg temp buff (~10s) */
+    TAROT_TEMPERANCE,       /* heal 1 full heart */
+    TAROT_MOON,             /* warp to the secret room */
+    TAROT_JUDGEMENT,        /* pickup shower: 3-5 mixed drops */
     TAROT_COUNT
 } TarotCard;
 
@@ -193,6 +213,7 @@ typedef struct {
     int   flash;     /* visual flash counter */
     int   active;
     int   is_epic;   /* Epic Fetus bomb: x1.5 blast radius and damage */
+    int   is_fetus;  /* Dr./Epic Fetus tear-bomb: blast scales with damage stat */
 } ActiveBomb;
 
 /* ---------- Creep / hazard tile ---------- */
@@ -306,6 +327,21 @@ typedef enum {
     ENEMY_BOSS_MOM,       /* Mom - fixed Depths boss (stomping foot + door hands) */
     ENEMY_BOSS_MOMS_HEART,/* Mom's Heart - fixed Womb boss (stationary + waves) */
     ENEMY_BOSS_SATAN,     /* Satan - fixed Sheol boss, 3 phases */
+    /* --- Round 9 (Phase C1) route-arc fixed bosses ---
+       MUST stay inside the boss block (is_boss_type / bosses_defeated bit
+       index / boss_names[] on the unlocks screen are all enum-order based:
+       Isaac=20, The Lamb=21, It Lives=22). */
+    ENEMY_BOSS_ISAAC,     /* Isaac - Cathedral (light route), holy 3 phases */
+    ENEMY_BOSS_THE_LAMB,  /* The Lamb - Dark Room (dark route), demonic mirror */
+    ENEMY_BOSS_IT_LIVES,  /* It Lives - Womb capstone after 1+ total wins */
+    /* --- Round 8 (M3/M7) bosses ---
+       MUST stay inside the boss block (is_boss_type / bosses_defeated bit
+       index / boss_names[] on the unlocks screen are all enum-order based:
+       Uriel=23, Gabriel=24, Krampus=25, ??? (Blue Baby)=26). */
+    ENEMY_BOSS_URIEL,     /* Uriel - first angel-statue miniboss of a run */
+    ENEMY_BOSS_GABRIEL,   /* Gabriel - second angel miniboss, faster/denser */
+    ENEMY_BOSS_KRAMPUS,   /* Krampus - devil-room ambush miniboss */
+    ENEMY_BOSS_BLUE_BABY, /* ??? (Blue Baby) - The Chest floor-7 boss */
     /* --- Phase 2 minor enemies (boss minions) --- */
     ENEMY_EYE,            /* Peep's detached eyes */
     ENEMY_LIL_HAUNT,      /* Haunt's minions */
@@ -355,6 +391,8 @@ typedef enum {
     PICKUP_TRINKET,   /* trinket (sub_type = TrinketType); swaps with held */
     PICKUP_KEY5,      /* 5-key pickup (charged key ring) */
     PICKUP_BATTERY,   /* refills active item charge to full */
+    PICKUP_CHEST_RED, /* R8 (M5): free to open, weighted risk/reward roll;
+                         sub_type 1 = already opened (husk stays visible) */
     PICKUP_TYPE_COUNT
 } PickupType;
 
@@ -462,6 +500,14 @@ typedef enum {
     ITEM_BROTHER_BOBBY,   /* familiar: plain tears in aim direction */
     ITEM_GHOST_BABY,      /* familiar: spectral tears in aim direction */
     ITEM_DEMON_BABY,      /* familiar: auto-aims the nearest enemy */
+    /* --- Round 8 (M7) Krampus-only drops (EXCLUDED from random pools) --- */
+    ITEM_LUMP_OF_COAL,    /* passive: tear damage grows with tear flight time */
+    ITEM_HEAD_OF_KRAMPUS, /* active (4): 4-way brimstone burst from the player */
+    /* --- R8 (M8) Guppy set (normal pool, NOT excluded). Each pickup of a
+       Guppy piece (these 3 + Dead Cat) advances the Guppy transformation. */
+    ITEM_GUPPYS_PAW,      /* passive: +2 soul hearts, Guppy piece */
+    ITEM_GUPPYS_HEAD,     /* active (2): summons 2 friendly blue flies */
+    ITEM_GUPPYS_TAIL,     /* passive: +1 luck, Guppy piece */
     ITEM_COUNT
 } ItemType;
 
@@ -487,6 +533,8 @@ typedef struct {
 #define ITEM_FLAG_FIRE_IMMUNE  (1 << 10)  /* Pyromaniac: immune+heal from blasts */
 #define ITEM_FLAG_ACTIVE       (1 << 11)  /* Active item: usable with charge bar (KEY_X) */
 #define ITEM_FLAG_DOUBLE       (1 << 12)  /* 20/20: two parallel tears */
+#define ITEM_FLAG_COAL         (1 << 13)  /* Lump of Coal: damage grows with tear age */
+#define ITEM_FLAG_FLIGHT       (1 << 14)  /* R8 (M8) Guppy: fly over rocks/poop */
 
 /* ---------- Item Definition ---------- */
 typedef struct {
@@ -599,7 +647,8 @@ typedef enum {
     OBST_ROCK = 0,
     OBST_POOP,        /* destructible by tears; may drop a pickup */
     OBST_SPIKES,      /* blocks nothing; damages the player on contact */
-    OBST_SLOT_MACHINE /* Arcade room: pay a coin, roll a reward */
+    OBST_SLOT_MACHINE,/* Arcade room: pay a coin, roll a reward */
+    OBST_ANGEL_STATUE /* Angel room: bombing it awakens Uriel/Gabriel */
 } ObstacleType;
 
 typedef struct {
@@ -617,7 +666,7 @@ typedef struct {
     float range;         /* tear range in pixels */
     int   max_hp;        /* maximum HP */
     int   flags;         /* ITEM_FLAG_* abilities */
-    float luck;          /* +luck improves drop chances and crit roll */
+    float luck;          /* +luck improves drop chances */
     int   shot_speed;    /* tear speed bonus (integer for display) */
 } PlayerStats;
 
@@ -628,7 +677,6 @@ typedef struct {
     int   hp;
     int   iframes;
     int   tear_cooldown;
-    int   kb_timer;        /* knockback stun: frames of lost movement control */
     int   shoot_anim;      /* >0 = frames remaining of shooting face (crying head) */
     Direction shoot_dir;   /* direction player last shot (for crying head) */
     int   pickup_anim;     /* >0 = frames of item pickup pose */
@@ -656,8 +704,6 @@ typedef struct {
     int   lives;            /* extra lives from Dead Cat etc. */
     int   holy_mantle_active; /* 1 if can absorb next hit */
     int   book_belial_dmg_timer; /* frames remaining of Book of Belial damage boost */
-    /* Magdalene Yum Heart cooldown (frames) */
-    int   yum_heart_cd;
     /* Soul hearts */
     int   soul_hp;          /* extra "soul" HP (consumed before red HP) */
     /* Black hearts (Phase E5): absorbed BEFORE soul hearts; each depleted
@@ -675,7 +721,44 @@ typedef struct {
     ItemType active_item;      /* ITEM_NONE = no active item held */
     int   active_charge;       /* current charge */
     int   active_max_charge;   /* charge required to use */
+    /* R8 (M3): Mega Satan key halves — Uriel drops 1, Gabriel drops 2.
+       Per-run (Player lives inside Game; start_new_game memsets Game). */
+    int   has_key_piece_1;
+    int   has_key_piece_2;
+    /* R8 (M8) transformations — per-run counters (memset by start_new_game).
+       Guppy pieces: Dead Cat / Guppy's Paw / Head / Tail; at 3+ -> GUPPY!
+       (flight + tears spawn friendly blue flies). Mushrooms: Magic Mush /
+       Odd Mushroom / Blue Cap; all 3 -> FUN GUY! (+1 heart container). */
+    int   guppy_count;
+    int   guppy_active;
+    int   funguy_count;
+    int   funguy_active;
+    /* R8 (M6) tarot temp buffs (Empress/Strength/Devil dmg, Empress/Chariot
+       speed). While the timer runs, recalc adds the bonus; expiry zeroes the
+       bonus and recalcs (same pattern as book_belial_dmg_timer). */
+    int   card_dmg_timer;
+    float card_dmg_bonus;
+    int   card_spd_timer;
+    float card_spd_bonus;
+    /* R10 (C4) Samson Bloody Lust: hits taken THIS room (+0.15 dmg each,
+       capped at +1.0 in recalc); reset on every room change. */
+    int   samson_hits;
+    /* R10 (C4) Lazarus' Rags: permanent +0.5 dmg per death-respawn this
+       run (applied in recalc; accumulates if he gains more lives). */
+    float lazarus_dmg_bonus;
+    /* R8 gauntlet: easy-mode +1 container. Persistent field added by
+       recalc_player_stats (like pill_max_hp_bonus) so the per-frame HP
+       watcher's recalc can't wipe it. Set once in start_new_game. */
+    int   easy_hp_bonus;
 } Player;
+
+/* ---------- R8 (M8) friendly blue flies (Guppy / Guppy's Head) ---------- */
+#define MAX_BLUE_FLIES 6
+typedef struct {
+    float x, y;
+    int   active;
+    int   anim;       /* wobble/orbit phase counter */
+} BlueFly;
 
 /* ---------- Blood Decal (permanent floor stain, persists per room) ---------- */
 #define MAX_BLOOD_DECALS 24
@@ -747,6 +830,14 @@ typedef struct {
     /* Phase E2: Mom's Heart kill spawns a "beam of light" end-run object
        next to the trapdoor; touching it wins the run with Ending 1. */
     int      has_ending_beam;
+    /* R8 #25: Boss Rush wave progress lives WITH the room so warping out
+       and back never refights waves already cleared (the Game-side
+       bossrush_active/spawn_timer are still reset on exit/entry). */
+    int      bossrush_wave;
+    /* R8 (M7): Krampus ambush state for devil rooms.
+       0 = normal devil room, 1 = armed (ambush fires ~45f after entry),
+       2 = Krampus spawned (never re-arms). */
+    int      krampus_state;
 } Room;
 
 /* ---------- Dungeon / Floor ---------- */
@@ -846,11 +937,6 @@ typedef struct {
     int        floor_intro_timer;
     /* AAA Menu animation state */
     int        menu_timer;       /* animation timer for menu effects */
-    float      particle_x[20];   /* floating particle positions */
-    float      particle_y[20];
-    float      particle_vx[20];
-    float      particle_vy[20];
-    int        particles_init;   /* 1 if particles have been initialized */
     /* Blood splatter particles */
     BloodParticle blood[MAX_BLOOD_PARTICLES];
     /* Active bombs (small pool: player-placed + troll bombs) */
@@ -902,9 +988,9 @@ typedef struct {
     int   characters_completed_run; /* runtime bitmask of chars who beat a run */
     /* Game-feel: hitstop freeze frames (skips sim updates while > 0) */
     int   hitstop;
-    /* Boss Rush room wave state */
+    /* Boss Rush room wave state (R8 #25: the wave COUNTER moved into the
+       Room struct so progress survives warping out and back in) */
     int   bossrush_active;       /* 1 while the wave machine is running in this room */
-    int   bossrush_wave;         /* current wave number (0-based) */
     int   bossrush_spawn_timer;  /* frames until next wave spawns (grace period) */
     /* Enemy Brimstone beam (Phase E3 - Satan). Kept fully separate from the
        player's laser_* fields. 0 = off, 1 = telegraph (thin red line, 30f),
@@ -914,6 +1000,18 @@ typedef struct {
     float ebeam_x, ebeam_y;      /* beam origin (boss muzzle) */
     float ebeam_dx, ebeam_dy;    /* unit aim direction (frozen at telegraph) */
     float ebeam_ex, ebeam_ey;    /* wall-clipped endpoint */
+    /* R9 (C1 - The Lamb): when set, the enemy beam is a 4-way brimstone
+       CROSS centered on (ebeam_x, ebeam_y) — the dx/dy/ex/ey fields are
+       ignored and 4 axis-aligned arms run to the room walls instead. */
+    int   ebeam_cross;
+    /* R9 (C1 - Isaac): Cathedral light columns. Up to 3 vertical beams:
+       ground-marker telegraph (~40f) then a full-height damage column
+       (~20f). 0 = off, 1 = telegraph, 2 = firing. Driven by Isaac's AI
+       case only; reset on every room/floor change alongside ebeam_*. */
+    int   vbeam_state;
+    int   vbeam_timer;
+    int   vbeam_count;
+    float vbeam_x[3];
     /* Familiar system (Phase E6): player position history ring buffer the
        followers trail behind, plus per-slot fire cooldowns. Static sizes,
        zero-state valid (head 0 / cds 0; trail refilled on room entry). */
@@ -921,9 +1019,53 @@ typedef struct {
     float fam_hist_y[FAM_TRAIL_LEN];
     int   fam_hist_head;
     int   fam_cd[MAX_FAMILIARS];
-    /* Phase E2: which ending the win screen shows (0 = full escape,
-       1 = "Ending 1" chosen at the Mom's Heart light beam) */
+    /* Which ending the win screen shows:
+       0 = full escape (The Chest / Mega Satan, light route)
+       1 = legacy "Ending 1" (pre-R9 Mom's Heart beam; no longer set)
+       2 = light ending (Isaac defeated in the Cathedral — ascension)
+       3 = dark ending (The Lamb defeated in the Dark Room — crowned) */
     int   win_ending;
+    /* R9 (C1): run route, chosen at the Mom's Heart / It Lives kill.
+       0 = undecided (floors 0-5), 1 = LIGHT (beam -> Cathedral -> Chest),
+       2 = DARK (trapdoor -> Sheol -> Dark Room). Floors 6/7 change
+       identity, palette and boss based on this (see get_floor_info). */
+    int   route;
+    /* --- R8 (M3/M7) additions (all per-run; zeroed by start_new_game) --- */
+    /* Set the first time a devil-room purchase completes this run; from
+       then on the post-boss deal flip ALWAYS chooses the devil room. */
+    int   took_devil_deal;
+    /* Angel statues awakened this run: 0 -> next fight is Uriel,
+       1+ -> Gabriel. Incremented at awaken time. */
+    int   angels_fought;
+    /* Krampus ambush countdown (armed on entering a krampus_state==1 devil
+       room; spawns Krampus at 0) + brief lights-dim overlay timer. */
+    int   krampus_timer;
+    int   krampus_dim;
+    /* Head of Krampus player burst: 4-way beam render timer + origin.
+       Damage is applied instantly at use; this is presentation only. */
+    int   pbeam_timer;
+    float pbeam_x, pbeam_y;
+    /* Mega Satan golden-door room (floor 7): created lazily in a free grid
+       cell the first time the door opens; re-enterable if the player warps
+       out (key pieces are consumed on first open). */
+    int   mega_created;
+    int   mega_gx, mega_gy;
+    /* R8 (M8): friendly blue fly pool (Guppy tears / Guppy's Head active).
+       Zero-state valid; persists across rooms (flies chase the player until
+       they find a target); memset by start_new_game. */
+    BlueFly blue_flies[MAX_BLUE_FLIES];
+    /* R10 (C4): last-seen total HP pool (red+soul+black). Eve's Whore of
+       Babylon and Samson's Bloody Lust are hp-conditional stats computed in
+       recalc_player_stats; the STATE_PLAYING update compares this cache each
+       frame and recalcs on any change (a decrease = a hit for Samson). */
+    int   prev_hp_total;
+    /* R10 (C4): latch so a game over increments the lifetime death counter
+       exactly once (zeroed by start_new_game's memset). */
+    int   death_counted;
+    /* R8 gauntlet: per-run identity (monotonic, set by start_new_game).
+       Render-side statics (HUD heart jiggle) compare it to detect a new
+       run and re-sync without a spurious pop. */
+    int   run_id;
 } Game;
 
 /* ---------- Function Declarations ---------- */
@@ -946,7 +1088,9 @@ void collisions_update(Game *g);
 void shoot_tear(Game *g, Direction dir);
 void check_door_transition(Game *g);
 void do_room_transition(Game *g, Direction dir);
-void collect_item(Game *g, ItemType item);
+/* Returns 1 if the item was actually granted, 0 if refused (passive-item
+ * cap reached). Purchases must gate their payment on this. */
+int  collect_item(Game *g, ItemType item);
 void apply_item_stats(Player *p, const ItemDef *def);
 void advance_floor(Game *g);
 void recalc_player_stats(Player *p);
@@ -959,7 +1103,7 @@ void render_mode_select(Game *g, C2D_TextBuf textBuf);
 void render_challenge_select(Game *g, C2D_TextBuf textBuf);
 void render_character_select(Game *g, C2D_TextBuf textBuf);
 void render_difficulty_select(Game *g, C2D_TextBuf textBuf);
-void render_controls(C2D_TextBuf textBuf);
+void render_controls(Game *g, C2D_TextBuf textBuf);
 void render_gameover(Game *g, C2D_TextBuf textBuf);
 void render_win(Game *g, C2D_TextBuf textBuf);
 void render_hud(Game *g, C2D_TextBuf textBuf);
